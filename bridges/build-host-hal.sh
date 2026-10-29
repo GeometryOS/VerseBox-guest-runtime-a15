@@ -62,17 +62,27 @@ for aidl in "$AIDL_SRC/android/os/PersistableBundle.aidl" \
              "$AIDL_SRC/android/hardware/thermal/IThermal.aidl"; do
     test -f "$aidl" || { echo "missing AIDL source: $aidl" >&2; exit 1; }
 done
-# aidl is a native Windows binary and compares the input path against its import
+# On Windows aidl is a native .exe and compares the input path against its import
 # roots as plain strings after appending a backslash to the root, so every
-# argument must use the Windows backslash form. Git Bash would convert them a
-# second time, hence MSYS2_ARG_CONV_EXCL.
-win() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+# argument must use the Windows backslash form (Git Bash would convert them a
+# second time, hence MSYS2_ARG_CONV_EXCL). On Linux the same aidl accepts the
+# normal '/' separator -- keep it platform-specific instead of hardcoding '\'.
+case "$(uname -s 2>/dev/null || echo Linux)" in
+    MINGW*|MSYS*|CYGWIN*)
+        SEP='\'
+        win() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+        ;;
+    *)
+        SEP='/'
+        win() { printf '%s' "$1"; }
+        ;;
+esac
 SRC_W=$(win "$AIDL_SRC")
 OUT_W=$(win "$AIDL_OUT")
 # Every .aidl in the package is compiled: the generated interface headers include
 # the parcelable headers (Braking.h, Effect.h, ...), and aidl emits one header
 # per input, so listing only the two interfaces is not enough.
-aidl_inputs="$SRC_W\\android\\os\\PersistableBundle.aidl"
+aidl_inputs="$SRC_W${SEP}android${SEP}os${SEP}PersistableBundle.aidl"
 for src in "$AIDL_SRC"/android/hardware/vibrator/*.aidl \
            "$AIDL_SRC"/android/hardware/sensors/*.aidl \
            "$AIDL_SRC"/android/hardware/thermal/*.aidl \
