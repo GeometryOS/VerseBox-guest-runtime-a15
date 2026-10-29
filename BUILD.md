@@ -39,7 +39,9 @@ Redroid 15 的 ART / framework / HAL / 系统 APK（原样保留，按 APEX 布�
 | 仓库 | 参考 | 用途 |
 | --- | --- | --- |
 | bionic | `refs/tags/android-15.0.0_r*`（`A15_TAG` 可覆盖） | linker、libc、libdl、libm |
-| system/core | 同上 | libbase、libutils、libcutils、libziparchive |
+| system/core | 同上 | libutils、libcutils、libsystem、property_service |
+| system/libbase | 同上 | `android-base/*.h`（linker 的 macros.h 等；A15 已移出 system/core） |
+| system/libziparchive | 同上 | `ziparchive/*.h`（linker 的 zip 支持） |
 | system/logging | 同上 | liblog（A15 已移出 system/core） |
 | system/core 内的 property_service/libpropertyinfoparser | 同上 | 属性解析器（A15 就在 system/core 里） |
 | external/llvm-project（NDK 29 的 libc++ 21 头 + 静态库） | NDK 29.0.14206865 | A15 的 linker/libc 需要 C++20；`external/libcxx` 是 2018 年的 libc++ 8，不能用 |

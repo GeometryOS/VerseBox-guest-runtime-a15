@@ -68,6 +68,10 @@ fetch_blob() {
 # to abort the whole stage after a partial download.
 fetch bionic                         .                    bionic
 fetch system/core                    .                    system/core
+# A15 split these out of system/core; liblinker includes <android-base/...>
+# and <ziparchive/...>, and compile.sh points at both.
+fetch system/libbase                 .                    system/libbase
+fetch system/libziparchive           .                    system/libziparchive
 fetch system/logging                 .                    system/logging
 
 # Modules parsed by runtime/select-libc-sources.py. Android 15 describes libc
