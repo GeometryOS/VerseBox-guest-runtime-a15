@@ -1569,8 +1569,11 @@ def d8(classes, destination):
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
     class_files = [str(x) for x in classes.rglob("*.class")]
-    command = ["cmd", "/c", str(D8), "--min-api", "35", "--lib", str(ANDROID_JAR),
-               "--output", str(destination)] + class_files
+    arguments = ["--min-api", "35", "--lib", str(ANDROID_JAR),
+                 "--output", str(destination)] + class_files
+    # d8.bat is a batch file and needs cmd.exe; on Linux build-tools ship a
+    # POSIX shell script named "d8" that must be executed directly.
+    command = (["cmd", "/c", str(D8)] if os.name == "nt" else [str(D8)]) + arguments
     run_tool(command, "d8")
 
 
