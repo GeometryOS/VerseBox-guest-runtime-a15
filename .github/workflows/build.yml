@@ -1,0 +1,121 @@
+# 完整构建 Android 15 运行时载荷（prepared/），用于发布。
+#
+# 这个仓库只负责 A15 客体运行时：镜像 -> rootfs/APEX -> API 35 运行时 ->
+# 桥接/图形 -> prepared（assets + jniLibs + 清单）。APK 由宿主工程打包，
+# 不在本仓库构建；以后补上 Gradle 外壳（settings.gradle.kts + gradlew）时，
+# 末尾的 AAR 步骤会自动生效。
+#
+# 触发：
+#   * push tag v*        -> 构建并创建 GitHub Release
+#   * workflow_dispatch  -> 手动构建（可选从源码重编 desktop-gpu-host）
+name: Build A15 runtime
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      rebuild_desktop:
+        description: "从源码重编 desktop-gpu-host（默认用 pinned 版本）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+      A15_SKIP_APK: "1"
+      A15_REBUILD_DESKTOP: ${{ github.event.inputs.rebuild_desktop == 'true' && '1' || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install platform / build-tools / NDK 29
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;29.0.14206865"
+
+      - name: Install patchelf
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends patchelf
+
+      # 镜像 / 解包 / AOSP 源 / 原生编译产物都很大，缓存后重跑只做增量。
+      # key 带上构建脚本与图形源清单的哈希，改脚本会自动失效。
+      - name: Cache image, sources and native outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            downloads
+            rootfs
+            runtime/upstream
+            runtime/build
+            bridges/lib
+            bridges/bin
+            bridges/obj
+            bridges/graphics
+          key: a15-${{ runner.os }}-${{ hashFiles('scripts/*.sh', 'scripts/*.py', 'runtime/*.sh', 'bridges/*.sh', 'bridges/patches/*', 'vendor/graphics/sources.txt') }}
+          restore-keys: |
+            a15-${{ runner.os }}-
+
+      - name: Build (image -> rootfs -> APEX -> runtime -> bridges -> prepared)
+        run: sh scripts/build.sh
+
+      - name: Verify prepared manifest
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          manifest = pathlib.Path("prepared/assets/guest-runtime-a15-inputs.json")
+          assert manifest.is_file(), "missing " + str(manifest)
+          m = json.loads(manifest.read_text(encoding="utf-8"))
+          assert m["guestSdk"] == 35 and m["frameworkSdk"] == 35, "wrong SDK in manifest"
+          files = m["files"]
+          assert len(files) > 1000, "too few native files: %d" % len(files)
+          for entry in files:
+              path = pathlib.Path("prepared/jniLibs/arm64-v8a") / entry["name"]
+              assert path.is_file(), "missing " + str(path)
+              assert path.stat().st_size == entry["bytes"], "size mismatch: " + str(path)
+          print("prepared ok: %d native, %d data" % (len(files), len(m["data"])))
+          PY
+
+      - name: Gradle AAR (only when the Gradle shell exists)
+        if: hashFiles('settings.gradle.kts') != '' && hashFiles('gradlew') != ''
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Package
+        run: |
+          name="a15-runtime-${GITHUB_REF_NAME:-dev}"
+          tar -czf "${name}.tar.gz" prepared
+          sha256sum "${name}.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a15-runtime
+          path: |
+            a15-runtime-*.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            a15-runtime-*.tar.gz
+            SHA256SUMS

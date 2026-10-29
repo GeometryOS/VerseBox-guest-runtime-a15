@@ -1,0 +1,25 @@
+diff --git a/encoder/GL2Encoder.cpp b/encoder/GL2Encoder.cpp
+--- a/encoder/GL2Encoder.cpp
++++ b/encoder/GL2Encoder.cpp
+@@ -1666,7 +1666,19 @@ static bool replaceExternalSamplerUniformDefinition(char* str, const std::string
+         char* sampler_start = c;
+         c += samplerExternalType.size();
+         if (!isspace(*c) && *c != '\0') {
++            // Not a sampler *declaration*, but still the external sampler type:
++            // Skia emits a default precision statement for every sampler type it
++            // uses, so Android 15 RenderEngine sends
++            //     precision mediump samplerExternalOES;
++            // Leaving that line behind is fatal: replaceSamplerExternalWith2D()
++            // blanks the "#extension GL_OES_EGL_image_external" line and rewrites
++            // the uniform to sampler2D, so the driver then rejects the shader with
++            //     'samplerExternalOES' : requires extension
++            //     GL_OES_EGL_image_external to be enabled
++            // which is exactly the round-47 SurfaceFlinger abort chain.
++            // The host never sees an external sampler (external textures are
++            // emulated as 2D), so rewrite this occurrence in place as well.
++            if (samplerExternalType == STR_SAMPLER_EXTERNAL_OES) {
++                memcpy(sampler_start, STR_SAMPLER2D_SPACE, sizeof(STR_SAMPLER2D_SPACE)-1);
++            }
+             continue;
+         }
+ 

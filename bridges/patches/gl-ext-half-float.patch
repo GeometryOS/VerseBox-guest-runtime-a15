@@ -1,0 +1,26 @@
+diff --git a/egl/egl.cpp b/egl/egl.cpp
+--- a/egl/egl.cpp
++++ b/egl/egl.cpp
+@@ -747,7 +747,22 @@ static std::vector<std::string> getExtStringArray() {
+     // push guest strings
+     res.push_back("GL_EXT_robustness");
+ 
+     if (!hostStr || !strlen(hostStr)) { return res; }
+ 
++    // Adreno-class hosts expose the half-float color buffer extensions, but the
++    // desktop GPU endpoint's ES2 advertisement does not list them. Without these
++    // tokens Skia's GLES caps reject RGBA_F16 external textures, so
++    // SkImages::BorrowTextureFrom() returns null and SurfaceFlinger aborts with
++    // "Unable to generate SkImage. isTextureValid:1 dataspace:513"
++    // (round 50: GrBackendTexture 128x128 texType 3 fTarget 36197 fFormat 34842
++    //  colorType 16). These are exactly the tokens surfaceflinger itself probes
++    // for, and the device driver advertises all three.
++    if (!strstr(hostStr, "GL_EXT_color_buffer_half_float")) {
++        res.push_back("GL_EXT_color_buffer_half_float");
++        res.push_back("GL_OES_texture_half_float");
++        res.push_back("GL_OES_texture_half_float_linear");
++    }
++
+     // find the number of extensions
+     int extStart = 0;
+     int extEnd = 0;

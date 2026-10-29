@@ -1,0 +1,107 @@
+# Android 15 (API 35, arm64-only) guest overlay properties.
+#
+# These are applied on top of the Redroid 15 build.prop set by
+# scripts/prepare-a15.py, exactly like guest-a9.prop is applied for A9.
+# Nothing here may claim a capability the runtime does not actually have:
+# an unverified property is a lie that the next stage will trip over.
+ro.build.version.sdk=35
+ro.build.version.release=15
+ro.build.version.codename=REL
+ro.build.version.all_codenames=REL
+ro.build.version.preview_sdk=0
+ro.build.version.min_supported_target_sdk=23
+ro.build.version.known_codenames=REL,29,30,31,32,33,34,35
+ro.product.cpu.abilist=arm64-v8a
+ro.product.cpu.abilist64=arm64-v8a
+ro.product.cpu.abilist32=
+ro.zygote=zygote64
+persist.sys.dalvik.vm.lib.2=libart.so
+dalvik.vm.usejit=true
+dalvik.vm.dex2oat-filter=verify
+dalvik.vm.heapstartsize=16m
+dalvik.vm.heapgrowthlimit=192m
+dalvik.vm.heapsize=512m
+pm.dexopt.first-boot=verify
+pm.dexopt.boot-after-ota=verify
+pm.dexopt.boot=verify
+pm.dexopt.install=verify
+pm.dexopt.bg-dexopt=verify
+pm.dexopt.ab-ota=verify
+pm.dexopt.inactive=verify
+pm.dexopt.shared=verify
+ro.dalvik.vm.native.bridge=0
+ro.debuggable=0
+ro.hardware=a15vm
+ro.hardware.egl=emulation
+ro.hardware.gralloc=ranchu
+ro.hardware.hwcomposer=ranchu
+# Round 75: the only legacy audio HAL module in the image is
+# /vendor/lib64/hw/audio.primary.default.so (52,000 B, exports HMI, uses
+# usleep/clock_gettime: the AOSP stub device). hw_get_module_by_class("audio",
+# "primary") reads ro.hardware.audio.primary first and otherwise falls back to
+# ro.hardware (=a15vm here), i.e. it would look for audio.primary.a15vm.so and
+# declare the module missing. Naming the module that is actually shipped keeps
+# the HAL service able to open the primary device; host PCM (A9/A10
+# HostAudioBridge) is a separate, later track.
+ro.hardware.audio.primary=default
+ro.kernel.qemu.gles=1
+ro.sf.lcd_density=480
+config.disable_cameraservice=true
+ro.vndk.version=35
+ro.product.first_api_level=35
+ro.crypto.state=unencrypted
+ro.lockscreen.disable.default=true
+sys.use_memfd=true
+ro.product.locale=zh-CN
+persist.sys.timezone=Asia/Shanghai
+# Android 15's ART defaults to a 16KB-aligned image when the device reports it.
+# The value is corrected by prepare-a15.py from the real layer metadata; this
+# line documents the field, it is not a guess baked into the runtime.
+ro.product.build.version.sdk=35
+# D track (round 65): the redroid image ships ro.cp_system_other_odex=1 because it is
+# built for A/B devices whose /system_other holds pre-opted artifacts. This runtime has
+# no /system_other and no init, so nothing can ever run /system/bin/cppreopt and set
+# sys.cppreopt=finished. PackageManagerService.requestCopyPreoptedFiles() (services.jar
+# classes2.dex, DexOptHelper) then spins on sys.cppreopt for exactly 100 000 ms on every
+# boot and logs "cppreopt did not finish! / cppreopts took 1000xx ms" before continuing
+# with the same result as a timeout. Declaring the truth (no system_other partition)
+# removes the dead wait; the copy itself never ran here, so behaviour is unchanged.
+ro.cp_system_other_odex=0
+# Round 72d: A15 refuses to create a ClassLoader for an /apex/...jar unless the
+# jar was prefetched by Zygote (SystemServerClassLoaderFactory.allowClassLoaderCreation:
+# "/apex/ must be prefetched", with exactly one runtime escape hatch --
+# ZygoteInit.shouldProfileSystemServer()). This runtime deliberately starts
+# SystemServer through dalvikvm64 with no zygote, so nothing is prefetched and
+# StartBluetoothService threw:
+#   Creating a ClassLoader from /apex/com.android.btservices/javalib/
+#   service-bluetooth.jar is not allowed
+# This property is that documented escape hatch (AOSP isExperimentEnabled:
+# dalvik.vm.<experiment>, else persist.device_config.runtime_native_boot.<experiment>).
+# It only relaxes the prefetch requirement and enables system-server profiling.
+dalvik.vm.profilesystemserver=1
+# RescueParty (round 86): the image's own system/system_ext/etc/build.prop already
+# says persist.sys.disable_rescue=true, but prepare-a15.py's PROPERTY_SOURCES names
+# /system_ext/build.prop while this redroid layout stores it at /system/system_ext/
+# etc/build.prop, so the line never reached guest.prop or the property area.
+# The guest then escalated PackageWatchdog health-check failures of
+# com.android.networkstack / com.android.networkstack.tethering every ~minute
+# (services.dex RescueParty.OnHealthCheckFailed) through
+# SCOPED_DEVICE_CONFIG_RESET -> ALL_DEVICE_CONFIG_RESET -> WARM_REBOOT and finally
+#   ShutdownThread: Rebooting, reason: RescueParty
+#   PowerManagerService: Unexpected return from lowLevelReboot!
+#   ShutdownThread: Reboot failed, will attempt shutdown instead
+# which leaves the shutdown dialog (a spinning reboot screen) on screen while
+# SystemServer never exits. A container with no init cannot reboot, so honouring
+# the image's own property is the correct behaviour, not a workaround:
+# RescueParty.isDisabled() reads persist.sys.enable_rescue (false here), then
+# persist.device_config.configuration.disable_rescue_party, then this property.
+persist.sys.disable_rescue=true
+# UI-0 (round 88): /system/bin/bootanimation returns immediately with
+#   BootAnimation: boot animation disabled
+# when debug.sf.nobootanimation is true; the redroid vendor/build.prop sets it to
+# 1 because the image ships no display and no animation. This runtime now starts
+# the image binary itself (FrameworkSession.startBootAnimation) and ships
+# /system/media/bootanimation.zip, so the guest side of that switch must be off.
+# SurfaceFlinger's own ctl.start path stays unused (the property bridge rejects
+# ctl.start by design), which is why the host launches the binary directly.
+debug.sf.nobootanimation=0

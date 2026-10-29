@@ -1,0 +1,40 @@
+# Android 15 guest runtime · generated images and build outputs
+#
+# Only source (C/C++/Java/Python/shell, lists, patches, headers) is committed.
+# Everything below is either multi-GB guest material or reproducible output.
+
+# Generated prepared runtime (assets + jniLibs staged for the APK)
+prepared/
+
+# Redroid 15 image: layer tarballs, extracted rootfs, and the path index
+downloads/
+rootfs/
+rootfs-index.json
+
+# Build outputs
+artifacts/
+logs/
+build/
+runtime/build/
+runtime/upstream/
+runtime/downloads/
+runtime/__pycache__/
+bridges/lib/
+bridges/bin/
+bridges/obj/
+bridges/graphics/lib/
+bridges/graphics/obj/
+**/__pycache__/
+
+# Graphics sources fetched by scripts/fetch-graphics-sources.sh (pinned commits;
+# third_party/graphics/{container,a9/{generated,definitions,framework,patches}} is
+# committed, only the downloaded upstream tree is not).
+third_party/graphics/a9/upstream/*
+!third_party/graphics/a9/upstream/.gitkeep
+
+# Local tool output
+*.log
+*.o
+*.rsp
+*.elf.txt
+*.dex.json

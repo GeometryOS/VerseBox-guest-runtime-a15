@@ -1,0 +1,7 @@
+# repository tag subtree downloaded-into
+hardware/interfaces android-15.0.0_r36 vibrator/aidl aidl
+hardware/interfaces android-15.0.0_r36 sensors/aidl aidl
+hardware/interfaces android-15.0.0_r36 thermal/aidl aidl
+hardware/interfaces android-15.0.0_r36 common/aidl aidl
+hardware/interfaces android-15.0.0_r36 common/fmq/aidl aidl
+frameworks/native android-15.0.0_r36 libs/binder/ndk ndk

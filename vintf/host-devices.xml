@@ -1,0 +1,50 @@
+<!--
+  Device manifest for the HALs this project supplies to the Redroid 15 image.
+
+  Both entries below are AIDL, and both are load-bearing for the same reason:
+  frameworks/base/libs/vibratorservice and the sensor service stack ask
+  AServiceManager_isDeclared() first and only fall back to the HIDL client --
+  which waits forever when no HIDL service is registered -- when the AIDL HAL is
+  not declared:
+
+    connectHal (libvibratorservice.so @0x11680):
+      isDeclared("<IVibrator>/default") == false
+        -> V1_0::IVibrator::getService("default")  => "Waited one second ..."
+           forever, and the 65 s Watchdog kills system_server (round 69).
+
+  The service implementations live in vendor/native/HostDevicesA15.cpp and are
+  launched by the host as the "host-devices" program.
+
+  android.hardware.vibrator  AIDL version 2, IVibrator + IVibratorManager.
+  android.hardware.sensors   AIDL version 2, ISensors (empty sensor list; the
+    image's system/bin/sensorservice is launched by the host and registers the
+    "sensorservice" binder name that DeviceStateManagerService waits for).
+
+  android.hardware.thermal   AIDL version 3, IThermal. HardwarePropertiesManager
+    Service's JNI (getThermalHalLocked) asks isDeclared() first and falls back
+    to the HIDL 1.0 client, which waits forever because the image only declares
+    and ships thermal 2.0. This entry plus the NoThermal service is what lets
+    StartHardwarePropertiesManagerService return. Version 3 is the current AIDL
+    interface version in android-15.0.0_r36 (hardware/interfaces/thermal/aidl).
+
+  Version numbers come from the image libraries themselves
+  (BnVibrator/BnSensors::getInterfaceVersion both return 2).
+-->
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.vibrator</name>
+        <version>2</version>
+        <fqname>IVibrator/default</fqname>
+        <fqname>IVibratorManager/default</fqname>
+    </hal>
+    <hal format="aidl">
+        <name>android.hardware.sensors</name>
+        <version>2</version>
+        <fqname>ISensors/default</fqname>
+    </hal>
+    <hal format="aidl">
+        <name>android.hardware.thermal</name>
+        <version>3</version>
+        <fqname>IThermal/default</fqname>
+    </hal>
+</manifest>
