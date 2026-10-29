@@ -82,12 +82,12 @@ guest-runtime-a15/
     a9/definitions/                 renderControl 定义
     a9/framework/                   HAL / nativewindow 头
     a9/patches/gralloc-api28.patch  gralloc 的 API 28 修正
-    a9/upstream/                    由 scripts/fetch-graphics-sources.sh 拉取（不入库）
+    a9/upstream/                    随仓库提交（pinned，255 文件 / 6.2 MB）；缺失时用 fetch 脚本补齐
     codec-id.txt                    与 pinned desktop-gpu-host 匹配的 codec id
     compat/android/base/Log.h       qemu 子集缺的 Log.h 垫片（只提供 CHECK 宏）
   prebuilt/arm64/desktop-gpu-host   宿主 GPU 端点（6,471,456 B / 6578B9D8…，pinned）
   prebuilt/arm64/desktop-gpu-host.sha256
-  scripts/fetch-graphics-sources.sh 按 sources.txt 拉取 pinned goldfish/qemu 源并校验 sources.sha256
+  scripts/fetch-graphics-sources.sh 仅当 a9/upstream 缺失时按 sources.txt 拉取并校验（429 有重试，缺文件直接报错）
   scripts/install-desktop-host.sh   校验 sha256 后把 prebuilt 复制到 bridges/bin/
   scripts/build-desktop-host.sh     从仓库内源码重编 host（不需要 A10 流水线）
 ```
@@ -154,7 +154,7 @@ Linux/Git Bash `sh guest-runtime-a15/scripts/build.sh`；已有产物的阶段�
 | 设备桥 | `sh bridges/build-devices.sh` | `bridges/lib/liba15vm-guest-devices.so` |
 | guest 日志 | `sh bridges/build-guest-log.sh` | `bridges/lib/liba15vm-guest-log.so` |
 | JNI 注册 | `sh bridges/build-jni-register.sh` | `bridges/lib/liba15vm-jni-register.so` |
-| 图形源（仅缺 upstream 时） | `sh scripts/fetch-graphics-sources.sh` | `third_party/graphics/a9/upstream/`（按 sources.sha256 校验） |
+| 图形源（已入库，仅补救） | `sh scripts/fetch-graphics-sources.sh` | `third_party/graphics/a9/upstream/`（已提交；脚本会校验 sources.sha256 与必需文件） |
 | 宿主 GPU 端点（默认） | `sh scripts/install-desktop-host.sh` | `bridges/bin/desktop-gpu-host`（pinned，sha256 校验） |
 | 宿主 GPU 端点（源码重编） | `sh scripts/build-desktop-host.sh` | 同上；需 NDK 29 + 已拉取的图形源，不需要 A10 流水线 |
 | 图形层 | `sh bridges/build-graphics-a15.sh` | `bridges/graphics/lib/*`（EGL/GLES/gralloc/HWC） |

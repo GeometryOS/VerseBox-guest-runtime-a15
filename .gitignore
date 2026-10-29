@@ -29,8 +29,10 @@ bridges/graphics/obj/
 # Graphics sources fetched by scripts/fetch-graphics-sources.sh (pinned commits;
 # third_party/graphics/{container,a9/{generated,definitions,framework,patches}} is
 # committed, only the downloaded upstream tree is not).
-third_party/graphics/a9/upstream/*
-!third_party/graphics/a9/upstream/.gitkeep
+# third_party/graphics/a9/upstream is committed: the pinned goldfish/qemu
+# sources are small (6.2 MB) and fetching them from gitiles is rate-limited
+# (HTTP 429) and incomplete for this build. The fetch script stays as a
+# fallback for a deliberately pruned checkout.
 
 # Local tool output
 *.log

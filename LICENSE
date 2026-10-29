@@ -18,7 +18,7 @@ Copyright (C) 2026 QZXStudio
   保留 **Apache-2.0** 及文件内自带的 BSD/MIT 声明，作为独立部分分发。
 
 - **`third_party/graphics/a9/upstream/`**（goldfish/qemu 源码）：
-  构建时按固定版本获取，不随本仓库分发，许可按其上游项目为准。
+  随本仓库分发（pinned），保留其上游 **Apache-2.0 / BSD** 声明，作为独立部分。
 
 - **Redroid 15 镜像**（`downloads/`、`rootfs/`）：构建时获取，不随本仓库分发；
   镜像自身的许可以其上游项目为准。

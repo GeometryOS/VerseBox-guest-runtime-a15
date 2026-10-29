@@ -92,7 +92,8 @@ rootfs/      解包后的 Redroid 15 根文件系统（不入库）
   仓库只包含构建它的补丁与应用源码。
 
 - **图形源分两部分。** `third_party/graphics/` 里的补丁、生成物与 HAL 头随仓库分发；
-  被固定的 goldfish/qemu 源码由 `scripts/fetch-graphics-sources.sh` 拉取，不入库。
+  被固定的 goldfish/qemu 源码（255 个文件，6.2 MB）**随仓库提交**，
+`scripts/fetch-graphics-sources.sh` 只作为被裁剪 checkout 的补救。
 
 - **`prebuilt/arm64/desktop-gpu-host` 是 pinned 的宿主 GPU 端点**（附 sha256）。
   默认直接用；`sh scripts/build-desktop-host.sh` 可以只用本仓库源码重编
@@ -122,7 +123,7 @@ rootfs/      解包后的 Redroid 15 根文件系统（不入库）
 
 - **`vendor/`、`third_party/graphics/a9/{generated,definitions,framework}/`**：
   来自 AOSP 与宿主工程的共享容器层，保留 **Apache-2.0** 及文件自带的 BSD/MIT 声明，
-  作为独立部分分发（`a9/upstream` 构建时获取，不随仓库分发）。
+  作为独立部分分发（含 `a9/upstream` 的 pinned goldfish/qemu 源码）。
 
 Redroid 15 镜像在构建时获取，不随仓库分发，镜像自身许可以上游为准。
 根目录 [LICENSE](LICENSE) 仅为拆分范围的简短说明。
