@@ -70,18 +70,24 @@ fetch bionic                         .                    bionic
 fetch system/core                    .                    system/core
 fetch system/logging                 .                    system/logging
 
-# Property parser and property service support.
-fetch system/libpropertyinfoparser   .                    system/libpropertyinfoparser optional
+# Modules parsed by runtime/select-libc-sources.py. Android 15 describes libc
+# through external defaults (gwp_asan, scudo, llvm-libc, the unwinder and the
+# optimized math routines); without these archives the selector stops with
+#   missing blueprint: external/<name>/Android.bp
+# even though bionic itself downloaded fine.
+fetch external/arm-optimized-routines .                    external/arm-optimized-routines
+fetch external/gwp_asan               .                    external/gwp_asan
+fetch external/scudo                  .                    external/scudo
+fetch external/llvm-libc              .                    external/llvm-libc
+fetch external/libunwind_llvm         .                    external/libunwind_llvm
 
 # C++ runtime and allocator used by ART and by the guest's own C++ programs.
 fetch external/libcxx                src                  external/libcxx/src
 fetch external/libcxx                include              external/libcxx/include
 fetch external/libcxxabi             src                  external/libcxxabi/src
 fetch external/libcxxabi             include              external/libcxxabi/include
-fetch external/llvm-libunwind        .                    external/llvm-libunwind optional
 fetch external/zlib                  .                    external/zlib
 fetch external/jemalloc_new          .                    external/jemalloc_new
-fetch build/make                     tools/fs_config      build/make/tools/fs_config optional
 
 # The exact Android.bp files are what the source selectors parse. The
 # whole-repository archives above already contain them, so nothing else is
