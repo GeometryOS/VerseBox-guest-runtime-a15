@@ -76,23 +76,33 @@ jobs:
       - name: Install patchelf
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends patchelf
 
-      # 镜像 / 解包 / AOSP 源 / 原生编译产物都很大，缓存后重跑只做增量。
-      # key 带上构建脚本与图形源清单的哈希，改脚本会自动失效。
-      - name: Cache image, sources and native outputs
+      # 三层缓存，key 各自只覆盖会影响该层的输入：
+      #   镜像 tar    <- fetch 脚本
+      #   解包 rootfs <- extract 脚本（改 APEX 解析不会重下 700 MB 镜像）
+      #   原生产物    <- 运行时/桥/图形源与脚本
+      - name: Cache image tarball
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: a15-image-${{ runner.os }}-${{ hashFiles('scripts/fetch-redroid15.py') }}
+
+      - name: Cache extracted rootfs
+        uses: actions/cache@v4
+        with:
+          path: rootfs
+          key: a15-rootfs-${{ runner.os }}-${{ hashFiles('scripts/extract-rootfs.py', 'scripts/extract-apex.py') }}
+
+      - name: Cache AOSP sources and native outputs
         uses: actions/cache@v4
         with:
           path: |
-            downloads
-            rootfs
             runtime/upstream
             runtime/build
             bridges/lib
             bridges/bin
             bridges/obj
             bridges/graphics
-          key: a15-${{ runner.os }}-${{ hashFiles('scripts/**', 'runtime/*.sh', 'runtime/*.py', 'bridges/**', 'vendor/native/**', 'third_party/graphics/**', 'vendor/graphics/sources.txt') }}
-          restore-keys: |
-            a15-${{ runner.os }}-
+          key: a15-native-${{ runner.os }}-${{ hashFiles('runtime/*.sh', 'runtime/*.py', 'runtime/fetch-a15-sources.sh', 'bridges/**', 'vendor/native/**', 'third_party/graphics/**', 'vendor/graphics/sources.txt') }}
 
       - name: Build (image -> rootfs -> APEX -> runtime -> bridges -> prepared)
         run: sh scripts/build.sh

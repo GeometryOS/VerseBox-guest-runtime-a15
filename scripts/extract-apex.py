@@ -280,12 +280,13 @@ def main():
             # walk() records paths relative to the APEX root ("bin/...",
             # "lib64/..."). Several APEXes contain the same relative paths, so
             # the stager needs them lifted under apex/<name>/.
-            for key in [k for k in entries if k not in before]:
+            lifted = [k for k in entries if k not in before]
+            for key in lifted:
                 entry = entries.pop(key)
                 full = "apex/%s/%s" % (name, key)
                 entry["path"] = full
                 entries[full] = entry
-            print("expanded %s: %d entries" % (name, len(entries) - before + 1))
+            print("expanded %s: %d entries" % (name, len(lifted) + 1))
             marker.write_text("apex=%s\n" % name, encoding="utf-8")
         finally:
             image.close()
