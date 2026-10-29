@@ -156,7 +156,13 @@ class Selector:
         self.load(upstream / "external/scudo/Android.bp")
         self.load(upstream / "external/arm-optimized-routines/Android.bp")
         self.load(upstream / "external/llvm-libc/Android.bp")
-        self.load(upstream / "external/libunwind_llvm/Android.bp")
+        # external/libunwind_llvm is NOT a separate repository at
+        # android-15.0.0_r36 (gitiles returns 404; the unwinder moved into
+        # external/llvm-project). libc.bp only references its
+        # "libunwind-exported" name, which EXTERNAL_PRELINKED resolves to the
+        # NDK libunwind.a linked by build-libc.sh, and no loaded Blueprint
+        # depends on a module from that file. Loading it is therefore optional;
+        # do not require the checkout to carry it.
 
     def load(self, path):
         if not path.is_file():

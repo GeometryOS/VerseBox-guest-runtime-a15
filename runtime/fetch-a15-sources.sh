@@ -79,7 +79,9 @@ fetch external/arm-optimized-routines .                    external/arm-optimize
 fetch external/gwp_asan               .                    external/gwp_asan
 fetch external/scudo                  .                    external/scudo
 fetch external/llvm-libc              .                    external/llvm-libc
-fetch external/libunwind_llvm         .                    external/libunwind_llvm
+# external/libunwind_llvm does not exist at android-15.0.0_r36 (the unwinder is
+# in external/llvm-project); select-libc-sources.py no longer loads it and links
+# the NDK's libunwind.a instead, so there is nothing to fetch here.
 
 # C++ runtime and allocator used by ART and by the guest's own C++ programs.
 fetch external/libcxx                src                  external/libcxx/src

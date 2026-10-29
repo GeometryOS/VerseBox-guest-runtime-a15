@@ -43,7 +43,7 @@ Redroid 15 的 ART / framework / HAL / 系统 APK（原样保留，按 APEX 布�
 | system/logging | 同上 | liblog（A15 已移出 system/core） |
 | system/core 内的 property_service/libpropertyinfoparser | 同上 | 属性解析器（A15 就在 system/core 里） |
 | external/llvm-project（NDK 29 的 libc++ 21 头 + 静态库） | NDK 29.0.14206865 | A15 的 linker/libc 需要 C++20；`external/libcxx` 是 2018 年的 libc++ 8，不能用 |
-| external/libunwind_llvm | 同上 | 只供 Blueprint 解析（模块 libunwind-exported）；实现链接 NDK 的 libunwind.a |
+| external/libunwind_llvm | **不拉取** | r36 已无该仓库；libc.bp 只引用名字 `libunwind-exported`，由 `EXTERNAL_PRELINKED` 交给 NDK 的 libunwind.a（build-libc.sh 链接） |
 | external/{gwp_asan,scudo,llvm-libc,arm-optimized-routines} | 同上 | select-libc-sources.py 必须解析这些 Android.bp，否则报 missing blueprint |
 | external/zlib | 同上 | linker 的 zip 支持 |
 | external/jemalloc_new | 同上 | libc 的分配器（A15 路径） |
