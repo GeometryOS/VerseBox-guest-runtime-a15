@@ -1,6 +1,81 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
-## 换会话交接（2026-10-30 第 88 轮，最新）
+## 换会话交接（2026-10-30 第 89 轮，最新）
+
+> 本文是唯一准绳。下面第 88 轮及更早的段落是历史，只用于查证据。
+> 文档已整理：修复到「能开机进桌面」的三篇轮次文档移到
+> `docs/android15-port/归档-20261030-修复到开机/`（内容一字未改）；
+> 日用级修复写进 `docs/android15-port/18-第89轮-进桌面后的日用修复-网络与存储.md`。
+
+━━ 一句话 ━━
+  A15 现在不只是「能进桌面」：**开机后的网络死循环和内部存储全线崩溃都关掉了**。
+  实例 1793360385751（19:39 启动）真机日志：
+  `has died: pers PER` 0 行、`timeout publishing content providers` 0 行、
+  `Waited one second for` 0 行、`Found primary storage` + `Mounted volume` 各 1 行，
+  并且 `Displayed com.android.documentsui/.files.FilesActivity`、
+  `Displayed com.android.gallery3d/.app.GalleryActivity` 都出现了。
+  还没关掉的只剩「截图写不进去」（MediaStore 拒 image/png，见下）。
+
+━━ 已验证（实例 1793360385751，2026-10-30 19:39）━━
+  1) 网络（H 轨缺口，不是 B 轨）：
+     `a15_netd_hash=2be6ff6fb01645cddd3b3bb60f6de5727e5733267 via=...INetd$Stub.HASH`
+     `a15_application_launch` 55 次（修前 1997）、`has died: pers PER` **0**、
+     `Lost network stack` **0**、`ANR in` **0**。
+     真因：A15 的 INetd 是 versioned AIDL，NetworkStackService 构造里调
+     `getInterfaceHash()`；ServiceSpecificException 不是 RemoteException，
+     逃出 handleBindService → 常驻进程 FATAL → AMS 无限重启。
+  2) 存储（三个症状同一个上游）：
+     `StorageManagerService: Found primary storage at VolumeInfo{emulated}`
+     `StorageManagerService: Mounted volume VolumeInfo{emulated} state=MOUNTED`
+     `Volume emulated broadcasting mounted to UserHandle{0}`
+     `timeout publishing content providers` **0**、`depends on provider` **0**
+     客人 /storage/emulated/0 下出现 Alarms/DCIM/Documents/Download/...（MediaProvider 建的）
+     真因链：MediaProvider 起不来（卡 media.c2 HIDL 无限重试 / media.resource_manager）
+     → 没有 ExternalStorageService → 仿真卷被 SMS 丢弃 →
+     文件/图库/截图全线崩。修法：启动镜像自己的 mediaswcodec + mediaserver，
+     vold 端点补 A15 监听签名 / 四参 mount / 用户解锁后重报卷 / getUnlockedUsers。
+  3) 桌面仍在：`desktop_boot_completed=1`、`desktop_home_resolved=com.android.launcher3`、
+     `desktop_services_ready=1`（client 日志）。
+
+━━ 未验证 / 未关闭 ━━
+  1) **截图**：`java.lang.IllegalArgumentException: Unsupported MIME type image/png`
+     at ContentProviderProxy.insert ← ImageExporter.createEntry（`:screenshot` 进程）。
+     MediaStore 拒绝 image/png 的 insert；镜像与宿主 A15 都没有 /system/etc/mime.types，
+     所以「补 mime.types」已排除，下一步是拿到 MediaProvider 抛该异常的类/白名单来源。
+     这是下一轮唯一动作。
+  2) `a15_vold_unhandled=getStorageSize / setupAppDir / fixupAppDir`：
+     已容忍（返回中性值并记名），尚未实现；getStorageSize 返回 0 会让
+     存储容量显示为 0。
+  3) mediaextractor / mediametrics 未启动：日志有
+     `MediaPlayerService: extractor service not available`（通知音/播放相关），
+     不影响文件与图库；A10 是启动这两条的。
+
+━━ 产物（第 89 轮，已装机）━━
+  APK 1,925,429,153 B / A2DCBC149E43652F60F017A024A0A0222568C7A930D8219FBE95BC50F0767855
+      （2026-10-30 19:37 构建 / 19:38 装机）
+  prepared：nativeFiles 1134（新增 liba15vm-media.so = system/bin/mediaserver）、
+      dataFiles 2439、runtimeProfile.services 新增 media + media-codec（uid 1013/gid 1005）
+  脚本事故与恢复：见 _audit/coding-log/2026-10-30-CL-A15-第89轮-检讨-read截断写坏构建脚本.md
+      （prepare-a15.py 曾被 read 截断写坏，已用 round78 备份尾 + inputs.json 对照恢复；
+       顺带补回 A15Zygote/A15AppLaunch 源表、bootanimation 素材 staging、keymaster/keystore2 服务）
+
+━━ 并行看板（第 89 轮结束）━━
+  A / C / C2 / D1 / D2 = 绿（未动）
+  B（SystemServer 起来、进桌面）= 绿
+  Z（guest app 进程树）= 绿
+  F2 / E = 绿（launcher3 + 触摸 + Displayed 多行）
+  N（networkstack 健康检查本身）= 已不再触发（没有崩溃，所以没有健康检查失败）
+  H（HAL/守护进程缺口）= 新关掉两条：media.c2 codec2 store、media.resource_manager
+  O（overlay/idmap2d）= 未动
+  S（存储/日用）= 卷已挂载 + 文件/图库可用；**截图（MIME）仍开**
+  L（进程泄漏）= 已交付
+
+━━ 下一步唯一动作 ━━
+  截图那一条：拿 MediaProvider 侧 `Unsupported MIME type` 的抛出点
+  （哪个类/方法决定允许的 MIME，是否依赖某个配置/apk 资源），
+  再决定补配置还是补实现。不要在没有那行证据之前改代码。
+
+## 换会话交接（2026-10-30 第 88 轮，历史）
 
 > 第 87 轮现场：实例 `1793298124525`（A15，02:24:55 启动，server pid 15483），
 > 证据 `_bin/a15/logs/round87-live/ok/`。
