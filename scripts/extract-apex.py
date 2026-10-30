@@ -201,6 +201,66 @@ def walk(image, inode_number, prefix, entries, target):
                              "uid": 0, "gid": 0, "mtime": 0}
 
 
+def reindex(name, target, entries):
+    """Re-add an already-expanded APEX tree to rootfs-index.json.
+
+    Two steps write the index: extract-rootfs.py rebuilds it from the image
+    layers (no APEX contents at all) and this script appends each expanded
+    payload. If the index disappears while the .expanded markers survive --
+    exactly what a CI cache that keeps rootfs/ but not rootfs-index.json
+    produces -- the cached branch below used to return without touching the
+    index, and prepare-a15.py then failed with
+
+        Missing Android 15 program dalvikvm64 at /apex/com.android.art/bin/dalvikvm64
+
+    (CI, 2026-10-30; the same state reproduces locally by stripping the
+    apex/* keys: 3681 entries, the number the CI log prints). Re-derive the
+    missing entries from disk so the two writers can never desync. Entries that
+    already exist are left untouched: their mode/uid/gid come from the payload,
+    which the host filesystem cannot represent faithfully (Windows reports
+    0o666/0o777 for everything).
+    """
+    added = 0
+    for root, dirs, files in os.walk(target):
+        relative_root = os.path.relpath(root, target)
+        for entry_name in dirs + files:
+            absolute = os.path.join(root, entry_name)
+            relative = entry_name if relative_root == "." else posixpath.join(
+                relative_root.replace(os.sep, "/"), entry_name)
+            key = "apex/%s/%s" % (name, relative)
+            if key in entries:
+                continue
+            # Modes must match what the payload path records, because the guest
+            # executes these files: a file recorded 0o644 instead of the payload's
+            # 0o666/0o755 loses its exec bit in the APK. stat() is only meaningful
+            # on POSIX (the CI runs there); on Windows it reports 0o666/0o777 for
+            # everything, so fall back to the payload conventions the walk() path
+            # writes (files 0o666, dirs 0o777, symlinks 0o777).
+            stat_mode = None
+            if os.name != "nt":
+                import stat as _stat
+                stat_mode = _stat.S_IMODE(os.lstat(absolute).st_mode)
+            if os.path.islink(absolute):
+                record = {"type": "symlink", "mode": 0o777, "uid": 0, "gid": 0, "mtime": 0,
+                          "target": os.readlink(absolute).replace(os.sep, "/")}
+            elif os.path.isdir(absolute):
+                record = {"type": "dir", "mode": stat_mode if stat_mode is not None else 0o777,
+                          "uid": 0, "gid": 0, "mtime": 0}
+            else:
+                record = {"type": "file", "mode": stat_mode if stat_mode is not None else 0o666,
+                          "uid": 0, "gid": 0, "mtime": 0,
+                          "bytes": os.path.getsize(absolute)}
+            record["path"] = key
+            entries[key] = record
+            added += 1
+    root_key = "apex/%s" % name
+    if root_key not in entries:
+        entries[root_key] = {"path": root_key, "type": "dir", "mode": 0o755,
+                             "uid": 0, "gid": 0, "mtime": 0}
+        added += 1
+    return added
+
+
 def long_path(path):
     absolute = str(path.resolve())
     if os.name == "nt" and not absolute.startswith("\\\\?\\"):
@@ -225,7 +285,8 @@ def main():
         target = APEX_TARGET / name
         marker = target / ".expanded"
         if marker.is_file() and not verify:
-            print("cached %s (already expanded)" % name)
+            added = reindex(name, target, entries)
+            print("cached %s (already expanded, re-indexed %d entries)" % (name, added))
             expanded.append(name)
             continue
         with zipfile.ZipFile(apex) as archive:

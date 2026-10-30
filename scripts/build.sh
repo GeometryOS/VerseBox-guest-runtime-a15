@@ -50,7 +50,18 @@ else
 fi
 
 # ----------------------------------------------------------------- 3. APEX ----
-if [ "$FORCE" = 1 ] || [ ! -f rootfs/apex/com.android.art/.expanded ]; then
+# The .expanded markers are not enough to skip this step: rootfs-index.json is
+# written by two different scripts (extract-rootfs.py rebuilds it from the image
+# layers, extract-apex.py appends the expanded payloads), so a cache that keeps
+# rootfs/apex but loses rootfs-index.json leaves the index without any APEX
+# contents. Skipping on the marker alone then made prepare-a15.py fail with
+#   Missing Android 15 program dalvikvm64 at /apex/com.android.art/bin/dalvikvm64
+# (CI, 2026-10-30). Treat "the index does not mention the ART APEX" as "not
+# expanded": extract-apex.py re-indexes an already-expanded tree in place.
+apex_indexed() {
+    [ -f rootfs-index.json ] && grep -q '"apex/com.android.art/bin/dalvikvm64"' rootfs-index.json
+}
+if [ "$FORCE" = 1 ] || [ ! -f rootfs/apex/com.android.art/.expanded ] || ! apex_indexed; then
     step "expand APEX payloads"
     "$PY" scripts/extract-apex.py
 else

@@ -78,6 +78,13 @@ public final class A15GuestApplication {
             init = "unavailable:" + failure;
         }
         System.out.println("a15_application_runtime_init=" + init);
+        // The MIME database MediaProvider resolves extensions through. Android 15
+        // builds it from classpath resources (/res/*.mime.types in framework.jar);
+        // when that lookup comes back empty every MediaStore insert with an
+        // explicit MIME type is rejected with "Unsupported MIME type" (the
+        // screenshot failure). One line says which table the guest ended up with.
+        System.out.println("a15_application_mime=" + A15MimeTypes.install());
+        System.out.flush();
         try {
             Class<?> vm = Class.forName("dalvik.system.VMRuntime");
             Object runtime = vm.getMethod("getRuntime").invoke(null);

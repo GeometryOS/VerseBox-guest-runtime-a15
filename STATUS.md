@@ -3,18 +3,23 @@
 ## 换会话交接（2026-10-30 第 89 轮，最新）
 
 > 本文是唯一准绳。下面第 88 轮及更早的段落是历史，只用于查证据。
-> 文档已整理：修复到「能开机进桌面」的三篇轮次文档移到
-> `docs/android15-port/归档-20261030-修复到开机/`（内容一字未改）；
-> 日用级修复写进 `docs/android15-port/18-第89轮-进桌面后的日用修复-网络与存储.md`。
+>
+> 文档区已按阶段重整（2026-10-30）：
+> - **当前阶段 = 日用修复**，看 `docs/android15-port/日用修复/README.md`，
+>   状态与卡点看 `日用修复/01`，任务看 `02`，轨道矩阵看 `03`，逐轮看 `04`；
+> - 第 89 轮完整取证：`docs/android15-port/18-第89轮-进桌面后的日用修复-网络与存储.md`；
+> - 「修复到能开机进桌面」的进度/卡点/交接/逐轮记录已整体移到
+>   `docs/android15-port/归档-20261030-修复到开机/`（01/08/10/11/12/14/15/16/17，内容一字未改）；
+>   长期有效的阶段说明/契约（02–07、09、13）留在原目录。
 
 ━━ 一句话 ━━
-  A15 现在不只是「能进桌面」：**开机后的网络死循环和内部存储全线崩溃都关掉了**。
-  实例 1793360385751（19:39 启动）真机日志：
-  `has died: pers PER` 0 行、`timeout publishing content providers` 0 行、
-  `Waited one second for` 0 行、`Found primary storage` + `Mounted volume` 各 1 行，
-  并且 `Displayed com.android.documentsui/.files.FilesActivity`、
-  `Displayed com.android.gallery3d/.app.GalleryActivity` 都出现了。
-  还没关掉的只剩「截图写不进去」（MediaStore 拒 image/png，见下）。
+  A15 的「日用三件套」全部关掉了：**网络死循环、内部存储/文件/图库、截图**。
+  实例 1793363090903（20:25）真机：`a15_application_mime=installed(entries=710,
+  png->png)`、`Screenshot: Finished waiting for id=0`、
+  客人 `Pictures/Screenshots/` 里落了 4 张 PNG（78,372 / 18,362 / 7,317 / 80,456 B）。
+  同时 CI 的 `Missing Android 15 program dalvikvm64` 也修好了（构建脚本幂等性 bug，
+  与运行时无关；本地复现→修复→index 回到 4775 条、与事故前备份 0 差异）。
+  另：`_audit` 的两篇检讨按维护者要求**暂不写**，等他 commit 并确认无误后再补。
 
 ━━ 已验证（实例 1793360385751，2026-10-30 19:39）━━
   1) 网络（H 轨缺口，不是 B 轨）：
@@ -37,28 +42,35 @@
   3) 桌面仍在：`desktop_boot_completed=1`、`desktop_home_resolved=com.android.launcher3`、
      `desktop_services_ready=1`（client 日志）。
 
+━━ 已验证（第 89 轮末尾，实例 1793363090903，20:25）━━
+  3) 截图（MimeMap 空）：每个 guest app 进程入口探一次 MIME 表，非空不动；
+     为空时用框架自己的 `libcore.content.type.MimeMap.setDefaultSupplier` 钩子，
+     把镜像 `system/framework/framework.jar` 里 `res/{debian,android,vendor}.mime.types`
+     （710 条映射）装回去。真机：`a15_application_mime=installed(entries=710, png->png)`、
+     `Screenshot: Finished waiting for id=0. onFinish id=0`，
+     `Pictures/Screenshots/Screenshot_20261030-20*.png` 4 个文件。
+     排除过的两条错路（都留了证据）：`/system/etc/mime.types` 在镜像里本来就没有，
+     打进去也无效（A15 不读该路径，已回滚）；dataFiles 没有丢条目
+     （index 4775 条与事故前备份逐项 0 差异）。
+  4) CI `Missing Android 15 program dalvikvm64`：`rootfs-index.json` 与 `.expanded` 标记
+     失同步（extract-rootfs 重建 index、extract-apex 追加 APEX 条目、build.sh 只看标记）。
+     修法：extract-apex 在缓存分支重新索引；build.sh 把“index 无 ART APEX 条目”视为未展开。
+
 ━━ 未验证 / 未关闭 ━━
-  1) **截图**：`java.lang.IllegalArgumentException: Unsupported MIME type image/png`
-     at ContentProviderProxy.insert ← ImageExporter.createEntry（`:screenshot` 进程）。
-     MediaStore 拒绝 image/png 的 insert；镜像与宿主 A15 都没有 /system/etc/mime.types，
-     所以「补 mime.types」已排除，下一步是拿到 MediaProvider 抛该异常的类/白名单来源。
-     这是下一轮唯一动作。
-  2) `a15_vold_unhandled=getStorageSize / setupAppDir / fixupAppDir`：
-     已容忍（返回中性值并记名），尚未实现；getStorageSize 返回 0 会让
-     存储容量显示为 0。
-  3) mediaextractor / mediametrics 未启动：日志有
-     `MediaPlayerService: extractor service not available`（通知音/播放相关），
-     不影响文件与图库；A10 是启动这两条的。
-
+  1) `a15_vold_unhandled=getStorageSize / setupAppDir / fixupAppDir`：已容忍（返回中性值并记名），
+     尚未实现；getStorageSize 返回 0 会让存储容量显示为 0。
+  2) mediaextractor / mediametrics 未启动：日志有
+     `MediaPlayerService: extractor service not available`（通知音/播放相关），不影响文件/图库/截图。
+  3) 截图音效：`ScreenshotSoundControllerImpl: Screenshot sound initialization failed`
+     （缺 soundfx 库），只影响声音。
 ━━ 产物（第 89 轮，已装机）━━
-  APK 1,925,429,153 B / A2DCBC149E43652F60F017A024A0A0222568C7A930D8219FBE95BC50F0767855
-      （2026-10-30 19:37 构建 / 19:38 装机）
-  prepared：nativeFiles 1134（新增 liba15vm-media.so = system/bin/mediaserver）、
-      dataFiles 2439、runtimeProfile.services 新增 media + media-codec（uid 1013/gid 1005）
+  APK 1,925,432,853 B / 2BA4D0E22080D7F53151A4BC50201724AA4DC64D99A206B545C6E6C4DA66727B
+      （2026-10-30 20:22 构建 / 20:23 装机；截图 4 张的验证就是这一版）
+  prepared：nativeFiles 1134、dataFiles 2438、runtimeProfile.services 新增
+      media（system/bin/mediaserver）+ media-codec（mediaswcodec），uid 1013/gid 1005
+  framework-check.dex 新增 A15MimeTypes（只多不少：A15Zygote/A15AppLaunch 已在源码表内）
+  rootfs-index.json 4775 条（与事故前备份逐项 0 差异）
   脚本事故与恢复：见 _audit/coding-log/2026-10-30-CL-A15-第89轮-检讨-read截断写坏构建脚本.md
-      （prepare-a15.py 曾被 read 截断写坏，已用 round78 备份尾 + inputs.json 对照恢复；
-       顺带补回 A15Zygote/A15AppLaunch 源表、bootanimation 素材 staging、keymaster/keystore2 服务）
-
 ━━ 并行看板（第 89 轮结束）━━
   A / C / C2 / D1 / D2 = 绿（未动）
   B（SystemServer 起来、进桌面）= 绿
@@ -71,10 +83,9 @@
   L（进程泄漏）= 已交付
 
 ━━ 下一步唯一动作 ━━
-  截图那一条：拿 MediaProvider 侧 `Unsupported MIME type` 的抛出点
-  （哪个类/方法决定允许的 MIME，是否依赖某个配置/apk 资源），
-  再决定补配置还是补实现。不要在没有那行证据之前改代码。
-
+  补 mediaextractor（+ mediametrics，A10 一直有），让 `media.extractor` 可用：
+  判据是同一次开机里 `MediaPlayerService: extractor service not available` 归零。
+  （截图/文件/图库/网络都已关闭，不要回头再动 vold / netd / MimeMap。）
 ## 换会话交接（2026-10-30 第 88 轮，历史）
 
 > 第 87 轮现场：实例 `1793298124525`（A15，02:24:55 启动，server pid 15483），

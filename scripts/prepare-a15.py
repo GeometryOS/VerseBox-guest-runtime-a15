@@ -1007,6 +1007,20 @@ def main():
         print("prepare-a15: bootanimation.zip missing, UI-0 disabled: "
               + str(bootanim_source), file=sys.stderr)
 
+    # 8.0b MIME database (round 89) -- the /system/etc route is DISPROVEN.
+    #
+    # Screenshots failed with "Unsupported MIME type image/png" from
+    # MediaProvider.ensureFileColumns, because the guest's libcore MimeMap is empty.
+    # Staging /system/etc/mime.types did not change anything and was removed: A15
+    # never reads that path. It builds the map from classpath resources
+    # (/res/{debian,android,vendor}.mime.types inside system/framework/framework.jar
+    # via android.content.type.DefaultMimeMapFactory), and in this container that
+    # lookup returns null even though the jar really contains the entries (probe
+    # line: a15_application_mime=fallback(replaced=false, png->null)).
+    # The fix lives in vendor/framework/A15MimeTypes.java: it parses those same
+    # resources out of the jar and installs them through the framework's own
+    # MimeMap.setDefaultSupplier hook, in every guest app process.
+
     # 8. Host device VINTF entry.
     host_vintf = A15 / "vintf" / "host-devices.xml"
     vintf_asset = ASSET_PREFIX + "rootfs/vendor/etc/vintf/manifest/a10vm-host-devices.xml"
@@ -1569,6 +1583,7 @@ def build_dex():
         # (A15Boot.start() calls it). The authoritative inventory is the class list
         # of the last good framework-check.dex (docs/android15-port/18).
         A15 / "vendor" / "framework" / "A15Zygote.java",
+        A15 / "vendor" / "framework" / "A15MimeTypes.java",
         A15 / "vendor" / "framework" / "A15AppLaunch.java",
     ]
     # Shared framework classes, same list as A9 until each one is verified on
