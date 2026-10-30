@@ -52,9 +52,14 @@
      排除过的两条错路（都留了证据）：`/system/etc/mime.types` 在镜像里本来就没有，
      打进去也无效（A15 不读该路径，已回滚）；dataFiles 没有丢条目
      （index 4775 条与事故前备份逐项 0 差异）。
-  4) CI `Missing Android 15 program dalvikvm64`：`rootfs-index.json` 与 `.expanded` 标记
+  4) CI 两次失败都已修（**真实 CI 尚未复跑**）：
+     a. `Missing Android 15 program dalvikvm64`：`rootfs-index.json` 与 `.expanded` 标记
      失同步（extract-rootfs 重建 index、extract-apex 追加 APEX 条目、build.sh 只看标记）。
      修法：extract-apex 在缓存分支重新索引；build.sh 把“index 无 ART APEX 条目”视为未展开。
+     b. `FileNotFoundError: 'cmd'`（d8）：`d8()` 写死 `cmd /c d8.bat`，只在 Windows 成立。
+     修法：`d8_binary(windows)` + `d8_command(..., windows)`，平台开关做成参数；
+     本机断言 POSIX=`.../35.0.0/d8` / Windows=`cmd /c ...d8.bat`，本地全流程 d8 产出
+     `a15-dex/classes.dex` 141,288 B。**这条是第 89 轮恢复脚本时丢的**（恢复自证只对照了产物清单）。
 
 ━━ 未验证 / 未关闭 ━━
   1) `a15_vold_unhandled=getStorageSize / setupAppDir / fixupAppDir`：已容忍（返回中性值并记名），

@@ -55,7 +55,17 @@ SDK = Path(os.environ.get("ANDROID_HOME",
     r"C:/Users/22437/AppData/Local/Android/Sdk" if os.name == "nt"
     else str(Path.home() / "Android/Sdk")))
 ANDROID_JAR = SDK / "platforms" / "android-35" / "android.jar"
-D8 = SDK / "build-tools" / "35.0.0" / ("d8.bat" if os.name == "nt" else "d8")
+D8_VERSION = "35.0.0"
+
+
+def d8_binary(windows=None):
+    """SDK d8 entry point for this platform (d8.bat on Windows, d8 elsewhere)."""
+    if windows is None:
+        windows = os.name == "nt"
+    return SDK / "build-tools" / D8_VERSION / ("d8.bat" if windows else "d8")
+
+
+D8 = d8_binary()
 
 # Guest runtime destinations. A15 /system/{bin/linker64,lib64/libc.so,...} are
 # symlinks into these APEX paths, so the source-built runtime replaces the APEX
@@ -1637,14 +1647,29 @@ def compile_java(sources, destination, classpath=None):
     run_tool(command, "javac")
 
 
+def d8_command(destination, class_files, windows=None):
+    """argv for the SDK's d8.
+
+    Windows ships d8.bat, which can only be started through cmd.exe; the POSIX
+    build-tools ship a plain d8 executable. Hard-coding "cmd" made CI fail with
+    FileNotFoundError: [Errno 2] No such file or directory: 'cmd'
+    (build-tools 35.0.0, ubuntu runner, 2026-10-30). The platform switch is a
+    parameter so the POSIX branch can be asserted on a Windows host.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    prefix = ["cmd", "/c"] if windows else []
+    return prefix + [str(d8_binary(windows)), "--min-api", "35",
+                     "--lib", str(ANDROID_JAR),
+                     "--output", str(destination)] + class_files
+
+
 def d8(classes, destination):
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
     class_files = [str(x) for x in classes.rglob("*.class")]
-    command = ["cmd", "/c", str(D8), "--min-api", "35", "--lib", str(ANDROID_JAR),
-               "--output", str(destination)] + class_files
-    run_tool(command, "d8")
+    run_tool(d8_command(destination, class_files), "d8")
 
 
 if __name__ == "__main__":
