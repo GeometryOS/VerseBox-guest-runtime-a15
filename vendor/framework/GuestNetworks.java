@@ -18,6 +18,7 @@ final class GuestNetworks implements InvocationHandler {
     private final Map<Integer, Set<String>> interfaces = new HashMap<>();
     private final Map<Integer, Integer> userPermissions = new HashMap<>();
     private final Map<Integer, Integer> trafficPermissions = new HashMap<>();
+    private static final Set<String> reportedOnce = new HashSet<>();
 
     static void register() throws Exception {
         registerNetworkService();
@@ -126,6 +127,34 @@ final class GuestNetworks implements InvocationHandler {
             // comparison), so the honest container answer is the value the
             // framework's own no-op implementation reports.
             case "getInterfaceHash": return interfaceHash();
+            // A15: ConnectivityService.registerNetworkAgentInternal() does not finish
+            // the registration by itself any more. It calls
+            //   NetworkStackClient.makeNetworkMonitor(Network, name, callbacks)
+            // and only the callback (handleRegisterNetworkAgent) calls
+            // INetworkAgent.onRegistered(). Inside NetworkMonitor's constructor,
+            // NetworkStack builds a TcpSocketTracker, whose constructor does
+            //   mNetworkMarkMask = netd.getFwmarkForNetwork(netId).mask   // no null check
+            // (image service-connectivity.jar: TcpSocketTracker.getNetworkMarkMask
+            // reads MarkMaskParcel.mark/.mask directly). The shim used to throw
+            // code 95 here, so makeNetworkMonitor aborted, the callback never ran,
+            // onRegistered never arrived, the registry stayed null and the default
+            // network stayed null forever -> status bar Wi-Fi/Internet icon, the
+            // IP/MAC rows and "connected" all missing while the data path worked
+            // (instance 1793463734155, application-20083-5.log:
+            //  NetworkMonitor.<init> -> getFwmarkForNetwork -> code 95).
+            // A container has no netd fwmark tagging, so answer what netd would
+            // answer structurally: netId in the low 16 bits of the mark and the
+            // netId mask. No socket carries that mark, so the tracker sees no
+            // sockets of its own - which is the honest state here.
+            case "getFwmarkForNetwork": {
+                Class<?> type = method.getReturnType();
+                Object parcel = type.getConstructor().newInstance();
+                type.getField("mask").setInt(parcel, 0xFFFF);
+                type.getField("mark").setInt(parcel, ((Integer) args[0]) & 0xFFFF);
+                if (reportedOnce.add("getFwmarkForNetwork"))
+                    System.out.println("a15_netd_fwmark=netId:" + args[0]);
+                return parcel;
+            }
             case "registerUnsolicitedEventListener": listener = args[0]; return null;
             case "interfaceGetList":
                 String name = GuestConnectivity.snapshot().optString("interface");
@@ -179,6 +208,25 @@ final class GuestNetworks implements InvocationHandler {
                 return null;
             // Host sockets remain subject to the host's data policy, not guest iptables.
             case "bandwidthEnableDataSaver": return false;
+            // A15 的 ConnectivityService 不再只调 networkCreatePhysical：它先用
+            // INetd.networkCreate(NativeNetworkConfig) 创建网络，成功之后才把该
+            // NetworkAgent 加进默认网络候选。这个壳原来落在 default 分支抛 code 95，
+            // 于是 handleRegisterNetworkAgent() 在 onRegistered 之后立刻打印
+            //   Error creating network [100 WIFI]: Guest host-socket network: networkCreate
+            // 网络永远建不起来、默认网络永远 null、状态栏 Wi-Fi/Internet 图标不画
+            // （实例 1793463734155 / 1793734155 r108：a15_network_agent_registered=1
+            //  之后紧跟这一行）。A15 的 INetd.networkCreate 返回 void（镜像
+            // framework-connectivity.jar dexdump: networkCreate:(NativeNetworkConfig;)V），
+            // 参数 NativeNetworkConfig 的 netId/permission/secure 三个字段从这里读，
+            // 容器只需把它登记成"已创建"，接口/路由本来就没有内核表可写。
+            case "networkCreate": {
+                Object netConfig = args[0];
+                int netId = netConfig.getClass().getField("netId").getInt(netConfig);
+                interfaces.put(netId, new HashSet<>());
+                if (reportedOnce.add("networkCreate"))
+                    System.out.println("a15_netd_network_create=netId:" + netId);
+                return null;
+            }
             case "networkCreatePhysical": interfaces.put((Integer) args[0], new HashSet<>()); return null;
             case "networkDestroy": interfaces.remove((Integer) args[0]); return null;
             case "networkAddInterface":

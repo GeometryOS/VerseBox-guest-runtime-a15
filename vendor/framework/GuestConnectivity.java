@@ -35,6 +35,8 @@ public final class GuestConnectivity {
     private Messenger peer;
     /** A15: the INetworkAgentRegistry the framework hands to the agent in onRegistered(). */
     private Object registry;
+    /** The INetworkAgent object handed to registerNetworkAgent (needed to unregister). */
+    private Object agent;
     /** A15: the Network object returned by registerNetworkAgent. */
     private Object network;
     /** The IConnectivityManager proxy, kept for reportNetworkConnectivity. */
@@ -136,6 +138,11 @@ public final class GuestConnectivity {
         // registerNetworkAgent returns android.net.Network on API 35 and an int on
         // API 28/29. Network's netId is @hide, so read the field reflectively.
         netId = registered instanceof Integer ? (Integer) registered : netIdOf(registered);
+        // Android 15 的状态栏与 Settings 只在 `WifiPickerTracker` 收到**默认网络**的
+        // NetworkCapabilities 时才会把 WifiEntry 标成 "Connected/Internet/Default"；
+        // 注册完 NetworkAgent 后这里把系统当时的默认网络原样记一行，下一轮就能
+        // 直接判断缺的是"默认网络没建立"还是"transportInfo 没配对"。
+        handler.postDelayed(GuestConnectivity::reportDefaultNetwork, 3000);
     }
 
     /**
@@ -169,7 +176,10 @@ public final class GuestConnectivity {
         Object agent = LocalGuestService.localEndpoint("android.net.INetworkAgent",
                 (proxy, method, arguments) -> {
                     String name = method.getName();
-                    if ("onRegistered".equals(name) && arguments.length == 1) {
+                    if (reported.add("agent.call." + name))
+                        System.out.println("a15_network_agent_call=" + name + "/"
+                                + (arguments == null ? -1 : arguments.length));
+                    if ("onRegistered".equals(name) && arguments != null && arguments.length == 1) {
                         registry = arguments[0];
                         System.out.println("a15_network_agent_registered=1");
                         push(info, links, caps);
@@ -183,6 +193,7 @@ public final class GuestConnectivity {
         Object result = LocalGuestService.call(service, "android.net.IConnectivityManager",
                 "registerNetworkAgent", agent, info, links, caps, networkScore(60),
                 localNetworkConfig(), networkAgentConfig(), -1);
+        this.agent = agent;
         System.out.println("a15_network_agent_shape=api35");
         return result;
     }
@@ -210,6 +221,86 @@ public final class GuestConnectivity {
             LocalGuestService.call(registry, "android.net.INetworkAgentRegistry", "sendScore", networkScore(60));
         } catch (Exception error) {
             System.err.println("Guest network registry: " + error);
+        }
+    }
+
+    /**
+     * Which network ConnectivityService calls the default, sampled repeatedly.
+     *
+     * <p>One sample 3 s after registration only proves what was true before boot
+     * completed (it printed null on every run so far). The framework evaluates the
+     * default network when requests arrive later, so keep sampling for a minute and
+     * stop early once a network appears; the log line therefore says `attempt=N`.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger defaultSamples =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    private static void reportDefaultNetwork() {
+        int attempt = defaultSamples.incrementAndGet();
+        try {
+            Object thread = Class.forName("android.app.ActivityThread")
+                    .getMethod("currentActivityThread").invoke(null);
+            android.content.Context context = (android.content.Context)
+                    thread.getClass().getMethod("getSystemContext").invoke(thread);
+            Object manager = context.getSystemService(Class.forName("android.net.ConnectivityManager"));
+            Object network = manager.getClass().getMethod("getActiveNetwork").invoke(manager);
+            Object caps = null;
+            if (network != null)
+                caps = manager.getClass().getMethod("getNetworkCapabilities", Class.forName("android.net.Network"))
+                        .invoke(manager, network);
+            System.out.println("a15_default_network=" + (network == null ? "null" : netIdOf(network))
+                    + (caps == null ? " caps=null" : " caps=" + caps)
+                    + " attempt=" + attempt);
+            if (network != null) return;
+            maybeReregister();
+        } catch (Throwable failure) {
+            System.out.println("a15_default_network_failed=" + failure + " attempt=" + attempt);
+        }
+        if (attempt < 24 && handler != null) handler.postDelayed(GuestConnectivity::reportDefaultNetwork, 2500);
+    }
+
+    private static volatile boolean reregistered;
+
+    private static boolean bootCompleted() {
+        try {
+            return "1".equals((String) Class.forName("android.os.SystemProperties")
+                    .getMethod("get", String.class).invoke(null, "sys.boot_completed"));
+        } catch (Throwable ignored) { return false; }
+    }
+
+    /**
+     * Re-registers the agent once, after boot completed.
+     *
+     * <p>Real-device evidence (r105, instance 1793463319744): the agent is registered
+     * at StartConnectivityService time (16:15:50) while NetworkStackClient only prints
+     * "Network stack service connected" much later (server.log:26973).
+     * NetworkAgentInfo.notifyRegistered() is what hands the agent its
+     * INetworkAgentRegistry, and ConnectivityService.handleRegisterNetworkAgent()
+     * takes an INetworkMonitor *before* that call; registered that early there is no
+     * monitor yet, so onRegistered never arrives (a15_network_agent_call = 0 lines)
+     * and the default network stays null forever (a15_default_network=null x24).
+     * Re-registering after boot puts the agent behind a ready NetworkStack.
+     */
+    private static void maybeReregister() {
+        GuestConnectivity relay = active;
+        if (relay == null || relay.registry != null || reregistered || !bootCompleted()) return;
+        reregistered = true;
+        try {
+            IBinder binder = (IBinder) Class.forName("android.os.ServiceManager")
+                    .getMethod("checkService", String.class).invoke(null, "connectivity");
+            if (binder == null) return;
+            try {
+                LocalGuestService.call(relay.connectivity, "android.net.IConnectivityManager",
+                        "unregisterNetworkAgent", relay.agent);
+            } catch (Throwable ignored) { }
+            defaultSamples.set(0);
+            GuestConnectivity replacement = new GuestConnectivity(binder, snapshot());
+            agents.remove(relay);
+            agents.add(replacement);
+            active = replacement;
+            System.out.println("a15_network_agent_reregistered=" + replacement.netId);
+        } catch (Throwable failure) {
+            System.out.println("a15_network_agent_reregister_failed=" + failure);
         }
     }
 
@@ -342,9 +433,24 @@ public final class GuestConnectivity {
                 .invoke(caps, NetworkCapabilities.TRANSPORT_ETHERNET);
         if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
             JSONObject wifi = snapshot.optJSONObject("wifi");
-            NetworkCapabilities.class.getMethod("setSSID", String.class).invoke(caps, GuestWifi.ssid(wifi));
+            try {
+                NetworkCapabilities.class.getMethod("setSSID", String.class).invoke(caps, GuestWifi.ssid(wifi));
+            } catch (Throwable absent) {
+                if (reported.add("caps.ssid")) System.out.println("a15_caps_ssid=absent:" + absent);
+            }
             if (wifi != null && wifi.has("rssi")) NetworkCapabilities.class.getMethod("setSignalStrength", int.class)
                     .invoke(caps, wifi.getInt("rssi"));
+            // Android 15 的状态栏不是从 WifiManager 取连接状态，而是从**默认网络的
+            // NetworkCapabilities.getTransportInfo()** 取 WifiInfo：
+            //   SystemUI.apk classes2.dex 里 com.android.wifitrackerlib.WifiPickerTracker
+            //   同时引用 NetworkCapabilities.getTransportInfo 与
+            //   NetworkCapabilities$Builder.setTransportInfo，WifiRepositoryImpl 再用
+            //   WifiEntry.isDefaultNetwork / isPrimaryNetwork 过滤出"当前默认网络"，
+            //   过滤不到就退化成 WifiNetworkModel$Inactive（= 状态栏不画 Wi-Fi 图标）。
+            // 真机的 WifiNetworkAgent 在 registerNetworkAgent 之前就是这么塞的；
+            // 我们只塞了旧字段 SSID/signalStrength，A15 的 wifitrackerlib 认不出来。
+            // 实例 1793449504963：wifiStateFlow=3、扫描回调已推送（a15_wifi_scan_callback=set）、
+            // 仍然没有图标，缺口就在这里。
         }
         for (String key : new String[] {"internet", "validated", "notMetered", "notRoaming", "notSuspended"}) {
             int value = key.equals("internet") ? NetworkCapabilities.NET_CAPABILITY_INTERNET :
@@ -355,11 +461,87 @@ public final class GuestConnectivity {
             NetworkCapabilities.class.getMethod(snapshot.optBoolean(key) ? "addCapability" : "removeCapability",
                     int.class).invoke(caps, value);
         }
+        // Android 15 的系统默认网络请求带 NOT_VCN_MANAGED
+        // (ConnectivityService 的 requestNetwork 日志: INTERNET&NOT_RESTRICTED&TRUSTED
+        //  &NOT_VPN&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED)。agent 的 caps 缺这一位
+        // 时 satisfies() 直接失败，默认网络永远是 null（实例 1793461890684:
+        // a15_default_network=null，而 registerNetworkAgent 的 nc{} 里没有
+        // NOT_VCN_MANAGED）——这也正是状态栏 WiFi 图标、Internet 标记和 IP 页面
+        // 一起为空的上游。位值从镜像自己的常量取，不写死 28。
+        try {
+            int notVcnManaged = NetworkCapabilities.class.getField("NET_CAPABILITY_NOT_VCN_MANAGED")
+                    .getInt(null);
+            NetworkCapabilities.class.getMethod("addCapability", int.class).invoke(caps, notVcnManaged);
+            if (reported.add("caps.notVcnManaged"))
+                System.out.println("a15_caps_not_vcn_managed=" + notVcnManaged);
+        } catch (Throwable absent) {
+            if (reported.add("!caps.notVcnManaged"))
+                System.out.println("a15_caps_not_vcn_managed_failed=" + absent);
+        }
         NetworkCapabilities.class.getMethod("setLinkDownstreamBandwidthKbps", int.class)
                 .invoke(caps, snapshot.optInt("downstreamKbps"));
         NetworkCapabilities.class.getMethod("setLinkUpstreamBandwidthKbps", int.class)
                 .invoke(caps, snapshot.optInt("upstreamKbps"));
+        // 最后才挂 WifiInfo：Builder 重建出来的对象可能不可再改，所以放在所有
+        // addCapability/setLink* 之后，避免"挂上之后就不能再写"的二义性。
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            try {
+                caps = attachTransportInfo(caps, GuestWifi.connectionInfo(snapshot));
+            } catch (Throwable failure) {
+                if (reported.add("!caps.transportInfo"))
+                    System.out.println("a15_caps_transport_info_failed=" + failure);
+            }
+        }
         return caps;
+    }
+
+    /**
+     * Attaches the relay's WifiInfo to the capabilities, which is the only thing the
+     * Android 15 status bar uses to decide "is this wifi the current default network".
+     *
+     * <p>镜像取证：SystemUI.apk classes2.dex 的
+     * {@code com.android.wifitrackerlib.WifiPickerTracker} 同时引用
+     * {@code NetworkCapabilities.getTransportInfo()} 与
+     * {@code NetworkCapabilities$Builder.setTransportInfo(TransportInfo)}，
+     * {@code WifiRepositoryImpl} 再用 {@code WifiEntry.isDefaultNetwork} /
+     * {@code isPrimaryNetwork} 过滤；过滤不到就退回
+     * {@code WifiNetworkModel$Inactive}，{@code WifiViewModel$wifiIcon} 于是给
+     * {@code WifiIcon$Hidden} —— 状态栏没有 Wi-Fi 图标（实例 1793449504963：
+     * wifiStateFlow=3、扫描回调已推送、图标仍无）。
+     *
+     * <p>为什么要有三条路：A15 的 {@code NetworkCapabilities} 同时出现在
+     * {@code framework.jar}（只有 getTransportInfo）和 {@code framework-connectivity.jar}
+     * （有 setter）里，运行期只认先加载的那一份，所以直接调 setter 可能不存在。
+     * 这里依次尝试 直接 setter → Builder 重建 → 私有字段 mTransportInfo，
+     * 命中的那条写进 {@code a15_caps_transport_info=}，三条都失败才写 failed。
+     */
+    private static NetworkCapabilities attachTransportInfo(NetworkCapabilities caps,
+            android.net.wifi.WifiInfo info) throws Exception {
+        Class<?> transportInfo = Class.forName("android.net.TransportInfo");
+        String label = null;
+        NetworkCapabilities result = caps;
+        try {
+            NetworkCapabilities.class.getMethod("setTransportInfo", transportInfo).invoke(caps, info);
+            label = "setter";
+        } catch (Throwable direct) {
+            try {
+                Object builder = Class.forName("android.net.NetworkCapabilities$Builder")
+                        .getConstructor(NetworkCapabilities.class).newInstance(caps);
+                builder.getClass().getMethod("setTransportInfo", transportInfo).invoke(builder, info);
+                Object built = builder.getClass().getMethod("build").invoke(builder);
+                if (built instanceof NetworkCapabilities) { result = (NetworkCapabilities) built; label = "builder"; }
+            } catch (Throwable rebuild) {
+                // 最后一条：镜像里的字段名（dexdump 之外没有再核过，所以失败要留原文）。
+                java.lang.reflect.Field field = NetworkCapabilities.class.getDeclaredField("mTransportInfo");
+                field.setAccessible(true);
+                field.set(caps, info);
+                label = "field";
+            }
+        }
+        if (reported.add("caps.transportInfo"))
+            System.out.println("a15_caps_transport_info=" + label + ":" + info.getSSID()
+                    + "/" + info.getNetworkId() + "/" + info.getRssi());
+        return result;
     }
 
     private static LinkProperties links(JSONObject snapshot) throws Exception {

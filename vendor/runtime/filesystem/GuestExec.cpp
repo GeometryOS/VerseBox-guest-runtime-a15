@@ -57,6 +57,34 @@ static void traceExec(const char* path, bool skipped) {
     syscall(__NR_close, fd);
 }
 
+/**
+ * Makes sure the file the guest is about to execute has an execute bit.
+ *
+ * <p>为什么必须在运行时补：客体 rootfs 里的文件是从 APK assets 解出来的，权限来自
+ * prepared 清单的 mode 字段，而这份清单在 **Windows** 上生成时拿不到 POSIX 模式，
+ * 于是 apex/bin 下的二进制一律记成 0666（extract-apex.py 的 fallback）。内核拒绝
+ * exec 一个没有 x 位的文件 → artd 每条 dexopt 都在这里失败：
+ *
+ * <pre>
+ *   Failed to execute (/apex/com.android.art/bin/art_exec --drop-capabilities ...):
+ *     Permission denied            (vm/framework-artd.log, 实例 1793447452431)
+ *   dex2oat returned an unexpected code: 134
+ * </pre>
+ *
+ * <p>也就是说“安装/清数据/卸载卡住、应用存储占用一直转圈”的那串现象，源头是这一个
+ * 权限位。文件属于本进程的 uid（整个实例都在 app 沙箱里），所以 chmod 一定成功；
+ * 只在 X_OK 真的失败、且 errno 是 EACCES 时才补，不影响正常路径。
+ */
+static int ensureExecutable(const char* path) {
+    if (syscall(__NR_faccessat, AT_FDCWD, path, X_OK) == 0) return 0;
+    int saved = errno;
+    if (saved != EACCES) return -1;
+    // 跟随符号链接（/apex/com.android.art/bin/dex2oat64 -> liba15vm-dex2oat64.so）。
+    if (syscall(__NR_fchmodat, AT_FDCWD, path, 0755) < 0) { errno = saved; return -1; }
+    if (syscall(__NR_faccessat, AT_FDCWD, path, X_OK) < 0) return -1;
+    return 0;
+}
+
 static int guestExec(const char* path, char* const argv[], char* const env[], unsigned depth) {
     if (depth > 4) { errno = ELOOP; return -1; }
     bool skipped = skipDex2oat(path);
@@ -73,7 +101,7 @@ static int guestExec(const char* path, char* const argv[], char* const env[], un
     int saved = errno;
     close(fd);
     if (size < 0) { errno = saved; return -1; }
-    if (syscall(__NR_faccessat, AT_FDCWD, mapped, X_OK) < 0) return -1;
+    if (ensureExecutable(mapped) < 0) return -1;
     size_t argc = 0, envc = 0;
     while (argv && argv[argc]) if (++argc > 131072) { errno = E2BIG; return -1; }
     while (env && env[envc]) if (++envc > 131072) { errno = E2BIG; return -1; }

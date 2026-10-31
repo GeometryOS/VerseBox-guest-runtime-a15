@@ -337,6 +337,7 @@ public final class A15Boot {
         // <stateRoot>/host-network.json (written by the host's HostNetworkBridge), and
         // GuestConnectivity registers that snapshot as a NetworkAgent so
         // ConnectivityService, apps and the status bar see the host's real network.
+        A15ServiceGuard.beginOwner();
         try {
             GuestWifi.register();
             System.out.println("a15_wifi_endpoint=registered");
@@ -345,6 +346,48 @@ public final class A15Boot {
             // Keep booting and name the loser; the next log line says who owns it.
             System.out.println("a15_wifi_endpoint=unavailable:" + failure);
         }
+        System.out.flush();
+        // --- I-track: the persistent_data_block endpoint -------------------------
+        // PackageInstallerSession.markAsSealed() (services.jar:2441) resolves
+        // PersistentDataBlockManager through ServiceManager.getServiceOrThrow(
+        // "persistent_data_block"). SystemServer only starts that service when the
+        // device declares an FRP partition (ro.frp.pst); redroid has none, so the
+        // lookup throws ServiceNotFoundException *inside* install-commit:
+        //   SystemServiceRegistry: No service published for: persistent_data_block
+        //   at PackageInstallerSession.markAsSealed(PackageInstallerSession.java:2441)
+        //   at PackageInstallerSession.commit(PackageInstallerSession.java:2190)
+        //   at PackageManagerShellCommand.runInstallCommit(...:1719)
+        // (real device 2026-10-31 17:29-17:50, instance 1793438854447, 哔哩哔哩 216 MB)
+        // The exception aborts the shell command inside system_server, libbinder
+        // answers the caller with a failed reply, and the guest sees
+        // "Unknown binder error code 0xffffff91" / DeadObjectException. Publishing
+        // the neutral endpoint is what a device without FRP answers anyway.
+        try {
+            GuestPersistentDataBlock.register();
+            System.out.println("a15_pdb_endpoint=registered");
+        } catch (Throwable failure) {
+            System.out.println("a15_pdb_endpoint=unavailable:" + failure);
+        }
+        // --- N-track: the wifiscanner endpoint -----------------------------------
+        // A15's WifiPickerTracker builds the WLAN list from WifiScanner callbacks, not
+        // from WifiManager.getScanResults(), and the image's WifiScanningService has no
+        // radio here ("WifiScanner: listener does not exist" / "Failed to scan!
+        // Reason: -1"). Without this endpoint the page shows only the saved network
+        // with [Level:0][Connecting...] and the status bar has no Wi-Fi icon.
+        try {
+            GuestWifiScanner.register();
+            System.out.println("a15_wifiscanner_endpoint=registered");
+        } catch (Throwable failure) {
+            System.out.println("a15_wifiscanner_endpoint=unavailable:" + failure);
+        }
+        A15ServiceGuard.endOwner();
+        // First registration wins from here on. Without this the image's own
+        // WifiService/WifiScanningService publish the same two names later in
+        // StartOtherServices and SystemUI caches the "radio disabled" service, which is
+        // why the WLAN list could say "connected" while the status bar, quick settings
+        // and MAC/IP showed nothing (SystemUI: WifiManager.getWifiState():1 vs
+        // Settings: wifi state: 3). See A15ServiceGuard.
+        A15ServiceGuard.install();
         System.out.flush();
         try {
             GuestConnectivity.start();
@@ -822,6 +865,42 @@ public final class A15Boot {
                             .getMethod("get", String.class)
                             .invoke(null, "sys.boot_completed");
                     if ("1".equals(boot)) {
+                        // --- W track: take the "wifi" binder back from the image's
+                        // WifiService. A15Boot registers the host-backed relay before
+                        // SystemServer.main(), but StartOtherServices starts the image's
+                        // own WifiService later and ServiceManager.addService replaces
+                        // the entry:
+                        //   409:  a15_wifi_endpoint=registered          (relay)
+                        //   20688: WifiService: Registering wifi        (image, overwrites)
+                        //   22323: WifiService: WifiService starting up with Wi-Fi disabled
+                        //   29423: WifiService: startScan uid=1000
+                        //   29424: WifiScanRequestProxy: Failed to retrieve wifiscanner
+                        //   29425: WifiService: Failed to start scan
+                        //   29429: ScanResultUtil: Empty or null ScanResult list
+                        // (instance 1793438854447, 2026-10-31 17:29-17:45)
+                        // So every WifiManager call went to a service with the radio
+                        // "disabled" and no scan data, while our relay was never asked
+                        // anything (0 x a15_wifi_scan_ssid), and Settings printed
+                        // "onWifiEntriesChanged: reason=1 / No entries!".
+                        // Re-registering after boot makes the framework talk to the
+                        // host-backed endpoint, exactly as A9/A10 do from the start.
+                        A15ServiceGuard.beginOwner();
+                        try {
+                            GuestWifi.register();
+                            System.out.println("a15_wifi_endpoint=rebound");
+                        } catch (Throwable failure) {
+                            System.out.println("a15_wifi_endpoint=rebind-failed:" + failure);
+                        }
+                        // The image's WifiScanningService publishes "wifiscanner" too;
+                        // take that name back for the same reason as "wifi".
+                        try {
+                            GuestWifiScanner.register();
+                            System.out.println("a15_wifiscanner_endpoint=rebound");
+                        } catch (Throwable failure) {
+                            System.out.println("a15_wifiscanner_endpoint=rebind-failed:" + failure);
+                        }
+                        A15ServiceGuard.endOwner();
+                        System.out.flush();
                         // SurfaceFlinger::stopBootAnim() sets exactly this property on a
                         // real device and the guest bootanimation polls it every frame.
                         // The host also stops the process when the desktop check passes,

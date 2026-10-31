@@ -225,7 +225,7 @@ int Broker::run(const char* path) {
                 if (sendPacket(connection->second.fd, connection->second.output.front(), MSG_DONTWAIT))
                     connection->second.output.pop_front();
                 else {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) closeConnection(id);
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) closeConnection(id, "send");
                     break;
                 }
             }
@@ -233,7 +233,7 @@ int Broker::run(const char* path) {
             if (connection == connections.end()) continue;
             bool blocked = !connection->second.output.empty();
             if (blocked != connection->second.writeBlocked) {
-                if (!poller.writable(connection->second.fd, id, blocked)) { closeConnection(id); continue; }
+                if (!poller.writable(connection->second.fd, id, blocked)) { closeConnection(id, "epoll-mod"); continue; }
                 connection->second.writeBlocked = blocked;
             }
         }
@@ -253,14 +253,14 @@ int Broker::run(const char* path) {
             if (flags & EPOLLIN) {
                 Packet packet;
                 if (receivePacket(connection->second.fd, &packet, MSG_DONTWAIT)) request(id, std::move(packet));
-                else if (errno != EAGAIN && errno != EWOULDBLOCK) { closeConnection(id); continue; }
+                else if (errno != EAGAIN && errno != EWOULDBLOCK) { closeConnection(id, "recv"); continue; }
             }
             connection = connections.find(id);
             if (connection == connections.end()) continue;
             if ((flags & EPOLLOUT) && !connection->second.output.empty()) {
                 scheduleOutput(id);
             }
-            if (flags & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) closeConnection(id);
+            if (flags & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) closeConnection(id, "epoll-hup");
         }
     }
     while (!processes.empty()) closeProcess(processes.begin()->first);

@@ -584,6 +584,45 @@ def boot_image_classpath(tree):
         if re.fullmatch(r"/(?:apex|system)/[A-Za-z0-9_.@+-]+(/[A-Za-z0-9_.@+-]+)*\.jar", entry)))
 
 
+def materialize_webview_native(index):
+    """把 webview.apk 里的 arm64 原生库解出来，落到该 APK 自己的 lib/arm64 目录。
+
+    为什么必须这么做（真机取证，实例 1793450665241，2026-10-31 20:57）：
+    webview.apk 是 extractNativeLibs=false，libwebviewchromium.so 在
+    APK 内的 lib/arm64-v8a/ 下，framework 的 WebViewLibraryLoader 走
+    "apk!/lib/..." 让 linker 直接从 zip 映射。这条路径在本运行时上会崩：
+      webview_zygote          code=139（开机时）
+      org.chromium.webview_shell code=139（用户打开浏览器时，每 6 秒重启一次）
+    两边都停在 "WebViewLibraryLoader: can't load with relro file" 之后。
+    镜像的 nativeloader 已经把 /system/product/app/webview/lib/arm64 放在
+    library_path 第一位，所以这里按普通 ELF 落盘即可让 linker 走普通文件路径。
+    """
+    webview = "system/product/app/webview"
+    apk = TREE / webview / "webview.apk"
+    if not apk.is_file():
+        return 0
+    import zipfile
+    extracted = 0
+    with zipfile.ZipFile(apk) as archive:
+        for name in archive.namelist():
+            if not name.startswith("lib/arm64-v8a/") or not name.endswith(".so"):
+                continue
+            guest = posixpath.join(webview, "lib", "arm64", posixpath.basename(name))
+            destination = TREE / guest
+            if not destination.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(name) as source, destination.open("wb") as output:
+                    shutil.copyfileobj(source, output, 1 << 20)
+                extracted += 1
+            record = index.setdefault(guest, {"path": guest, "type": "file", "mode": 0o755,
+                                              "uid": 0, "gid": 0, "mtime": 0})
+            record["bytes"] = destination.stat().st_size
+    if extracted:
+        print("prepare-a15: materialized %d WebView native libraries into %s/lib/arm64"
+              % (extracted, webview), file=sys.stderr)
+    return extracted
+
+
 def main():
     skip_dex = "--skip-dex" in sys.argv
     index = json.loads(INDEX.read_text(encoding="utf-8"))["entries"]
@@ -716,6 +755,20 @@ def main():
         native_links.append({"path": "rootfs/" + guest, "logical": logical})
         used_guest_paths.add(guest)
         programs_named.add(guest)
+
+    # 2.1 WebView 的原生库先落成普通 ELF 文件。
+    #
+    # 镜像的 webview.apk 是 extractNativeLibs=false，库在 APK 里的
+    # lib/arm64-v8a/ 下，由 linker 走 "apk!/lib/..." 的 zip 映射。真机 20:57
+    # （实例 1793450665241）在打开浏览器时是这条链崩的：
+    #   WebViewLibraryLoader: can't load with relro file; address space not reserved
+    #   cr_WVCFactoryProvider: version=128.0.6613.88 ...
+    #   a15_application_exit=...:org.chromium.webview_shell code=139   （每 6 秒一次）
+    # 而镜像自己的 nativeloader 把 /system/product/app/webview/lib/arm64 放在
+    # 搜索路径的第一位（framework-server.log 的 product-clns-7 library_path），
+    # 所以把这些库按普通文件落到那个目录，linker 就会走普通 ELF 映射，
+    # 不再进 zip 分支。这与 A9/A10 的镜像布局一致（那里的 webview 库同样在 lib/ 下）。
+    materialize_webview_native(index)
 
     # 3. arm64 shared libraries. /system/lib64 first (it is the ROM's default
     # namespace), then APEX payloads, then vendor. Every library keeps its real
@@ -1416,6 +1469,14 @@ def main():
             # reaches DeviceStateManagerService.
             {"role": "sensorservice", "logical": "sensorservice", "uid": "1000", "gid": "1000",
              "preload": "liba15vm-binder-devices.so"},
+            # artd 的启动参数不能带 ART 的 -X 选项：artd 自己的 argv 解析器只认
+            # --dump-only / --class-loader-context=… 这类 artd 选项，传 -Ximage 会被它
+            # 直接拒掉并退出（真机 VM10，实例 1793440502763：
+            #   framework-artd.log: "Unknown option -Ximage:/system/framework/boot.art"）。
+            # 不带参数时的失败则是 ART 在 GetDefaultBootImageLocation 里 abort：
+            #   ": Check failed: !location.empty() No mainline framework library found"
+            # 也就是说 artd 既吃不到 dalvikvm 的 -Ximage，又无法自己推出 boot image，
+            # 需要的是 derive_classpath / 环境层面的修法，不能再往 argv 里塞 -X。
             {"role": "artd", "logical": "artd", "uid": "0", "gid": "0",
              "preload": "liba15vm-binder-devices.so"},
             # Round 75: AudioService (SystemServer.startOtherServices -> line 2359)
@@ -1611,7 +1672,8 @@ def build_dex():
                  "GuestCommand", "GuestInstall", "GuestMediaScan", "AppLaunch",
                  "AppRuntimeOptions", "GuestWebView", "AppDexCache", "GuestNetworks",
                  "GuestConnectivity", "GuestWifi", "GuestWifiChannel", "GuestDiscovery",
-                 "GuestDnsResolver", "GuestOemNetd", "A15BpfMaps", "ProcessEvidence"):
+                 "GuestDnsResolver", "GuestOemNetd", "A15BpfMaps", "ProcessEvidence",
+                 "GuestPersistentDataBlock", "GuestWifiScanner", "A15ServiceGuard"):
         framework_sources.append(A15 / "vendor" / "framework" / (name + ".java"))
     missing = [str(path) for path in framework_sources if not path.is_file()]
     if missing:

@@ -98,7 +98,7 @@ private:
     void updateReferences(Node& node);
     void trimHandle(uint64_t process, uint32_t handle);
     int freeBuffer(uint64_t process, uint64_t buffer);
-    void closeConnection(uint64_t connection);
+    void closeConnection(uint64_t connection, const char* reason = "io");
     void closeProcess(uint64_t process);
     void finishCall(uint64_t call);
     void scheduleNodeReclaim(Node& node);

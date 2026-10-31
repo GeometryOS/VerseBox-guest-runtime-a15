@@ -84,6 +84,8 @@ int Broker::transact(uint64_t id, Packet packet) {
     } else {
         targetNode = resolve(source.id, transaction.target.handle);
         if (!targetNode || nodes.find(targetNode) == nodes.end() || !nodes.at(targetNode).alive) {
+            fprintf(stderr, "a10binder dead reply sender_pid=%d handle=%u code=%u\n",
+                    int(source.pid), unsigned(transaction.target.handle), unsigned(transaction.code));
             event(id, BR_DEAD_REPLY); return 0;
         }
         Node& node = nodes.at(targetNode);
@@ -120,6 +122,14 @@ int Broker::transact(uint64_t id, Packet packet) {
     Process& destination = processes.at(targetProcess);
     size_t bytes = packet.data.size() - sizeof(transaction) + (securityContext.empty() ? 0 : securityContext.size() + 1);
     if (bytes > kArenaLimit - destination.bufferBytes) {
+        // Behaviour unchanged. The line only names the branch: if this ever fires it
+        // explains a BR_FAILED_REPLY (Java DeadObjectException) with a buffer
+        // accounting, which the guest never sees. It did NOT fire for the failed
+        // 216 MB commit -- that failure was a pure blocking read (write=0) on a
+        // closed socket, i.e. a connection close, not a rejected transaction.
+        fprintf(stderr, "a10binder arena full target_pid=%d bytes=%zu used=%zu limit=%zu code=%u\n",
+                int(destination.pid), bytes, destination.bufferBytes, size_t(kArenaLimit),
+                unsigned(transaction.code));
         if (!reply && callId) calls.erase(callId);
         event(id, BR_FAILED_REPLY); return 0;
     }

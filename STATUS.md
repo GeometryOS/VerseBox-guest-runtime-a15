@@ -1,5 +1,1276 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
+## 第 111 轮（2026-11-01 01:41）· 事故与手工回滚：linker 默认禁用 apk 库 → 系统卡死、Wi-Fi 图标回退（已回滚，用户已验证恢复）
+
+> **结论先行**：r111 的改动（`open_library_in_zipfile` 默认返回 -1）是**全局行为改动**，
+> 装上去后系统不稳定卡死、状态栏 Wi-Fi 图标回退。已按用户要求**手工回滚（未用 git）**，
+> 重编 linker + prepare + gradle + 装机，APK 回到 **1,979,510,014 B（与 r110 字节一致）**。
+> 用户实测：**Wi-Fi 图标回来了，系统不卡了**。
+
+━━ 1. 改了什么（已回滚）━━
+
+`guest-runtime-a15/runtime/patch-linker-a15.py` 给 `open_library_in_zipfile` 加：
+
+```c
+if (getenv("A15VM_ALLOW_APK_LIBS") == nullptr) return -1;   // 默认禁用 apk 内 .so
+```
+
+理由是"容器里 .so 已由 prepare 投影成目录文件、apk 副本是重复的"。**错在把这个
+WebView 的局部观察当成所有 namespace 的全局事实**：`open_library_in_zipfile`
+服务 system_ext/product/vendor/app 所有 namespace，默认关闭后依赖 apk 内 .so 的组件
+从"崩"变成"not found"，沿依赖链扩散，系统卡死；Wi-Fi 的 NetworkAgent 链也随之失效。
+
+━━ 2. 回滚步骤（手工，全部有记录）━━
+
+1. `guest-runtime-a15/runtime/patch-linker-a15.py` ←
+   `_bin/a15/scratch/backup-20261101-r111-patch-linker-a15.py`
+   （恢复后 `A15VM_ALLOW_APK_LIBS` 0 次）；
+2. `sh runtime/build-linker.sh` 重编 → `source-linker64` 5,919,832 B，derived/linker.cpp
+   再次确认 `A15VM_ALLOW_APK_LIBS` 0 次（日志 `_bin/a15/logs/linker-rollback.log`）；
+3. `python scripts/prepare-a15.py` → `_bin/a15/logs/prepare-rollback.log`（EXIT=0）；
+4. `gradlew :app:assembleDebug` → `_bin/a15/logs/gradle-rollback.log`（BUILD SUCCESSFUL）；
+5. `adb install -r -d`（01:41，`_bin/a15/logs/install-rollback.log` Success）；
+6. **未使用任何 git 写操作**。
+
+━━ 3. 验证（用户实测 + 产物对照）━━
+
+| 项 | r111（事故版） | 回滚后 |
+| --- | --- | --- |
+| APK | 1,979,510,242 B | **1,979,510,014 B（与 r110 一致）** |
+| 状态栏 Wi-Fi 图标 | 回退（无） | **有** |
+| 系统卡顿 | 卡死 | **不卡** |
+
+━━ 4. 回滚后的真实状态（不要误读）━━
+
+- **N 网络：已验证（r108/r109）** —— `a15_default_network=100`、`New default network 100`、
+  状态栏图标出现；这次回滚也确认了它依赖的 linker 行为不能被全局改。
+- **W WebView：仍红**。r110 的取证结论仍然成立（`libwebviewchromium.so` 被打开后，
+  解析 NEEDED `liblog.so` 走进 `webview.apk!/lib/arm64-v8a` 的 zip 路径并崩在 `memcpy(NULL)`）。
+  r111 的"跳过 apk"方向不是不能走，而是**不能做成全局默认**；正确做法是只对
+  WebView 的 namespace 生效，或用 `A15VM_ALLOW_APK_LIBS=1` 作为默认、显式关闭。
+- **S 存储容量：仍 2×，未修**（`FileUtils: Rounded bytes from 478941978624`）。
+  r111 没有动它，回滚也不需要动它；下一轮按检讨里的方法先用 dexdump 定位
+  `StorageStatsService.getTotalBytes`，同时把 `getStorageSize` 的下限修复做出来。
+- **A15AppLaunch 的 `LD_DEBUG=dynamic`（r110 加的临时取证开关）仍在**，
+  它让每个 app 进程日志涨到 ~2 MB，是卡顿的次要嫌疑；下一轮先删它再做 WebView 取证。
+
+━━ 5. 检讨（必读）━━
+
+- `_audit/coding-log/2026-11-01-CL-A15-第111轮-检讨-为省时间改linker默认行为.md`
+- `_audit/coding-log/2026-11-01-CL-A15-第111轮-检讨-把存储修复降级成下一轮.md`
+
+---
+
+## 第 110 轮（2026-11-01 01:17 启动，虚拟机 10 / 实例 1793466953840）· WebView 崩溃点收敛到 **linker 的 apk zip 路径**
+
+> 本轮只加了取证开关（`A15AppLaunch` 给 app 子进程注入 `LD_DEBUG=dynamic`），未改行为。
+
+━━ 同一份日志（`vm/application-12279-60.log`，webview_shell，崩溃前最后 20 行）━━
+
+```text
+:27502  WebViewLibraryLoader: can't load with relro file; address space not reserved
+:27503  cr_WVCFactoryProvider: version=128.0.6613.88 ... multiprocess=true packageId=2
+:27506  linker: [ opening /system/product/app/webview/lib/arm64/libwebviewchromium.so from namespace product-clns-7 ]
+:27508  linker: name .../liba15vm-image-9dc0678dda3d710b34a0.so: allocating soinfo   ← 依赖里的 libc 投影
+:27512  linker: [ "liblog.so" find_loaded_library_by_soname failed (*candidate=n/a@0x0). Trying harder... ]
+:27514  linker: [ opening liblog.so from namespace product-clns-7 ]
+:27516  linker: Trying zip file open from path ".../webview.apk!/lib/arm64-v8a/liblog.so"
+（之后进程退出，a15_application_exit=13415:org.chromium.webview_shell code=139）
+```
+
+**结论（不要再推翻）**：
+
+1. **目录里的 `libwebviewchromium.so` 确实在尝试加载**（27506 行），不是"路径没在搜索列表里"。
+2. 崩溃发生在解析它的 **NEEDED `liblog.so`** 时：`product-clns-7` 的 search paths 依次是
+   `/system/product/app/webview/lib/arm64` → `webview.apk!/lib/arm64-v8a` → `/product/lib64` …，
+   **apk 在 linked `system` namespace 之前**，于是先进 apk 的 zip；
+   linker 在 zip 解析里 `memcpy(NULL, <代码区地址>, 32)`（`A9VM bdev crash ... pc=liba15vm-guest-ld-android.so+0x7f390`，
+   换算后落在 `__memcpy_aarch64_simd`），进程 139。
+3. **不是 dlopen 的错误路径**：dlerror 修好后日志里**没有** `dlopen failed`；
+   也**不是**"libwebviewchromium.so 16 KiB 对齐加载失败"——它已经进到依赖解析阶段。
+4. **app 进程没有 crash 报告**（`bdev crash` 0 行，`app-4` 的 child zygote 有）：
+   app 入口 `A15GuestApplication` 没有装 `A9VM` 的信号处理器，所以只能靠 linker 的
+   `LD_DEBUG` 行定位；下一轮先补 handler 再谈修 zip。
+
+**下一步唯一动作**：给 app 子进程装与 child zygote 相同的 crash handler
+（`vendor/native/BinderDevices.cpp` 的 `A9VM bdev crash` ，只有装了它才能拿到
+`fault/pc/lr/bt`）；判据是 WebView 崩溃进程的 app 日志出现
+`A9VM bdev crash sig=11 ... pc=...`。拿到 PC 后再决定是修 zip 解析还是绕开 apk。
+
+**已排除**：
+- "libwebviewchromium.so 不在搜索路径"（`[ opening ... ]` 有）；
+- "dlerror 崩"（修好后无 dlopen failed，崩溃仍在）；
+- "apk zip 结构不合法"：`webview.apk` 605 条、无 zip64、.so 为 stored（Python zipfile 核对）。
+
+---
+
+## 第 107–109 轮结果（2026-11-01 01:07/01:09 装机，实例 1793466006868 / 1793466412968）· **Wi-Fi 默认网络打通：状态栏图标已出现**
+
+> 包名 **me.kanadex.versebox**（旧 `io.a10vm` 是废弃包）。APK 1,979,510,014 B（01:04 构建）。
+> 本轮三次构建，每次只改一类；构建失败一次（javac 变量遮蔽，见下），已如实记录。
+
+━━ 1. 已验证（虚拟机 8/9，同一份日志）━━
+
+```text
+vm/framework-server.log（实例 1793466412968 / 1793466006868）
+:20939  a15_netd_fwmark=netId:100                      ← 修法1生效
+:20975  a15_network_agent_registered=1                  ← INetworkAgent.onRegistered 第一次到达
+:19308  a15_netd_network_create=netId:100               ← 修法2生效
+:19387  NetworkTimeUpdateService: New default network 100; checking time.
+:19442  a15_default_network=100 caps=[ Transports: WIFI ... NOT_VCN_MANAGED ... ]
+```
+
+用户实测（同一版本）：**状态栏 Wi-Fi 图标出现**；虚拟机 9 里 `ae`/`ca` 两个普通应用正常不闪退。
+
+**根因链（两层，都已关闭）**：
+
+1. **`INetd.getFwmarkForNetwork` 缺失 → NetworkMonitor 建不起来（第 106 轮断点的真因）**。
+   A15 `ConnectivityService.registerNetworkAgentInternal()` 不再当场完成注册，它调
+   `NetworkStackClient.makeNetworkMonitor()`；NetworkStack 侧构造 `NetworkMonitor` 时
+   `TcpSocketTracker` **直接解引用** `netd.getFwmarkForNetwork(netId).mark/.mask`（镜像
+   `service-connectivity.jar` dexdump：`MarkMaskParcel.mark/.mask` 两个 public int，无 null 检查）。
+   壳原来落到 default 抛 code 95，于是 `makeNetworkMonitor` 抛异常 → 回调不来 →
+   `handleRegisterNetworkAgent()` 不执行 → `onRegistered` 永不回调 → 默认网络永远 null。
+   修法：`GuestNetworks` 返回镜像自己的 `MarkMaskParcel`（mask=0xFFFF, mark=netId&0xFFFF），
+   与 netd `NetdNativeService::getFwmarkForNetwork` 的结构一致；容器没有 fwmark 标记，
+   所以 tracker 看不到属于本网络的 socket，这是诚实结果。
+   真机原文（旧版）：`application-20083-5.log` 的
+   `NetworkMonitor.<init> → TcpSocketTracker.<init> → getFwmarkForNetwork (code 95)`。
+
+2. **`INetd.networkCreate` 缺失 → 网络建不起来**。`onRegistered` 之后
+   `handleRegisterNetworkAgent()` 走 `updateNetworkInfo()`，A15 先调
+   `INetd.networkCreate(NativeNetworkConfig)`（镜像 dexdump：`networkCreate:(NativeNetworkConfig;)V`，
+   返回 void；字段 `netId:int / permission:int / secure:boolean`）。
+   壳同样落 default 抛 code 95，真机原文：
+   `ConnectivityService: Error creating network [100 WIFI]: Guest host-socket network: networkCreate`（58 行）。
+   修法：登记 `interfaces[netId]` 后返回（no-op），接口/路由本来就没有内核表可写。
+
+**第 106 轮表格里的 5 条已排除思路仍然有效**，本轮新增两条已排除：
+- **"要给 NetworkAgent 传 INetworkMonitor"**：A15 的 registerNetworkAgent 没有这个参数（dexdump 8 参）。
+- **"重注册时机/NetworkStack 未就绪"**：第 106 轮已证伪；真因是上面两层端点缺失。
+
+━━ 2. 应用启动闪退：根因已收敛到 WebView 初始化（不是安装/启动链）━━
+
+同一实例（1793466412968）里三个进程的日志尾部完全同形：
+
+```text
+WebViewFactory: Loading com.android.webview version 128.0.6613.88 (code 661308801)
+nativeloader: Configuring product-clns-7 ... library_path=/system/product/app/webview/lib/arm64:/system/product/app/webview/webview.apk!/lib/arm64-v8a:...
+WebViewLibraryLoader: can't load with relro file; address space not reserved
+cr_WVCFactoryProvider: version=128.0.6613.88 ... multiprocess=true packageId=2   ← 之后进程死（code=139）
+```
+
+`a15_application_exit=8025:com.liuzh.deviceinfo code=139`；`webview_shell` / Via 同样；
+**不动 WebView 的 ae/ca 正常**。所以"应用启动闪退"= **只要应用碰 WebView 就崩**，
+不是 PackageManager/ActivityThread 的问题（协议页能画出来就是 proof）。
+
+**已修的取证侧改动（未验证是否根治）**：`linker/dlfcn.cpp` 的 `__bionic_format_dlerror`
+不再读 `__get_thread()->dlerror_buffer`。A15 的 linker 跑在宿主 app 进程里，
+`__get_thread()` 指向宿主 libc 的 `pthread_internal_t`，偏移与 API 35 不同；
+任何 dlopen 失败都会在错误格式化里踩到宿主结构（`A9VM bdev crash sig=11 fault=0x0`）。
+改成本进程静态缓冲后，**本轮 WebView 崩溃不再走这条路径**（日志里没有 `dlopen failed`），
+说明它崩在别处（见下），这条修改保留但**不能算 WebView 修好**。
+
+**下一步唯一动作（WebView）**：给 app 子进程注入 `LD_DEBUG=dynamic`
+（`A15AppLaunch` 的 ProcessBuilder 环境；linker 的 `init_LD_DEBUG` 只读该环境变量，
+`linker_main.cpp:305`），一次装机后看：
+1. `[ opening libwebviewchromium.so from namespace ... ]` 出现 → 目录路径确实在尝试；
+2. `Load libwebviewchromium.so ... : ok` 出现 → 加载成功，崩在 WebView native 初始化；
+3. 只有 `Trying zip file open ... webview.apk!` → 目录加载失败，修 16 KiB 对齐/路径。
+**在这三种之一出现前，不再猜 WebView 修法。**
+
+━━ 3. 内部存储容量：取证到 2× 的精确数值，未修 ━━
+
+同一实例 `vm/framework-server.log`：
+
+```text
+:25272  FileUtils: Rounded bytes from 478941978624 to 512000000000
+:25273  StorageStatsService: getFreeBytes: 178699173888
+```
+
+`478941978624 == 2 × 239470989312`（宿主 `/data` 真值 = `host-network.json` 的
+`storage.totalBytes`），`getFreeBytes` 正确。**`a15_vold_storage_size` / `a15_vold_storage_candidate`
+0 行**：`IVold.getStorageSize` 根本没被调用，所以 2× 不是 `PrivateVolumes` 造成的。
+下一轮直接定位 `StorageStatsService.getTotalBytes`（services.jar classes2）对
+`UUID_DEFAULT` 的算法，**不再改 `PrivateVolumes`**。
+
+━━ 4. 本轮产物与修改文件 ━━
+
+- `guest-runtime-a15/vendor/framework/GuestNetworks.java`：
+  `getFwmarkForNetwork`（返回 MarkMaskParcel）、`networkCreate`（登记 netId 后 no-op）；
+  备份 `_bin/a15/scratch/backup-20261101-r107-GuestNetworks.java`、
+  `backup-20261101-r108a-GuestNetworks.java`。
+- `guest-runtime-a15/runtime/upstream/bionic/linker/dlfcn.cpp`：
+  dlerror 缓冲改本进程静态；备份 `_bin/a15/scratch/backup-20261101-r108-dlfcn.cpp`。
+- 产物：APK 1,979,510,014 B（01:04:30），`framework-check.dex` 162,740 B（01:03:28），
+  `source-linker64` 5,919,832 B（00:56:50）。
+- **构建事故（已修正）**：r108 的 gradle 实际 `BUILD FAILED`（`GuestNetworks.java` 里
+  `config`/`type` 与相邻 case 的局部变量重名），我第一次只看了 job 的 completed 状态就请用户验证，
+  用户测的是旧 APK。已按 `_audit/04` §4.1 补齐：**构建必须看 EXIT 码与 `gradle-*.log` 尾部**。
+
+━━ 5. 已知仍未过 ━━
+
+- WebView（= 所有碰 WebView 的应用闪退）：见 §2，下一步 `LD_DEBUG`。
+- 存储容量 2×：见 §3。
+- MAC 仍是 `02:00:00:00:00:00`（宿主 Android 10+ 脱敏，A10 相同）；IP 由 `LinkProperties`
+  与 `WifiInfo.setInetAddress` 给 `192.168.1.10`，默认网络建立后应可显示，待用户复核。
+- MT Manager `code=139`：加固 native 保护库，非普通应用样本，暂时放最后。
+
+---
+
+## 第 106 轮结果（00:22:05 装机，实例 1793463734155）· "boot 后重注册 agent" 也被真机**证伪**
+
+> 包名 **me.kanadex.versebox**。APK 1,976,349,973 B / `E1697E06B33360795A0D25C76CC3D27919B1DB7C519661D625A40A64EBC22071`。
+
+━━ 同一份日志（`_bin/a15/logs/r106/server.log`）━━
+
+```text
+:20729 a15_caps_not_vcn_managed=28
+:20735 ConnectivityService: registerNetworkAgent NetworkAgentInfo{network{100} ...}
+:20783 a15_default_network=null caps=null attempt=1
+...
+:25165 ConnectivityService: registerNetworkAgent NetworkAgentInfo{network{101} ...}   ← boot 后重注册
+:25182 a15_network_agent_reregistered=101
+:27445 a15_default_network=null caps=null attempt=7                          ← 重注册之后仍 null
+...
+（attempt 一路到 31 次，全部 null；`a15_network_agent_call=` 0 行；
+ `a15_network_agent_registered=` 0 行；`New default network` 0 行；
+ `Error registering NetworkAgent` 0 行）
+```
+
+**结论（不要再推翻）**：
+1. 重注册确实发生了（net 101），**但 `INetworkAgent` 的任何方法都没有回到我们的端点**
+   —— 连一次 `onRegistered` 都没有。**这不是"注册太早 / NetworkStack 未就绪"**。
+2. 默认网络在 60 秒采样里**始终 null**，所以 `WifiEntry.isDefaultNetwork()` 永远是 false，
+   状态栏 `WifiNetworkModel` 永远 `Inactive`/`isDefault=false` → 图标不画。
+   **Settings 的 WLAN 页、控制中心展开菜单能看到连接，是因为它们只消费 `Entry` 列表，
+   不消费 `isDefault`。**
+
+━━ 已排除的错误思路（下一次会话不要再走）━━
+
+| # | 曾经的假设 | 真机判据 | 结论 |
+| --- | --- | --- | --- |
+| 1 | `calculateSignalLevel` 返回 0 导致状态栏没图标 | 修后 `[Level:3]`，图标仍无（r103） | 只修了**信号格**，不是图标 |
+| 2 | 缺 `NOT_VCN_MANAGED` 导致默认请求不满足 | `nc{}` 含 `&NOT_VCN_MANAGED&`，默认仍 null（r104） | **证伪** |
+| 3 | `transportInfo`/`isPrimary` 不够 | 注册日志里 TransportInfo/IsPrimary 一直在，默认仍 null | 只是消费者字段，**改不动 isDefault** |
+| 4 | 注册太早，NetworkStack 未就绪 | boot 后重注册 net 101，仍无 onRegistered/仍 null（r106） | **证伪** |
+| 5 | 宿主能给真实 MAC | `run-as cat /sys/class/net/wlan0/address` → Permission denied；`NetworkInterface` 返回 02:00:00:00:00:00 | **宿主 Android 10+ 平台限制**，A10 的 VM 同样；要显示只能由 guest 派生稳定本地 MAC |
+
+**上网（数据面）已实测**（不要再修 socket/路由/DNS）：
+`run-as … ping -c 2 223.5.5.5` 2/2 回包 42–44 ms；`ping www.baidu.com` DNS 解析
+36.144.42.114 并回包。**网络是通的，缺的只是 ConnectivityService 的默认网络。**
+
+━━ 下一次会话的唯一动作（事务层取证，不是再改 caps/图标）━━
+
+在 **`LocalGuestService.endpoint()` 的 `onTransact`** 加一条：
+`if (method == null) System.out.println(descriptor + " unknown_transaction=" + code + " size=" + data.dataSize());`
+并在 **`GuestConnectivity.registerAgent()` 返回后**打印：
+`agent.getClass().getName() + " alive=" + ((android.os.IInterface) agent).asBinder().isBinderAlive()`；
+再在 `reportDefaultNetwork()` 里打印 `ConnectivityManager.getAllNetworks()` 的 netId 列表。
+
+判据（三条，缺一不可）：
+1. `android.net.INetworkAgent unknown_transaction=…` 出现 → 事务号没映射（修 `transactions`）；
+2. 不出现且 `getAllNetworks()` 不含 100/101 → `InternalHandler` 的
+   `CMD_REGISTER_NETWORK_AGENT` 没执行（handleRegisterNetworkAgent 前中断）；
+3. 不出现且含 100/101 → `notifyRegistered()` 的 `onRegistered` 在 binder 层被吞。
+
+**在这三条有结果之前，不要再改 `calculateSignalLevel` / caps / 注册时机 / WifiEntry / 图标层。**
+
+---
+
+## 第 104–105 轮结果（00:04 / 00:14 装机，实例 1793462688687 / 1793463319744）· 默认网络仍是 null；`onRegistered` 从未回调
+
+> 包名 **me.kanadex.versebox**。r104 APK `79F6AC21…`（00:04:06），r105 APK `EF2D97F2…`（00:14:47）。
+
+━━ 已验证（同一实例原文）━━
+
+| 判据 | r104（1793462688687） | r105（1793463319744） |
+| --- | --- | --- |
+| `a15_caps_not_vcn_managed` | 28（已加） | 28 |
+| 注册 `nc{}` | 含 `&NOT_VCN_MANAGED&` | 含 `&NOT_VCN_MANAGED&` |
+| `a15_network_agent_call=` | — | **0 行** |
+| `a15_default_network=` | null（1 次） | **null × 24（attempt=1..24）** |
+| `New default network` | 0 | **0** |
+| `host-network.json` 的 `wifi.mac` | 02:00:00:00:00:00 | 02:00:00:00:00:00 |
+
+**⇒ NOT_VCN_MANAGED 修法已被真机证伪**（r104 用户实测：状态栏/控制中心/设置上层全都没有）。
+
+━━ 断点（r105 钉死）━━
+
+- `INetworkAgent.onRegistered` **一次都没有到达**（`a15_network_agent_call` 0 行），
+  `registry` 永远 null，默认网络 60 秒内始终 null。
+- A15 的 `NetworkAgentInfo.notifyRegistered()`（`service-connectivity.jar` dexdump：
+  `onRegistered(INetworkAgentRegistry)` → `mHandler.obtainMessage(1002,1,0,this)`）
+  没有执行；它前面的 `ConnectivityService.handleRegisterNetworkAgent(nai, INetworkMonitor)`
+  里 `networkMonitor.start()` 是第一嫌疑人（`Network Monitor created` /
+  `onNetworkMonitorCreated` 都是 0 行）。
+- **MAC**：`run-as … cat /sys/class/net/wlan0/address` → `Permission denied`；
+  `NetworkInterface`/`WifiInfo` 都被 Android 10+ 脱敏为 02:00:00:00:00:00。
+  **这是宿主平台限制，A10 的 VM 也一样**；要显示 MAC 只能由 guest 派生一个稳定的
+  本地管理 MAC（`02:xx`），不能伪装宿主真实网卡。
+- **上网（数据面）已实测**：`run-as … ping -c 2 223.5.5.5` 2/2 回包（42–44 ms）、
+  `ping -c 1 www.baidu.com` DNS 解析 36.144.42.114 并回包。**网络是通的**，
+  缺的是 ConnectivityService 的默认网络（控制面），所以 UI 显示未连接。
+
+━━ 下一步唯一动作 ━━
+
+查 `handleRegisterNetworkAgent` 的 `INetworkMonitor` 来源（`NetworkStackService` 的
+`NetworkMonitor` 绑定）。判据：下一实例出现 `a15_network_agent_call=onRegistered/1`、
+`a15_network_agent_registered=1`、`a15_default_network=100`。
+**在这三条出现之前，不要再改 WifiEntry / caps / 图标层。**
+
+---
+
+## 第 103 轮结果（23:48 构建，23:51 装机，实例 1793461890684）· Wi-Fi 信号与导入链路**真机验证通过**；默认网络仍是 null
+
+> 包名 **me.kanadex.versebox**（旧 `io.a10vm` 是废弃包；本轮全部日志来自新包名）。
+> APK：1,976,187,799 B / SHA-256 `5A52EF33C01F34C5DCD3C0EFB34005BCE13845DFE0DE202246CDD59E33161095`，
+> 23:48 构建，`lastUpdateTime=2026-10-31 23:51:14`。
+
+━━ 1. 已验证（同一实例 `1793461890684` 的原文）━━
+
+| 判据 | 修前（实例 1793460458429） | 修后（实例 1793461890684） |
+| --- | --- | --- |
+| `a15_wifi_unhandled=calculateSignalLevel` | 1 行 | **0 行** |
+| Settings 的 WLAN 条目 | `[CMCC-FKAz-5G][Connected][Level:0][Connecting...][Primary][Saved]` | **`[Level:3]` / `[Level:2]`**，扫描到 **21/26 个 AP**，Level 0–4 分布正常（`vm/application-11532-10.log:267/297/369-389`） |
+| 安装事务 | 旧实例停在 binder 事务，无结果 | `vm/framework-install-commit.log:47 Success`、`:55 guest_command_result=0`、`:56 System.exit called, status: 0` |
+| 桌面刷新 | 要重启才有图标 | `vm/application-11532-47.log`：`AlphabeticalAppsList: adding ... appInfoTitle: MT Manager`（导入后当场出现） |
+
+⇒ **calculateSignalLevel 这条修法是对的**（代码用镜像自己的 `WifiManager.calculateSignalLevel`，不是自造阈值）；
+⇒ **导入链路本身已经能走完**（create/write/commit 全 0，dexopt 正常），本轮导入 MT Manager 成功。
+
+━━ 2. 已取证但未修复：默认网络是 null（状态栏 Wi-Fi 图标/Internet 的根因）━━
+
+`vm/framework-server.log:22673`（注册 NetworkAgent 后 3 秒，本轮的诊断行）：
+
+```text
+a15_default_network=null caps=null
+```
+
+而注册本身是成功的（`:22459` `registerNetworkAgent NetworkAgentInfo{network{100} ... nc{ WIFI, INTERNET,
+NOT_RESTRICTED, TRUSTED, VALIDATED, TransportInfo: <SSID ... IsPrimary: 1 ...> }}`）。
+`:22462` 只有 `a15_network_agent_shape=api35`，**没有 `a15_network_agent_registered=1`**：
+`INetworkAgent.onRegistered` 没有回到我们的端点，`registry` 一直是 null，后续 push 全部搁在
+pending。下一轮的第一件事就是查这一条（A15 的 `NetworkAgentRegistry` 何时回调、事务号是否映射）。
+在那之前，Settings/SystemUI 的 `WifiEntry` 只能是 `[Connecting...]`、没有 `[Internet]`/`[Default]`。
+
+━━ 3. 已取证：MT Manager 启动即 SIGSEGV（不是"卡住"）━━
+
+```text
+:32182 a15_application_launch=13360:bin.mt.plus uid=10087 spawn_ms=7
+:32200 ActivityManager: Process bin.mt.plus (pid 13360) has died: fg TOP
+:32203 a15_application_exit=13360:bin.mt.plus code=139
+（13373 / 13385 … 同形状重复）
+```
+
+进程日志（`vm/application-11532-48.log`）停在
+`GraphicsEnvironment: Neither updatable production driver nor prerelease driver is supported.`
+之后没有任何一行；系统应用（Settings/Launcher）在同一行之后继续正常输出
+（`application-11532-10.log:86-109`）。MT 的 `lib/arm64` 里已经是 11 个普通 `.so`
+（`libmtprotect.so` 等，不是 APK 的 zip 映射），所以第 102 轮的 zip 映射假设对 MT 不成立；
+MT 是加固应用，native 保护库在这套容器里崩掉，不能当普通应用样本。**普通应用的启动判据
+还没拿到，下一轮要用非加固应用（如 deviceinfo）复现。**
+
+━━ 4. 产物与修改文件 ━━
+
+- 修改：`guest-runtime-a15/vendor/framework/GuestWifi.java`（`calculateSignalLevel` + `signalLevel()`）、
+  `guest-runtime-a15/vendor/framework/GuestConnectivity.java`（`a15_default_network` 诊断）；
+  备份在 `_bin/a15/scratch/backup-20261031-r103-*.java`。
+- `prepare-a15.py`：`nativeFiles 1136 / dataFiles 2437 / bootClassPath 44`。
+- 未改：`A15GuestApplication`、`BinderDevices.cpp`、`PrivateVolumes`（存储容量代码未动，等打开存储页的日志）。
+
+━━ 5. 下一步唯一动作 ━━
+
+先查 `INetworkAgent.onRegistered` 为什么没有回调（`a15_network_agent_registered` 0 行）：
+事务号映射 / NetworkAgentRegistry 时机；判据是下一实例出现 `a15_network_agent_registered=1`，
+随后 `a15_default_network=100`。
+
+---
+
+## 本轮只读取证 · 2026-10-31 21:34（未构建、未装机、未改源码）
+
+- **已验证（仅日志行为）**：实例 `1793452156630` 的 `vm/framework-server.log:23960-23961` 有 `a15_wifi_scan_callback_pushed=1`、`a15_wifi_scan_callback=set`；`:20338` 有 `a15_caps_transport_info=setter:"CMCC-FKAz-5G"/0/-64`，`:20345` 有 `guest_host_network_registered=100`。这些行证明回调及网络注入执行了，**不证明状态栏图标出现或真实网页可访问**。
+- **未验证**：同一实例 `vm/` 未找到 `framework-install-create.log`、`framework-install-write.log`、`framework-install-commit.log`；没有本次导入、卸载、清数据的真实事务，不能把过去实例的 artd/rollback 错误当作当前失败根因。`framework-artd.log` 有 `dex2oat returned code 0`，只说明已有编译任务成功，不等于安装 commit 成功；存储快照 `host-network.json` 含 `storage.totalBytes=239470989312`，但未观察到 `a15_vold_storage_candidate=host:239470989312` 或设置容量页面。
+- **当前唯一卡点（W）**：同一实例 `vm/framework-server.log:26339` 为 `a15_application_exit=16125:org.chromium.webview_shell code=139`；`vm/application-15068-1668.log` 最后停在 `cr_WVCFactoryProvider`，未见当前 browser 进程的崩溃 PC/寄存器/映射。日志继续增长，不能将第 102 轮静态计数 551 当作目前总数。下一步唯一动作：先取得当前 browser 进程的可靠崩溃 PC、寄存器和映射，再决定 WebView 修法；可参考开机归档 §5.16 的 core 取证方法，但设备侧 core_pattern/RLIMIT_CORE 变更必须先由维护者明确授权，本轮未执行。不重复改库搜索路径或重装信号处理器。
+- **旧证据边界**：`_bin/a15/logs/r102-app5.log:39-42` 是旧 `webview_zygote` 的崩溃行，**不是当前 browser**；已核验当前安装的 linker 与 `runtime/build/bin/source-linker64` SHA-256 均为 `1A6B68787C03D8C75CBCD32B445E20A11019501204553372C16F5A3931059218`，该 ELF `+0x7f390` 实际指令为 `subs x4,x2,x7`（非访存），不能直接用旧 PC 推导当前根因。
+- **产物/回滚**：本轮未生成 APK、未安装、未改源码，也没有本轮回滚；当前手机仍为 `versionCode=59`、`lastUpdateTime=2026-10-31 21:06:50` 的第 102 轮 APK（原记录 `1,976,189,213 B` / SHA-256 `42679AFB4F00B87C9E7B4257947AFB4E595B2C6B19A61F6058C0719BE6F433D8`）。
+
+## 第 102 轮结果（21:16 开机，实例 1793452156630）：库已落成普通文件，浏览器仍然 code=139 —— 本次修法**证伪**
+
+━━ 真机事实（同一份日志）━━
+```text
+vm/framework-server.log:
+  22903  a15_child_zygote_launch=webview_zygote args=15        （整机仅 1 次，仍是开机那次）
+  69567… 69943  a15_application_exit=<pid>:org.chromium.webview_shell code=139
+          整轮共 551 行 code=139（每个进程仍然是一启动就 SIGSEGV）
+  ANR in / Blocked in handler = 0 行
+```
+进程日志 `vm/application-15068-616/617/618.log`（各 98 行，三段完全相同）末尾仍是：
+```text
+WebViewLibraryLoader: can't load with relro file; address space not reserved
+cr_WVCFactoryProvider: version=128.0.6613.88 (661308801) minSdkVersion=26
+    isBundle=false multiprocess=true packageId=2
+（无下一行）
+```
+**关键否定**：日志里**完全没有** `nativeloader: Load libwebviewchromium.so … ok` 这一行 ——
+也就是说这次连“库开始加载”都没走到，崩点在 provider 初始化阶段，与库从哪来无关。
+
+━━ 修复确实生效到产物，但没有解决问题 ━━
+新实例 rootfs 里符号链接与目标都在（21:09 生成）：
+```text
+files/devices/1793452156630/vm/rootfs/system/product/app/webview/lib/arm64/
+  libwebviewchromium.so -> /data/app/…/lib/arm64/liba15vm-image-9dc0678dda3d710b34a0.so
+设备侧该目标：110,387,824 B（存在）
+```
+nativeloader 的 library_path 第一位就是 `/system/product/app/webview/lib/arm64`
+（`product-clns-7 library_path=…`），所以“从 APK 的 zip 映射”这条假设**被证伪**：
+库已经在第一搜索路径上，崩溃形状一模一样。
+
+━━ 现在的唯一卡点（下一步，不许再瞎改）━━
+浏览器进程的 SIGSEGV **没有任何崩溃报告**：`webview_zygote` 崩时至少有
+`A9VM bdev crash sig=11 … pc=liba15vm-guest-ld-android.so+0x7f390`，
+而 `org.chromium.webview_shell` 这次 551 次崩溃里一条 `bdev crash` 都没有
+（`framework-server.log` / `framework-broker.log` 都搜过）——所以现在连崩在哪都不知道，
+任何“再换个加载路径”的改动都是猜。
+下一轮唯一动作：先让这类进程的 SIGSEGV 有报告（查清为什么 crash handler 没在这条路径上打印），
+拿到 pc/寄存器/映射之后再改。
+
+━━ 产物（已装机）━━
+```text
+APK 1,976,189,213 B
+    sha256 42679AFB4F00B87C9E7B4257947AFB4E595B2C6B19A61F6058C0719BE6F433D8
+    2026-10-31 21:04 构建，21:06:50 装机
+```
+
+## 第 102 轮 · 浏览器打不开的真因：WebView 原生库从 APK 里被 zip 映射时崩
+
+> 包名 **me.kanadex.versebox**。本轮只做一件事：读用户打开浏览器那一刻的日志并修。
+
+━━ 1. 真机取证（实例 1793450665241，20:53-20:57，用户点开浏览器）━━
+`vm/framework-server.log`：
+```text
+53197 a15_application_launch=30077:org.chromium.webview_shell uid=10046 spawn_ms=6
+53198 ActivityManager: Start proc 30077:org.chromium.webview_shell/u0a46
+      for top-activity {org.chromium.webview_shell/.WebViewBrowserActivity}
+53243 a15_application_exit=30077:org.chromium.webview_shell code=139   ← SIGSEGV
+53244 ActivityManager: Process org.chromium.webview_shell (pid 30077) has died: fg TPSL
+53274 a15_application_launch=30096:org.chromium.webview_shell uid=10046 spawn_ms=20
+53275 ActivityManager: Start proc 30096:org.chromium.webview_shell/u0a46
+...  同形状再重复，整轮共 6 次启动 / 6 次 code=139（约每 6 秒一次）
+```
+判据三项（按指定口径）：
+- 浏览器进程**有**启动：`a15_application_launch=…:org.chromium.webview_shell`（6 次）；
+- **没有任何** `ANR in` / `Blocked in handler`（0 行）→ 不是 ANR、不是等 zygote；
+- **没有**重试 `a15_child_zygote`（整机只有 1 次，开机那次），失败的是浏览器进程自己。
+
+进程日志（`vm/application-23080-40{0..5}.log`，每个 98 行，内容完全相同）末尾：
+```text
+96 GUEST_LOG 6 WebViewLibraryLoader: can't load with relro file; address space not reserved
+97 GUEST_LOG 4 cr_WVCFactoryProvider: version=128.0.6613.88 (661308801) minSdkVersion=26
+      isBundle=false multiprocess=true packageId=2
+   （进程在这里 SIGSEGV，没有第二行）
+```
+开机时 `webview_zygote` 也是同一个死法（`a15_application_exit=23591:webview_zygote code=139`）。
+
+**结论**：浏览器不是“卡住”，是**一启动就 SIGSEGV 并被 AMS 重启**。崩点在 WebView 加载自己的
+原生库这一步，而且和 boot 时的 webview_zygote 崩是同一件事。
+
+━━ 2. 为什么会崩：库在 APK 里，走的是 zip 映射 ━━
+镜像的 `/system/product/app/webview/webview.apk` 是 `extractNativeLibs=false`：
+```text
+lib/arm64-v8a/libwebviewchromium.so   110,387,824 B（stored，未压缩）
+```
+nativeloader 因此把 `webview.apk!/lib/arm64-v8a` 放进 library_path，linker 用
+`open_library_in_zipfile()` 直接从这个 198 MB 的 APK 里映射 .so。这条路径在本运行时上崩，
+而 `webview_zygote`（reserve address space 失败 → 退回普通 dlopen）和浏览器进程走的是同一条。
+
+**这不是要重写 Android**：Android 自己就支持“把原生库放成普通文件”的布局
+（`extractNativeLibs=true` 的 APK 就是这样，A9/A10 镜像也是 `lib/` 下的普通文件）。
+镜像的 nativeloader 已经把 `/system/product/app/webview/lib/arm64` 放在 library_path
+**第一位**（`framework-server.log` product-clns-7），所以只要那个目录里有普通 ELF，
+linker 根本不会进 zip 分支。
+
+━━ 3. 修法（build 期，不碰运行时行为）━━
+`scripts/prepare-a15.py` 新增 `materialize_webview_native(index)`：把 webview.apk 里
+`lib/arm64-v8a/*.so` 解到镜像自己的
+`rootfs/system/product/app/webview/lib/arm64/`，并登记进 index，让现有流水线把它当成
+普通镜像库（`jniLibs` + 实例 rootfs 里的符号链接，与其余 1100+ 个镜像库完全同一条路）。
+
+产物：
+```text
+APK 1,976,189,213 B
+    sha256 42679AFB4F00B87C9E7B4257947AFB4E595B2C6B19A61F6058C0719BE6F433D8
+    2026-10-31 21:04 构建，21:06:50 adb install -r -d Success
+prepared: redroid15 1111 → 1113（新增 libwebviewchromium.so / libcrashpad_handler_trampoline.so）
+设备侧已确认解出：/data/app/…/lib/arm64/liba15vm-image-9dc0678dda3d710b34a0.so = 110,387,824 B
+```
+
+**未验证**：还没有开机跑过一次浏览器。下一次开机的判据：
+1) `a15_application_launch=…:org.chromium.webview_shell` 之后**不再**出现同 pid 的
+   `code=139`，或者错误变成别的（都要原文）；
+2) 进程日志里出现 `nativeloader: Load libwebviewchromium.so … ok`（走的是
+   `/system/product/app/webview/lib/arm64` 而不是 `webview.apk!/…`）；
+3) 浏览器能出页面（或至少不再重启循环）。
+
+## 第 101 轮真机结果（开机 20:25，实例 1793449504963）与第二次修复## 第 101 轮真机结果（开机 20:25，实例 1793449504963）与第二次修复
+
+> 包名 **me.kanadex.versebox**。本轮第一次开机只做了“进桌面 + 看 Wi-Fi”，没有导入应用。
+
+━━ 1. 已验证（同一份日志原文）━━
+
+| 判据 | 修前（实例 1793447452431） | 修后（实例 1793449504963） |
+| --- | --- | --- |
+| `a15_wifi_scan_callback=set` | 0 行 | **26489 / 26712** |
+| `a15_wifi_scan_callback_pushed=1` | 不存在 | **26488** |
+| `a15_wifi_scan_ssid=set`（SystemUI 回调后真的来取扫描） | 0 | **26491** |
+| `Failed to execute (…art_exec…): Permission denied` | 17 | **0** |
+| `dex2oat returned an unexpected code: 134` | 51 | **0** |
+| `dex2oat returned code 0` | 0 | **17** |
+| `Failed to execute` in `vm/framework-artd.log` | 17 | **0** |
+| `ArtService: Dexopt result … status=` | 全是 134 失败 | 93 行全部 `status=SKIPPED/成功`，`dex2oatWallTimeMillis` 正常 |
+
+⇒ **exec 执行位这条修对了**：artd 现在能把 `art_exec` 拉起来，`dex2oat64` 真的跑完并返回 0
+（`vm/framework-artd.log:218/304/354/384 …`）。PackageManager 的 150 s 阻塞、
+`Waited one second for artd` 都不再出现。
+
+━━ 2. 仍然没有 Wi-Fi 图标：新真因（已取证，已改，待验证）━━
+真机事实：`WifiStateWorker: WifiManager.getWifiState():3`、扫描回调已推送、
+Settings 里 `WifiRepository: wifiStateFlow: 3`，**状态栏仍然没有图标**；
+SystemUI 日志里还有 `StatusBarIconController: Ignoring removal of (wifi).
+It should be controlled elsewhere`（注释：wifi 图标归新的状态栏管线管，不归老控制器）。
+
+镜像取证（`adb pull` SystemUI.apk → 自己解 DEX，`_bin/a15/scratch/sysui`）：
+
+```text
+Lcom/android/systemui/statusbar/pipeline/wifi/data/repository/prod/WifiRepositoryImpl;
+   -> WifiPickerTrackerFactory.create            ← 用 WifiPickerTracker 取条目
+   -> WifiEntry.isDefaultNetwork / isPrimaryNetwork
+   -> WifiEntry.getLevel / hasInternetAccess / getTitle
+   -> WifiNetworkModel$Active.<init> / WifiNetworkModel$Inactive.<init>
+Lcom/android/wifitrackerlib.WifiPickerTracker;
+   -> NetworkCapabilities.getTransportInfo
+   -> NetworkCapabilities$Builder.setTransportInfo
+Lcom/android/systemui/statusbar/pipeline/wifi/ui/viewmodel/WifiViewModel$wifiIcon$1;
+   -> WifiIcon$Companion.fromModel   （Hidden / Visible）
+```
+
+结论：A15 的状态栏不从 `WifiManager` 取连接状态，而是**从默认网络的
+`NetworkCapabilities.getTransportInfo()` 取 WifiInfo**，用它把 WifiPickerTracker 里
+某个 `WifiEntry` 标成“默认网络”；标不上就退化成 `WifiNetworkModel$Inactive` →
+`WifiIcon$Hidden`。我们的 NetworkAgent 只塞了旧字段 `SSID`/`SignalStrength`
+（`registerNetworkAgent … nc{… SSID: "CMCC-FKAz-5G"}` 能看到），**没有 transportInfo**。
+
+**修法**：`GuestConnectivity.capabilities()` 在最后一步把 `GuestWifi.connectionInfo()`
+挂上去，依次尝试三条路（因为镜像里 `NetworkCapabilities` 同时存在于
+`framework.jar`（只有 getTransportInfo）与 `framework-connectivity.jar`（有 setter））：
+`NetworkCapabilities.setTransportInfo` → `NetworkCapabilities$Builder` 重建 →
+私有字段 `mTransportInfo`。命中哪条写 `a15_caps_transport_info=<setter|builder|field>:ssid/…`。
+
+━━ 3. 产物（第二轮，已装机）━━
+```text
+APK 1,925,816,207 B
+    sha256 616C2E13F541009F5B49246E00ECB7E9937225B1BBEC927EC1A7BBC479BA6E33
+    2026-10-31 20:41 构建，20:4x adb install -r -d Success
+framework-check.dex 158,696 B（含 a15_caps_transport_info / a15_wifi_connection_info）
+```
+（第一轮装的是 `DEB5A335…`，20:22 构建；它已经证明了 exec 与扫描回调两条修法。）
+
+━━ 4. 下一步唯一动作 ━━
+  再开一次机，四步：
+  ① 状态栏有没有 Wi-Fi 图标；② 设置 → WLAN / 存储；③ 导入一个应用；④ 打开它。
+  我读 `a15_caps_transport_info=`、`a15_wifi_connection_info=`、
+  `a15_vold_storage_candidate=`、`vm/framework-install-commit.log`。
+
+## 换会话交接（2026-10-31 第 101 轮 · 三条真因用镜像取证后修掉，已装机待真机判定）
+
+> ⚠️ **应用包名 = `me.kanadex.versebox`**（旧 `io.a10vm` 仍在设备上，是废弃包）。
+> 本文件、`docs/android15-port/**`、`run-as`、实例目录、dropbox 一律用新包名。
+
+━━ 本轮一句话 ━━
+  三处“上一轮以为修了、其实没生效”的点，都用**镜像自己的方法表/日志原文**重新取证后改掉：
+  1) **Wi-Fi 状态栏断点**：A15 的 `IWifiManager.register*Callback` 全是 **一个** 参数，
+     `IScanResultsCallback.onScanResultsAvailable()` **零个**参数；relay 按 A9/A10 的
+     两参形状取 `args[1]`，自己抛 `ArrayIndexOutOfBoundsException`，所以
+     `a15_wifi_scan_callback=set` 从来没打印过 —— SystemUI 的 `WifiRepositoryImpl`
+     永远收不到扫描回调（状态栏/控制中心没有 Wi-Fi）。
+  2) **dexopt 全线失败（134）的真因**：rootfs 里的 `art_exec` 等二进制**没有执行位**
+     （`ls: -rw-rw-rw- art_exec`），artd 每次 fork 后 `execve` 都 EACCES。
+     Windows 上 `extract-apex.py` 拿不到 POSIX mode，fallback 写的是 0666 —— 这是构建
+     环境造成的**产物缺陷**，不是 AOSP 的问题。已在我们自己的 libc exec 桥里补执行位。
+  3) **存储容量**改由宿主给真实值（宿主 `/data` 223 GiB = 239,470,989,312 B，旧值
+     492,196,392,960 B ≈ 458 GiB 与本机不符）。
+
+━━ 1. Wi-Fi：取证（镜像 framework-wifi.jar classes.dex 方法表，`_bin/a15/scratch/fwifi2`）━━
+```text
+Landroid/net/wifi/IWifiManager;:
+  V registerScanResultsCallback(Landroid/net/wifi/IScanResultsCallback;)     ← 1 参数
+  V registerTrafficStateCallback(Landroid/net/wifi/ITrafficStateCallback;)   ← 1 参数
+  V registerSoftApCallback(Landroid/net/wifi/ISoftApCallback;)               ← 1 参数
+  V registerLocalOnlyHotspotSoftApCallback(ISoftApCallback, Landroid/os/Bundle;)
+Landroid/net/wifi/IScanResultsCallback;:
+  V onScanResultsAvailable()                                                 ← 0 参数
+Landroid/net/wifi/ITrafficStateCallback;:
+  V onStateChanged(I)
+Landroid/net/wifi/ISoftApCallback;:
+  V onStateChanged(Landroid/net/wifi/SoftApState;)   ← 参数是对象，不是 int
+```
+真机侧同一件事的原文（实例 1793447452431，server.log:27731）：
+```text
+a15_wifi_call=registerScanResultsCallback      ← 请求确实进了 relay
+（缺 a15_wifi_scan_callback=set）               ← 推送前就抛了
+```
+**为什么是 AIOOBE**：`GuestWifi.invoke()` 里 `registerScanResultsCallback` 分支写的是
+`LocalGuestService.call(args[1], …)`，而 A15 的这个方法只有 `args[0]`；异常从 relay
+抛出 → 调用方（system_server 的 WifiManager 代理）收到 failed reply。
+
+**修法**（`guest-runtime-a15/vendor/framework/GuestWifi.java`）：三个注册方法一律取
+`args[0]`；扫描回调按**零参**调用；`publish()` 在 `scanUpdated` 时对所有已注册回调
+再推一次；热点回调（参数是 `SoftApState` 对象）只登记不推送，避免编造一个假热点。
+新增判据行：`a15_wifi_scan_callback=set` / `a15_wifi_scan_callback_pushed=1` /
+`a15_wifi_scan_callback_failed=<异常>`。
+
+━━ 2. dexopt / 安装 / 清数据 / 卸载 / 存储统计：同一个真因 ━━
+真机原文（实例 1793447452431）：
+```text
+vm/framework-artd.log:79
+  GUEST_LOG 7 : Failed to execute (/apex/com.android.art/bin/art_exec --drop-capabilities
+      --keep-fds=13:9:7:15:16:17:18 -- /apex/com.android.art/bin/dex2oat64 …): Permission denied
+vm/framework-artd.log:80
+  A9VM abort caller=liba15vm-image-3b8529810b072a9c1f43.so+0xaa6f8
+实例根 a9exec.log：17 行 "enter /apex/com.android.art/bin/art_exec"（每行都在 exec 前被记下，
+之后失败）；同一实例 server.log 里 dex2oat 134 共 51 处。
+```
+为什么没有执行位（`adb shell run-as … ls -l …/rootfs/apex/com.android.art/bin`）：
+```text
+-rw-rw-rw- 1 u0_a335 u0_a335 69600 19:51 art_exec      ← 0666，没有 x
+```
+来源：`extract-apex.py` 在 Windows 上无法 stat 出 POSIX mode，走 fallback `0o666`；
+`RuntimeFiles.installData()` 忠实照抄进实例 rootfs。CI（Linux）不会有这个现象，
+所以**这是本机产物特有的缺陷**，只能用运行时代码兜住（重新 prepare 一次也能改，但要重打 1.9 GB
+资产，风险更大）。
+
+**修法**（`guest-runtime-a15/vendor/runtime/filesystem/GuestExec.cpp`）：exec 前先
+`faccessat(X_OK)`，只有 **EACCES** 时才 `fchmodat(0755)` 再重试一次（跟随
+`dex2oat64 -> liba15vm-dex2oat64.so` 这种符号链接）。文件属于实例的 uid，chmod 必然成功；
+正常路径完全不受影响。
+
+━━ 3. 存储容量：改由宿主给真实值 ━━
+- 宿主 `HostNetworkBridge.writeSnapshot()` 新增 `"storage":{"totalBytes","usableBytes"}`
+  （取 `context.getFilesDir()` 的 getTotalSpace/getUsableSpace）；
+- 客体 `PrivateVolumes.totalBytes()` 优先读 `$A10VM_STATE_ROOT/host-network.json` 的
+  `storage.totalBytes`，读不到才回落到 `/data` → `/storage/emulated/0` → state root → `/`；
+- 判据行：`a15_vold_storage_candidate=host:239470989312`（本机 `df /data` = 223 GiB）。
+  旧的 492,196,392,960 B 与本机任何挂载都对不上（`adb shell df -h` 没有 458 GiB 的文件系统）。
+
+━━ 4. 本轮产物（已装机）━━
+```text
+APK 1,925,816,207 B
+    sha256 DEB5A335BCDD0BB2B25363C4741E43C0E041854B5CCD02A0FD7C338B5C20E1A0
+    2026-10-31 20:22 构建，20:2x adb install -r -d 成功
+framework-check.dex 157,304 B（含 a15_wifi_scan_callback_pushed / a15_vold_storage_candidate=host）
+libc.so / liba15vm-bootstrap.a 重编（含 exec 执行位修复）
+prepared：nativeFiles / dataFiles 与第 97 轮同源（未改资产）
+```
+
+━━ 5. 已验证 / 未验证 ━━
+  ✅ 已验证（本地，非真机）：构建全绿；framework-check.dex 内含本轮两条新判据串；
+     `liba15vm-guest-ld-android.so` 的 `__memchr_aarch64_mte` 崩溃点已用
+     `llvm-objdump` 定位（见下节，未修）。
+  ⏳ **未验证（必须一次真机开机 + 一次导入才有结论）**：
+  1) Wi-Fi：`a15_wifi_scan_callback=set` + `a15_wifi_scan_callback_pushed=1` 出现，
+     SystemUI 日志里 `WifiManager.getWifiState():3`，状态栏/控制中心出现 Wi-Fi 图标；
+  2) dexopt：`vm/framework-artd.log` 里 `Failed to execute …art_exec…: Permission denied`
+     归零、`dex2oat returned an unexpected code: 134` 归零（或换成别的错）；
+  3) 导入：一次 create/write/commit 后 `vm/framework-install-commit.log` 出现
+     `guest_command_result=0`，桌面当场出现图标；
+  4) 存储：设置 → 存储 显示与 223 GiB 相符（不是 512 GB），server.log 有
+     `a15_vold_storage_candidate=host:…`。
+
+━━ 6. 已知未修（下一轮按此顺序）━━
+  1) **WebView 崩溃**（阻断“应用打开后卡死”）：`webview_zygote` 已经走到
+     `a15_child_zygote_ready=com.android.internal.os.WebViewZygoteInit/…`，随后
+     `A9VM bdev crash sig=11 fault=0x0 pc=liba15vm-guest-ld-android.so+0x7f390`
+     = `__memchr_aarch64_mte`，寄存器 `x0=0`（s=NULL）、`x2=0x20`（n=32），
+     即 **有人对 NULL 调 memchr**。同一行前面是
+     `WebViewLibraryLoader: can't load with relro file; address space not reserved`
+     → 走的是“从 webview.apk 里按 zip 取 .so”的路径。回调用栈落在
+     `ParseZip64ExtendedInfoInExtraField`（linker_zip）附近，但 bionic 的 linker 源码里
+     **没有 memchr 调用**，所以下一步要先确认调用者（在 zip/lookup 路径上加一次
+     只读点名，或对 `webview.apk` 的 zip 目录做离线解析），不许盲改。
+  2) **开机日志刷屏**：一次开机 `SystemServiceRegistry: No service published for: dropbox`
+     约 960 次（每次 10 行栈，约 9600 行，占 server.log 的绝大部分），全部发生在
+     `StartDropBoxManager`（server.log:22965）之前，来自
+     `ActivityManagerService.addErrorToDropBox`。修法候选：在 `A15Boot` 里先发布一个
+     中立 `dropbox` 端点（真服务起来后同名覆盖），判据=该行归零。
+  3) WebViewLibraryLoader 的 relro 分支：需要单独取证（是否与 1 同源）。
+
+━━ 7. 下一步唯一动作 ━━
+  让维护者启动默认虚拟机（`me.kanadex.versebox`）一次，然后：
+  ① 打开「设置 → WLAN」看一眼是否显示已连接、状态栏是否有 Wi-Fi 图标；
+  ② 打开「设置 → 存储」看总容量；
+  ③ 导入一个应用，看是否当场出现图标；
+  ④ 打开它。
+  我按这四步读同一份日志（`vm/framework-artd.log`、`vm/framework-server.log`、
+  SystemUI 的 `application-*-*.log`、`vm/framework-install-commit.log`）。
+
+## 换会话交接（2026-10-31 第 100 轮 · Wi-Fi：服务名已夺回、状态已对，卡在扫描回调推送）
+
+> ⚠️ 包名 **me.kanadex.versebox**（旧 io.a10vm 作废）。
+
+━━ 一句话 ━━
+  状态栏没有 Wi-Fi 图标的链路已经拆到底：**镜像 WifiService 抢名字 → 已被拒**、
+  **SystemUI 的 getWifiState 已由 1 变 3**；剩下的唯一断点是
+  `IScanResultsCallback.onScanResultsAvailable` 这一推——请求确实进了 relay
+  （`a15_wifi_call=registerScanResultsCallback`），但推送在打印之前抛出，
+  所以 `a15_wifi_scan_callback=set` 不出现，`WifiRepositoryImpl` 永远收不到扫描结果。
+
+━━ 真机判据（实例 1793447094656 / 1793447452431，19:44-19:56）━━
+```text
+412    a15_service_guard=installed
+23905  WifiService: Registering wifi            ← 镜像来抢
+23906  a15_service_add_rejected=wifi:15063     ← 拒绝（修前是覆盖成功）
+23912  a15_service_add_rejected=wifiscanner:15063
+27731  a15_wifi_call=registerScanResultsCallback  ← 状态栏管线打到了 relay
+       (缺 a15_wifi_scan_callback=set)            ← 推送前抛异常
+SystemUI application-*-1.log:
+  253  WifiManager: registerScanResultsCallback: …WifiRepositoryImpl…
+  681  WifiStateWorker: WifiManager.getWifiState():3   ← 修前是 1
+```
+
+━━ 本轮改动（3 次构建，逐次判据分开）━━
+1. `A15ServiceGuard`（新类）：替换 `ServiceManager.sServiceManager` 为动态代理，
+   `wifi`/`wifiscanner` 的重复注册丢弃并打 `a15_service_add_rejected=`；
+   A15Boot 自己注册时用 `beginOwner/endOwner` 放行。**已验证**（23906/23912）。
+2. `GuestWifi`：补 `registerScanResultsCallback` / `unregisterScanResultsCallback`，
+   把宿主 AP 列表推给 `IScanResultsCallback.onScanResultsAvailable`。**未生效**。
+3. `GuestWifi.invoke()` 入口加 `a15_wifi_call=<method>`（只记一次）。**已验证**（27731）。
+
+━━ 产物 ━━
+  当前装机 APK（19:52 构建、19:53 装机，含上面 3 条）；
+  `framework-check.dex` 随 prepare 重建（含 A15ServiceGuard）。
+
+━━ 已验证 / 未验证 ━━
+  已验证：guard 生效 + SystemUI getWifiState=3 + 设置列表仍可用 + artd 卡点仍关闭
+  （`Waited one second for artd` 0 行）。
+  未验证：状态栏 Wi-Fi 图标（仍无）；`dex2oat`（`art_exec` exec 失败、134）；
+  WebView（linker `__memchr_aarch64_mte`，fault=0x0）。
+
+━━ 下一步唯一动作 ━━
+  把 `registerScanResultsCallback` 的推送包 try/catch 并打
+  `a15_wifi_scan_callback_failed=`，同时按镜像 `framework-wifi.jar` 的 dexdump
+  核对 `IScanResultsCallback` 的真实方法签名与参数类型（不要凭记忆），
+  判据：`a15_wifi_scan_callback=set` 出现 + SystemUI 收到带 SSID/RSSI 的扫描结果 +
+  状态栏出现 Wi-Fi 图标。
+
+## 换会话交接（2026-10-31 第 97 轮 · artd 真因：DEX2OATBOOTCLASSPATH 与 BOOTCLASSPATH 相等）
+
+> ⚠️ **应用包名 = `me.kanadex.versebox`**（uid 10335）。设备上仍装着旧的 `io.a10vm`（uid 10262），
+> 那是**废弃包**，它的进程/实例/日志一律不可用。所有命令形状：
+> `adb shell "run-as me.kanadex.versebox ..."`、`files/devices/<实例号>/`。
+
+━━ 本轮一句话 ━━
+  「导入超时 / 桌面要重启才有图标 / 清数据没反应 / 卸载不了 / 应用存储占用一直转圈」
+  是**同一个**卡点：镜像自己的 `artd` 一被调用就 abort，PackageManagerService 永远等不到
+  dexopt 回复（ANR `Blocked in handler on PackageManager (PackageManager) for 150s`）。
+  artd abort 的**真因**不是超时、不是 binder、不是 arena，而是 **`DEX2OATBOOTCLASSPATH`
+  被导出成和 `BOOTCLASSPATH` 完全相同**：ART 的 boot image 推导要求前者是后者的**真前缀**
+  （去掉前缀后剩下的第一段就是 mainline jar），相等 → 剩下为空 →
+  `Check failed: !location.empty() No mainline framework library found`。
+  已修：`FrameworkSession` 只把 **ART APEX 的 5 个 javalib jar + 一个结尾冒号** 作为
+  `DEX2OATBOOTCLASSPATH`，剩下的第一段正好是 `/system/framework/framework.jar`。
+  dalvikvm64 子进程一直带 `-Ximage`，所以它们从来没走过这条推导，只有 artd 需要它。
+
+━━ 1. 真因（真机原文，实例 1793443256048）━━
+  `vm/framework-artd.log` 末尾（artd 已经注册成功之后才被第一个请求打死的）：
+  ```
+  GUEST_LOG 4 : Starting artd
+  GUEST_LOG 4 AidlLazyServiceRegistrar: Registering service artd
+  ... binder 事务 ...
+  GUEST_LOG 7 : Check failed: !location.empty() No mainline framework library found
+  A9VM abort caller=liba15vm-image-3b8529810b072a9c1f43.so+0xaa6f8
+  ```
+  同一实例 `vm/framework-server.log`：
+  - `24845: GUEST_LOG 6 ArtService: An error occurred when calling artd`
+  - `24923 起 ServiceManagerCppClient: Waited one second for artd ...` **607 行 / 10 分钟**
+  - `anr_2026-10-31-11-00-06-904: Subject: Blocked in handler on PackageManager
+     (PackageManager) for 150s`（19:00:06；起点是 18:57:35 那次
+    `ActivityManager: Force stopping com.android.gallery3d ...: clear data`）
+  - 同一时刻 `framework-install-commit.log` 停在第 46 行（没有任何
+    `guest_command_result`），而 create/write 都是 `guest_command_result=0`。
+
+  ART 侧语义（`_bin/a15/evidence/libartbase-bootimage-disasm.txt` 反汇编 +
+  `_bin/a15/scratch/parsed_options_15.cc` 真源码）：
+  `art::GetFirstMainlineFrameworkLibraryFilename()` = `BOOTCLASSPATH` 去掉
+  `DEX2OATBOOTCLASSPATH` 前缀后按 ':' 切分取第一段；相等 → 空 → CHECK。
+  结论：**davikvm64 靠 -Ximage 绕过了这条检查，artd 不能带 -X（它自己的 argv 解析器
+  只认 --dump-only/--class-reboot 之类），所以必须让环境本身满足它。**
+
+━━ 2. 本轮改动（唯一一处，host Java）━━
+  `guest-runtime/src/main/java/io/a10vm/guestruntime/FrameworkSession.java`
+  - 新增 `dex2oatBootClassPath(List<String> boot)`：取 bootClassPath 开头连续的
+    `/apex/com.android.art/javalib/*`（5 项），用 ':' 连接并**保留结尾冒号**；
+    没有 APEX 前缀时回退成旧值（相等）。
+  - `framework.put("DEX2OATBOOTCLASSPATH", dex2oatBootClassPath(paths))`。
+  - 结尾冒号是刻意的：helper 不跳过分隔符，而 `DEX2OATBOOTCLASSPATH` 不是任何进程
+    打开的 class path（dalvikvm/dex2oat 读 `BOOTCLASSPATH`），空尾项无害。
+
+━━ 3. 产物与装机 ━━
+  APK `1,925,755,673 B`
+      sha256 `C97EAB1DA43A6B84232FCFD895C9A0F7ED83343ECE432548A775DD6E1A5173F4`
+      （2026-10-31 19:21:28 构建，19:23:51 `adb install -r -d` 成功，
+        `lastUpdateTime=19:23:51`）
+  上一版 `1,925,606,065 B / 3C84EC10…`（18:38 构建、18:40 装机）**是本轮之前的现场**，
+  文档 18:45 那一版写的是更早的 18:04 APK（27339838…），已经纠正到本节。
+
+━━ 4. 已验证 / 未验证 / 已回滚 ━━
+  ✅ 第 97 轮**实测**（实例 `1793445920558`，19:25 启动，19:23 那一版 APK）：
+  - `vm/framework-artd.log` 里 `Check failed: !location.empty() No mainline framework library found`
+    **0 行**（修前：artd 的第一条请求就打死它）；
+  - `vm/framework-server.log` 里 `Waited one second for artd` **0 行**（修前实例 1793443256048：607 行）；
+  - `Blocked in handler`（PackageManager 150s ANR）**0 行**；
+  - 桌面正常：`Displayed com.android.launcher3/.uioverrides.QuickstepLauncher for user 0: +2s92ms`；
+  - artd 真的开始干活：`ArtService: onBoot: reason=first-boot`、
+    `ArtService: Dexopting 93 packages with reason=first-boot`，
+    `framework-artd.log` 177,899 B（修前 2,724 B）。
+  **⇒ artd 卡点已关闭（同一份日志前后比对）**。
+
+  ⚠️ 同一份 artd 日志暴露下一层（**新发现，不属于 artd 闸门**）：
+  `ArtService` 让 artd 起 `dex2oat64` 时，`art_exec` 执行失败并 abort（sig=6/134）：
+  ```
+  GUEST_LOG 4 : Running dex2oat: /apex/com.android.art/bin/art_exec --drop-capabilities
+       --keep-fds=10:11:7:13:14:16 -- /apex/com.android.art/bin/dex2oat64 ...
+  GUEST_LOG 7 : Failed to execute (/apex/com.android.art/bin/art_exec ... )
+  A9VM abort caller=liba15vm-image-3b8529810b072a9c1f43.so+0xaa6f8
+  GUEST_LOG 4 : dex2oat returned code 134
+  ```
+  17 次（93 个包里其余是 `Should not recompile`）。artd 自己**不再死**（后续继续扫描），
+  所以安装事务不该再被挂死；但 `dex2oat` 仍未真正跑起来 → 新装应用没有 oat
+  （走解释/JIT）。下一步要单独取证 `art_exec` 的 `execv(dex2oat64)` 为什么失败
+  （`_bin/a15/scratch` 的 exec 桥日志 `a9exec.log` 只有 `enter art_exec` / `enter linker`，
+  没有 `enter dex2oat64`）。
+
+  已验证（真机，本轮之前）：
+  - artd 确实 abort 在这条 CHECK 上，且 artd 是 PackageManager 150s ANR 与
+    commit 不返回的同一源头（原文见 §1）；
+  - `a15_pdb_endpoint=registered`（server.log:409），`persistent_data_block` 异常 0 行；
+  - `a15_wifi_endpoint=rebound` / `a15_wifiscanner_endpoint=rebound`、
+    `a15_wifiscanner_deliver=17`、`a15_wifi_scan_ssid=set`（本轮实例 server.log 25306）。
+  未验证（本轮的判据，**必须在这里补上原文后才能写“修好”**）：
+  - `vm/framework-artd.log` **不再**出现 `No mainline framework library found`；
+  - `vm/framework-server.log` 里 `Waited one second for artd` 归零或只剩开机前几行；
+  - `vm/framework-install-commit.log` 出现 `guest_command_result=0`，桌面当场出现图标；
+  - 设置里容量页出现 `a15_vold_storage_candidate=<state root>:≈2.39e11`；
+  - 清除数据/卸载返回，不再触发 PackageManager ANR。
+  已回滚：第 95 轮给 artd argv 塞 `-Ximage:/system/framework/boot.art`
+  （artd 直接 `Unknown option` 起不来，见 coding-log 第 95 轮第三篇检讨）。
+
+━━ 5. 下一步唯一动作 ━━
+  等人启动一次（19:23 装机的那一版），**只读**这四行比对：
+  1) `framework-artd.log` 末行不再是那条 CHECK；
+  2) server.log 的 `Waited one second for artd` 计数；
+  3) 一次导入的 `framework-install-commit.log` 是否 `guest_command_result=0`；
+  4) 存储页的 `a15_vold_storage_candidate=`。
+  这四个判据决定下一轮是继续 artd（deopt 真跑起来）还是转 WebView/linker
+  （`webview_zygote` cpu 崩溃：`WebViewLibraryLoader: can't load with relro file;
+  address space not reserved` 之后 `pc=liba15vm-guest-ld-android.so+0x7f390`
+  = `__memchr_aarch64_mte`，fault=0x0，即某个调用方给 memchr 传了 NULL）。
+
+
+## 换会话交接（2026-10-31 第 95 轮，当前状态汇总）
+
+> ⚠️ **应用包名已改为 `me.kanadex.versebox`**（旧包名 `io.a10vm` 仍可能残留在设备上）。
+> 抓日志、查实例目录、看 dropbox 一律用 `me.kanadex.versebox`：
+> `run-as me.kanadex.versebox ...`、`files/devices/<实例号>/`。
+> 抓错包名会得到一台已经废弃的进程，结论全部作废。
+
+━━ 本轮一句话 ━━
+  应用导入失败的**真因已找到并修掉**（不是超时、不是 binder 桥断开、不是 arena）：
+  A15 的 `PackageInstallerSession.markAsSealed()` 要取 `persistent_data_block` 服务，
+  redroid 没有 FRP 分区 → `ServiceNotFoundException` 在 system_server 里抛出 →
+  shellCommand 事务失败 → Java 侧 `Unknown binder error code 0xffffff91` /
+  `DeadObjectException`。已发布中立端点 `a15_pdb_endpoint=registered`（真机 VM8 已验证注册）。
+  Wi-Fi 列表空的真因同样不是 ScanResult 序列化：**我们注册的 relay 被镜像自己的
+  WifiService 覆盖了**，所以 WifiManager 全部打到"radio disabled + 无扫描数据"的真服务上。
+  已在 boot_completed 时重新夺回 `wifi` 名字（真机 VM8：`a15_wifi_endpoint=rebound`）。
+
+━━ 1. 应用导入（I 轨）：根因 + 修法（**新**）━━
+  真机证据（实例 1793438854447，17:29-17:50，导入哔哩哔哩 216 MB），system_server 日志原文：
+  ```
+  GUEST_LOG 6 SystemServiceRegistry: No service published for: persistent_data_block
+  android.os.ServiceManager$ServiceNotFoundException: No service published for: persistent_data_block
+      at android.os.ServiceManager.getServiceOrThrow(ServiceManager.java:203)
+      at android.app.SystemServiceRegistry$82.createService(SystemServiceRegistry.java:1111)
+      at com.android.server.pm.PackageInstallerSession.markAsSealed(PackageInstallerSession.java:2441)
+      at com.android.server.pm.PackageInstallerSession.commit(PackageInstallerSession.java:2190)
+      at com.android.server.pm.PackageManagerShellCommand.doCommitSession(PackageManagerShellCommand.java:4305)
+      at com.android.server.pm.PackageManagerShellCommand.runInstallCommit(PackageManagerShellCommand.java:1719)
+  ```
+  - `SystemServer` 只在设备声明 FRP 分区（`ro.frp.pst`）时启动 `PersistentDataBlockService`，
+    redroid 镜像没有，所以该名字永远不存在；而 `getSystemService` 是 **throw** 不是返回 null。
+  - 于是一切 "提交安装" 都会在 commit 里炸掉；这解释了为什么"装完没图标、要重启才出现、点开就闪退"
+    与"大应用必失败、小应用偶尔成功"（write 阶段已 sealed 的会话会跳过 markAsSealed）。
+  - 已修：`vendor/framework/GuestPersistentDataBlock.java`（中立端点，全部返回"没有持久分区"的值，
+    永不抛异常）+ `A15Boot` 在 `SystemServer.main()` 之前 `GuestPersistentDataBlock.register()`。
+  - 真机验证（VM8 = 实例 1793439416160，17:37）：`a15_pdb_endpoint=registered`（server.log:410），
+    `persistent_data_block` 相关异常 0 行。
+  - **未验证**：一次真实导入的 commit 是否 `guest_command_result=0`。判据：同一份
+    `vm/framework-install-commit.log` 出现 `guest_command_result=0`，且 server.log 不再有上面的栈。
+
+  ✗ 已证伪（不要再走）：
+  - "arena 被填满 → BR_FAILED_REPLY"：失败点是 `writeRead failed errno=111 write=0 read=256`，
+    即**纯阻塞读**（没有事务在途），arena 分支根本不会被走到；该假设已回滚
+    （`BrokerObjects.cpp` 与备份逐字节一致），只在 arena 分支留了一行日志供以后取证。
+  - "commit 超时"：commit 不是慢，是在 markAsSealed 抛异常；把宿主限时从 150 s 放宽到不限时无效。
+
+━━ 1.1 导入的**第二道墙**：artd 起不来，dexopt 没人执行（**新，未修**）━━
+  PDB 修好后 commit 仍卡住，同一形状两次（VM9 17:46、VM10 17:59）：
+  `framework-install-commit.log` 第 46 行之后不再前进，create/write 都是
+  `guest_command_result=0`。取证：
+  - `rootfs/data/anr/anr_2026-10-31-09-49-37-337`：
+    `Subject: Blocked in handler on PackageManager (PackageManager) for 150s`
+    → PackageManager 的 ServiceThread 被堵 150 s（这就是"导入卡住"）。
+  - `framework-artd.log`（VM9）：注册 artd 后立刻 abort
+    `Check failed: !location.empty() No mainline framework library found`
+    → 之后 server 日志 `Waited one second for artd` 无限重复（开机日志刷屏的主源）。
+  - A15 的 dexopt 由 artd 执行 → install-commit 需要的那次 dexopt 无人执行。
+  ✗ 已证伪的修法：给 artd 服务加 `-Ximage:/system/framework/boot.art`。
+    artd 自己的 argv 解析器不认 ART 的 `-X` 选项，真机 VM10（1793440502763）
+    `framework-artd.log` 只有两行：`Unknown option -Ximage:/system/framework/boot.art`
+    —— 比原来更坏，已回滚（见 coding-log 第 95 轮第三篇检讨）。
+  → 下一轮只能从这里三个方向里选一个取证：derive_classpath 产物、artd 的环境变量、
+    或者由 bootstrap 发布 artd 端点。**不许再往 argv 里塞 -X。**
+
+━━ 1.2 首次开机卡在开机画面 / Wi-Fi 设置页闪退（**新**）━━
+  - 首次开机卡画面：首次开机要做 dexopt（artd），第二次已做过 → 能进。与 1.1 同源。
+  - WLAN 设置页闪退：relay 夺回 `wifi` 名字后，A15 的 Settings 会调用 relay 没实现的方法，
+    旧代码默认分支 `throw new UnsupportedOperationException` → 调用方收到 failed reply → 闪退。
+    已修：默认分支改为**中立返回值**（基本类型 0/false、容器空、数组空、其余 null）
+    并打一行 `a15_wifi_unhandled=<method>`（每个方法只一次）。**未验**。
+
+━━ 1.3 Wi-Fi：**只有"设置页的 WLAN 列表"通了，状态栏/控制中心/系统级仍不显示**（2026-10-31 18:4x 更正）━━
+  维护者原话："列表从来都是 connect，我说的是状态栏和控制中心的其他地方根本不显示 wifi"。
+  所以上一版把 Wi-Fi 写成"已通"是**错的**，这里按真实范围重写。
+
+  ｜能用的部分（有真机日志）
+  - ConnectivityService 里有一个 WIFI/VALIDATED 的 NetworkAgent：
+    `guest_host_network_registered=100` + `registerNetworkAgent … WIFI CONNECTED VALIDATED SSID "CMCC-FKAz-5G"`；
+  - 设置 → WLAN 里有一个 "已连接/Saved" 条目：
+    `WifiPickerTracker: Entry 1/1: [StandardWifiEntry][CMCC-FKAz-5G][Connected][Level:0][Connecting...]`
+    （relay 由 `a15_wifi_endpoint=rebound` 接管，server.log:28822/24800）；
+  - 宿主 AP 列表已经能送到 WifiScanner 层：`a15_wifiscanner_deliver=22`（22 个 AP），
+    端点 `a15_wifiscanner_endpoint=registered/rebound`。
+
+  ｜不能用的部分（用户可见）
+  - **状态栏没有 Wi-Fi 图标；控制中心/快捷设置里没有 Wi-Fi 磁贴状态**；
+  - 列表条目一直是 `[Level:0][Connecting...]`（信号条为空）、MAC/IP 为空；
+  - 上层面板只说"网络可用"，不显示"已连接到 CMCC-FKAz-5G"；
+  - 能否真正上网**没有验证过**（只有 ConnectivityService 的 VALIDATED，没有应用实际发起请求的证据）。
+
+  ｜已排除的解释（不要再试）
+  - "某个 WifiInfo setter 在 A15 不存在导致 getConnectionInfo 整条抛异常"：**证伪**。
+    A15 镜像的 WifiInfo 九个 setter 全部存在（`setBSSID/setFrequency/setInetAddress/
+    setLinkSpeed/setMacAddress/setNetworkId/setRssi/setSSID/setSupplicantState`，
+    `_bin/a15/scratch/fwifi/dump.txt:104342-105081`）。加 try/catch 的那一版已回滚，
+    `connectionInfo()` 与 A10 的 `guest-runtime/check/GuestWifi.java:31-49` 逐行一致。
+  - "ScanResult 序列化 / WifiSsid 工厂"：那是列表的上一层，改完列表条目仍只有 1 条，
+    真正的通道是 WifiScanner（见 `a15_wifiscanner_*`）。
+
+  ｜**已取证：SystemUI 拿到的是镜像那个"Wi-Fi 已关闭"的 WifiService**（2026-10-31 18:4x）
+  SystemUI 进程日志（实例 1793443256048，`application-21473-1.log`）：
+  ```
+  WifiManager: registerScanResultsCallback: callback=com.android.systemui.statusbar.pipeline.wifi.data.repository.prod.WifiRepositoryImpl…
+  WifiManager: registerTrafficStateCallback: callback=com.android.systemui.statusbar.connectivity.WifiSignalController$WifiTrafficStateCallback…
+  WifiStateWorker: WifiManager.getWifiState():1          ← 1 = WIFI_STATE_DISABLED
+  ```
+  - 同一时刻设置里的 `NetworkProviderSettings: onWifiStateChanged … wifi state: 3`（ENABLED）
+    —— 两个进程看到的状态**不一样**，这就是"设置页说已连接、状态栏/控制中心没有 Wi-Fi"的机制；
+  - 原因：镜像自己的 `WifiService` 在 StartOtherServices 里注册了 `wifi`
+    （server.log `WifiService: Registering wifi`），**SystemUI 在它之后、我们 rebound 之前
+    就解析并缓存了那个代理**；我们在 `sys.boot_completed==1` 才 `a15_wifi_endpoint=rebound`，
+    对已经拿到旧代理的客户端（SystemUI / 已启动的 Settings）无效。
+  - 旁证：`getWifiState()` 在整个 SystemUI 日志里只出现过一次、值为 1；若打到我们的 relay，
+    值应当是快照里的 3。
+  ⇒ 结论：**不是广播没发，而是 SystemUI 从一开始就没连到我们的 relay。**
+
+  ｜下一轮唯一动作（修法，尚未实施）
+  让镜像的 `WifiService` **不能覆盖** `wifi` / `wifiscanner` 这两个名字，而不是事后夺回：
+  在 bootstrap 里替换 `android.os.ServiceManager.addService(String, IBinder)` 的 native
+  （项目已经用同一手法换过 `readProcLines`、BpfMap、NetworkStats 的 native）：
+  当 name 是 `wifi`/`wifiscanner` 且调用方不是我们的 relay 时，丢弃并打印一行
+  `a15_service_add_rejected=wifi:<pid>`。
+  判据：同一次开机里该行出现、且 SystemUI 日志的 `WifiManager.getWifiState():` 变成 3、
+  状态栏出现 Wi-Fi 图标。**在此之前不要再改 connectionInfo / 再新增 relay。**
+
+  （下面是当时写的列表层细节，保留作为历史证据）
+  `a15_wifi_endpoint=rebound`（server.log:28822）后，relay 第一次真正被调用：
+  - `a15_wifi_scan_ssid=set`（server.log:31303）——`getScanResults` 走到并补上了 WifiSsid；
+  - 未实现的方法不再抛异常，逐个点名：`a15_wifi_unhandled=` 6 个
+    （isAutoWakeupEnabled / getWifiConfigForMatchedNetworkSuggestionsSharedWithUser /
+    getPasspointConfigurations / getAllMatchingPasspointProfilesForScanResults /
+    isFeatureSupported …）；
+  - Settings 进程日志（application-16758-10.log）：
+    ```
+    WifiPickerTracker: onWifiEntriesChanged: reason=1
+    WifiPickerTracker: Entry 1/15: [StandardWifiEntry][CMCC-FKAz-5G][Connected][Level:0][Connecting...][Primary][Saved]
+    ```
+    —— **不再有 `No entries!`**，列表 15 条，宿主 SSID 在列且状态 Connected。
+  - 本轮没有出现 `data_app_crash`（dropbox 只有 strictmode），WLAN 页不再闪退。
+
+━━ 1.4 导入：APK 已经落盘，但 commit 的回复永远不返回（**新，未修**）━━
+  实例 1793441400580（18:11 导入 Via）：
+  - `rootfs/data/app/~~UgKgBpMg1vnDyP9m0H_pHQ==/mark.via-…/base.apk` = 2,628,334 B，
+    18:11 写完 —— **安装的实际复制已经成功**；
+  - `framework-install-commit.log` 停在第 46 行、没有 `guest_command_result`；
+  - 新 dropbox：`system_server_pre_watchdog@1793441649234`，
+    `Subject: Blocked in handler on PackageManager (PackageManager) for 150s`
+    → 卡在 PackageManager 的 ServiceThread，也就是 commit 的后续编译阶段；
+  - artd 仍然起不来：`framework-artd.log` = `Check failed: !location.empty()
+    No mainline framework library found` → abort（A15 的 dexopt 由 artd 执行）。
+  结论：**下一步只能修 artd**；修好之前，commit 复制完 APK 就卡在编译阶段。
+
+━━ 2. Wi-Fi（W 轨）：真因是 relay 被镜像的 WifiService 覆盖（**新**）━━
+  server.log 原文（实例 1793438854447）：
+  ```
+   409:  a15_wifi_endpoint=registered          ← 我们的 relay（SystemServer 之前）
+ 20688: WifiService: Registering wifi          ← 镜像自己的 WifiService 后注册，覆盖同名
+ 22323: WifiService: WifiService starting up with Wi-Fi disabled
+ 29423: WifiService: startScan uid=1000
+ 29424: WifiScanRequestProxy: Failed to retrieve wifiscanner
+ 29425: WifiService: Failed to start scan
+ 29429: ScanResultUtil: Empty or null ScanResult list
+  ```
+  - 所以 `WifiManager.*` 全部打到真服务：enable 状态是 disabled、扫描缓存为空 →
+    Settings 打印 `onWifiEntriesChanged: reason=1` + `No entries!`。
+  - 我们的 relay 一次都没被调用：`a15_wifi_scan_ssid` = 0 行（本轮新加的判据行），
+    这也证明此前"ScanResult/ParceledListSlice 序列化"方向（文档候选 c/d）**不是原因**。
+  - 已修：`A15Boot` 在 `sys.boot_completed==1` 时重新 `GuestWifi.register()` 夺回 `wifi` 名字，
+    真机 VM8：`a15_wifi_endpoint=rebound`（server.log:26801）。
+  - 另外把 `ScanResult.wifiSsid` 一并填上（A15 的 WifiPickerTracker 以该字段建条目），
+    真机判据：出现 `a15_wifi_scan_ssid=set`，且 Settings 里 `No entries!` 归零。
+
+━━ 3. 存储容量（S 轨）：解掉"256G 显示 512G" ━━
+  - 旧值 `a15_vold_storage_size=492196392960`（≈458 GiB，被 FileUtils 圆整成 "512 GB"）
+    与当前手机 `/data` 实际 `233858388 KB ≈ 223 GiB` 不符；代码本身没有写死常量，
+    说明取到了别的路径/别的设备的值。
+  - 已改：`PrivateVolumes.totalBytes()` 优先用 `A10VM_STATE_ROOT`（必然在手机 /data 上），
+    并对每个候选路径各打一行 `a15_vold_storage_candidate=<path>:<bytes>`（只打一次）。
+  - 判据：候选行里 state root 的值 ≈ 239,470,989,312 B，Settings 显示 "256 GB"。
+    当前 VM8 尚未打开存储页（`a15_vold_storage_candidate` = 0 行）。
+
+━━ 4. 产物（当前装机）━━
+  APK 1,925,602,385 B
+      sha256 27339838139EC26B293E1CFCAB4C264A83BB18C02F48BF2846FF4BC05941ABDF
+      （2026-10-31 18:04 构建；含 PDB 端点、Wi-Fi 重夺、Wi-Fi 默认分支不再抛异常、
+        storage 候选、broker 关闭原因诊断；artd 的错误参数已回滚）
+      上一版 1,925,601,913 B / 83DE870B…（17:35）**已作废**：它把 -Ximage 塞给了 artd，
+      artd 直接 `Unknown option` 起不来。
+  framework-check.dex 149,916 B（17:33，含 GuestPersistentDataBlock）
+  prepared：nativeFiles 1134 / dataFiles 2437（与第 89 轮一致，无回归）
+
+━━ 5. 下一步唯一动作 ━━
+  **先修 artd（见 1.1）**：它同时挡住"首次开机"和"导入 commit"两件事。
+  在 derive_classpath / 环境 / bootstrap 端点三条里选一条取证，不许再改 argv。
+  修好后再重新导入一次，读 `vm/framework-install-commit.log`：
+  出现 `guest_command_result=0` + 桌面出现图标 = I 轨关闭；
+  若仍有异常，读 server.log 里新的栈（现在已有 `a10binder close connection ... reason=` 可定位关闭方）。
+  然后依次验 Wi-Fi 列表（`a15_wifi_scan_ssid=set` + 无 `No entries!`）与存储容量候选行。
+
+
+## 换会话交接（2026-10-31 第 94 轮，当前状态汇总）
+
+> 本文是唯一准绳。本节把 Wi-Fi / WebView / 应用导入 / 重启后闪退 四件事的**最新真实状态**
+> 一次写清；下面的历史段落只用于查证据。
+
+━━ 一句话 ━━
+  A15 已经能进桌面、能开浏览器、能联网（宿主 Wi-Fi 已注入 ConnectivityService），
+  **但 Wi-Fi 列表仍为空**；WebView 仍未验证；**应用导入只完成到 create/write，
+  commit 会在长事务等待中被 binder 桥断开（errno=111）**；已安装的 APK 因为
+  **可写** 被 A15 拒绝加载（`Writable dex file`）而闪退——最后一个问题已修复到
+  代码（每次显示会话都自动去写位），前三个仍未关闭。
+
+━━ 1. Wi-Fi（半绿，UI 仍不可用）━━
+  已验证（实例 1793421081689 / 12:31）：
+    `guest_host_network_registered=100`
+    `ConnectivityService: registerNetworkAgent … ni{WIFI CONNECTED extra: "CMCC-FKAz-5G"}
+      nc{Transports: WIFI … VALIDATED … SSID: "CMCC-FKAz-5G"}
+      lp{{InterfaceName: wlan0 … DnsAddresses: [/192.168.1.1,/114.114.114.114] …}}`
+    `a15_wifi_endpoint=registered`、`a15_wifi_ssid=fromBytes`
+  未达成（实例 1793421860752 / 12:57 与之后）：
+    Settings Wi-Fi 页 `WifiPickerTracker: onWifiEntriesChanged: reason=1` + **`No entries!`**
+    → 虚拟机里看不到 Wi-Fi 连接，与 Android 10 的表现不同。
+  已修的两层（已进 APK）：
+    a) A15 没有 `WifiSsid.createFromByteArray`，改多策略 `fromBytes/fromString/fromUtf8Text`；
+    b) A15 的 `IWifiManager.getScanResults(String,String)` 与
+       `getConfiguredNetworks(String,String,boolean)` 返回 **jarjar**
+       `com.android.wifi.x.com.android.modules.utils.ParceledListSlice`，relay 原来返回裸
+       `List`；已改 `parceled()`。
+  仍空的两条候选（未取证，下一轮只验一条）：
+    c) A15 的 `ScanResult` 以 `WifiSsid` 字段序列化，relay 只写兼容字段 `SSID`；
+    d) `WifiConfiguration` 在 A15 需要 `setSecurityParams()`，relay 只写 `allowedKeyManagement`。
+  判据：同一次开机 `WifiPickerTracker: No entries!` 变 0，列表出现宿主 SSID。
+
+━━ 2. WebView（未验证）━━
+  代码路径已在：`A15AppLaunch` 的 `--start-child-zygote` → `A15GuestChildZygote`
+  （绑 abstract socket + `DesktopProcesses` 逐包起 renderer）。
+  真机只走到（12:34 打开 WebView）：
+    `a15_application_launch=…:org.chromium.webview_shell uid=10046`
+    `WebViewFactory: Loading com.android.webview version 128.0.6613.88`
+    `GraphicsEnv: Failed to get gpu service`
+    `nativeloader: Configuring product-clns-7 … webview.apk`
+  之后停止：`a15_child_zygote*` = 0 行、无 renderer、无 `a15_application_exit`。
+  下一轮判据：`a15_child_zygote_ready=` 出现，且 renderer 子进程被拉起。
+
+━━ 3. 应用导入（create/write 通，commit 失败）━━
+  机制：宿主把 APK 复制到 `<instance>/guest-imports/`，再用客人的
+  `PackageInstaller` 会话安装：`install-create → install-write → install-commit`
+  （每步一个独立客人进程，角色名 `install-*`；宿主等进程退出并检查
+  `guest_command_result=0`）。
+  第 91 轮已修：A15 上 `app_process64` 会在 `GetDefaultBootImageLocation` abort
+  （`No mainline framework library found`），改走 `dalvikvm64 + A15GuestApplication`。
+  第 92 轮已修：`GuestCommand` 内部 120 s→30 min；宿主 commit 不限时；超时不再
+  `install-abandon`；成功后去 `/data/app` 写位；成功后重启 home 让桌面重扫。
+  **仍未解决（第 93 轮取证）**：实例 1793435241273 / 16:28（via，2.6 MB）
+    `vm/framework-install-commit.log`：
+    `IPCThreadState: Driver returned error (-111 (Connection refused)) …`
+    `a10binder exchange failed code=630c errno=32`
+    `a10binder writeRead failed errno=111`
+    `bdev writeRead fd=4 ret=-1 errno=111`
+    `Caused by: android.os.RemoteException: Unknown binder error code. 0xffffff91`
+    同实例 `framework-broker.log` 里 `errno=111` = 0 行，broker 仍在服务其它进程
+    （`sender_pid=3697 …`）→ **不是 broker 崩溃，是这条客户端连接在长事务等待期间被关闭**。
+  下一轮唯一动作：在 `vendor/binder/native` 里查“客户端阻塞等回复时谁会关连接”
+  （reclaim / 线程存活检查 / readCapacity 超时），判据是同一条 `errno=111` 消失。
+
+━━ 4. 导入后 / 重启后应用闪退（已修到代码，未真机验证）━━
+  客人 dropbox 证据：`data_app_crash@1793434612075`（tv.danmaku.bili）、
+  `data_app_crash@1793434741463`（com.liuzh.deviceinfo）、
+  `data_app_crash@1793436231723`（mark.via，重启后）都是同一条：
+    `java.lang.SecurityException: Writable dex file
+       '/data/app/…/base.apk' is not allowed.`
+  原因：真机 `/data/app` 是 0644 root:root，应用不是属主；这里实例文件属于宿主 App uid，
+  客人进程也以该 uid 运行，所以“属主可写”就命中 A15 的拒绝。
+  已做：① `installApks()` 成功后 `makeDataApksReadOnly()`；
+  ② `setDisplayInteractive()`（每次显示/唤醒虚拟机）也调用一次，
+  覆盖“commit 未返回但 APK 已落盘”的情况；③ 现场已手工把已有包改成 `-r--r--r--`。
+  仍待验证：下一次导入后桌面上点开应用不再出现 `Writable dex file`。
+
+━━ 产物（当前装机）━━
+  APK 1,925,451,921 B / F7144711923A8ACB0565EFDE6DE8068B888E68069CCA587FFC3C29529203827A
+  （2026-10-31 16:47 构建并装机；含上面第 1–4 条的全部代码改动）
+  framework-check.dex 147,628 B（16:32 重建，含 GuestCommand 30 min 等待）
+
+━━ 下一步唯一动作 ━━
+  修 binder 桥：定位 commit 长事务里客户端连接被关闭的代码路径（判据 `errno=111` 消失），
+  然后依次验证 Wi-Fi 列表（候选 c/d 二选一）与 WebView child zygote。
+
+
+## 换会话交接（2026-10-31 第 91 轮 · APK 导入/安装）
+
+━━ 一句话 ━━
+  A15 导入失败的**第一层**根因是宿主用 `app_process64` 跑安装命令（A15 上它
+  `Check failed: !location.empty() No mainline framework library found` 直接 abort），
+  已按 `frameworkSdk>=35` 分流到 `dalvikvm64 + A15GuestApplication`。
+  分流后 create ✅、write ✅（`Success: streamed 226,519,153 bytes`）、
+  **commit 未在宿主的 150 s 限时内返回**（客人 `/data/app` 里留下
+  `vmdl1515406531.tmp` = 安装仍在落盘），宿主把它当"应用安装超时"、随后 abandon。
+  超时已放宽（commit 900 s / write 600 s），**但还没有一次成功验证**。
+
+━━ 只读取证（实例 1793434047234，2026-10-31 16:08-16:11）━━
+  1) `vm/framework-install-create.log`：
+     `Success: created install session [627938164]` + `guest_command_result=0` +
+     `System.exit called, status: 0`
+  2) `vm/framework-install-write.log`：
+     `Success: streamed 226519153 bytes` + `guest_command_result=0` +
+     `System.exit called, status: 0`
+  3) `vm/framework-install-commit.log`：**没有** `Calling main entry`、**没有**
+     `guest_command_result`、也**没有 abort 文本**；结尾是正常 binder 流量。
+  4) 客人 `/data/app` 里是 `vmdl1515406531.tmp` + `~~1BwGoS-…`：PackageManager
+     的安装暂存目录，说明 commit 正在复制 216 MB 的 APK，不是崩溃。
+  5) 同一时间 logcat 里那条 `A9VM bdev crash sig=6` / `liba15vm-app_process64.so (main+1200)`
+     / `art::GetDefaultBootImageLocation` 的 SIGABRT，属于
+     **`Display power: Guest display power failed`**（`GuestDisplayPower` 仍用
+     app_process64），与安装无关——这两件事此前被混为一谈。
+  6) `prepared/assets/guest-runtime-a15-inputs.json`：`guestSdk=35`、
+     `frameworkSdk=35`、`appClass=io.a10vm.guest.A15GuestApplication`，
+     所以三步走的是同一条 dalvikvm 分支，不存在"commit 漏了分流"。
+
+━━ 本轮改动（代码）━━
+  1) `FrameworkSession.packageArguments()`：frameworkSdk>=35 时用
+     `dalvikvm64 -Ximage -Xgc:CMC -Xbootclasspath -cp framework-check.dex
+     A15GuestApplication 35 GuestCommand …`；A9/A10 保持原 argv。
+  2) `guest-runtime-a15/…/GuestCommand.java`：命令完成后 `System.exit`，
+     因为 A15 的 binder 线程池不是 daemon，主线程返回后进程不退出
+     （否则宿主只能等超时）。
+  3) `installApks()`：commit 900 s / write 600 s（A15），超时异常里带客体日志尾部。
+
+━━ 未验证 ━━
+  - commit 在 900 s 内能否真正完成：**没有一次真机成功记录**，不能写"已修复"。
+  - `DisplayPower`（以及同类的 `scanMedia`）在 A15 仍用 app_process64 → 会
+    SIGABRT，属于另一条轨（`GuestDisplayPower` 需要同样的 dalvikvm 分流）。
+
+━━ 导入后的闪退（本轮真正关掉的）━━
+  客人 dropbox `data_app_crash@1793434612075.txt`（tv.danmaku.bili，16:16）与
+  `data_app_crash@1793434741463.txt`（com.liuzh.deviceinfo，16:19）都是同一条：
+  ```text
+  java.lang.SecurityException: Writable dex file
+    '/data/app/~~1BwGoS-…/tv.danmaku.bili-…/base.apk' is not allowed.
+    at dalvik.system.DexFile.openDexFileNative
+    … at android.app.ActivityThread.handleBindApplication
+    … at io.a10vm.guest.A15GuestApplication.main
+  ```
+  原因：真机 /data/app 是 0644 root:root，应用不是属主；这里实例文件属于宿主 App 的 uid，
+  客人进程又以该 uid 运行，所以"属主可写"就触发 A15 的拒绝。镜像 APK 在 prepare 里
+  已经做过 `mode &= ~0o222`，新装进 /data/app 的 APK 之前没人做。
+  修法：① 现场把三个已装包的写位去掉（`-r--r--r--`，已生效：哔哩哔哩能过启动进入协议页）；
+  ② `FrameworkSession.installApks()` 在 commit 成功后调用 `makeDataApksReadOnly()`
+  递归清 `/data/app` 的写位（下次导入自动生效）。
+
+━━ 仍未验证 / 新发现 ━━
+  1) 哔哩哔哩**停在协议页**：不再是 dex 崩溃，但还没进入主界面，未取证（可能是 WebView 或
+     首屏网络/渲染），需要单独一轮读它的进程日志与 dropbox。
+  2) "导入报超时 + 桌面上没图标，要重启虚拟机才出现"：本轮 server log 里
+     `PACKAGE_ADDED` = **0 行**，说明 Launcher3 没收到安装广播；超时是从 commit 150 s
+     来的（已放宽到 900 s，未验证），图标刷新机制仍未解决。
+  3) 导入完成后的媒体扫描 `scanMedia` 与 `DisplayPower` 仍是 app_process64 →
+     A15 上 SIGABRT（与安装无关）。
+
+━━ 第 92 轮：把"导入到可用"这条链的五段一起修了（APK 160F4193…）━━
+  1) 客体 `GuestCommand` 内部等待 120 s → **30 min**：原来客体自己先把 216 MB 的
+     commit 判死，宿主放宽到 900 s 也没用；
+  2) 宿主 A15 的 commit **不再限时**（`waitForever`，等进程退出）；
+  3) 超时后**不再 `install-abandon`** 一个正在落盘的合法会话（这是"装完没图标、
+     要重启虚拟机"的来源之一）；
+  4) 成功后 `makeDataApksReadOnly()`：每个新装 APK 自动去掉写位（`Writable dex file`
+     不再出现），与 prepare 对镜像 APK 的处理一致；
+  5) 成功后 `refreshLauncher()`：用 system uid 通过 activity 服务重启 home，
+     装完即刻重扫桌面，不再需要重启虚拟机。
+  **仍然未真机验证**：需要一次新的导入（见下）。
+
+━━ 第 93 轮：via 导入失败的**新**根因（binder 桥），与超时/权限都不同 ━━
+  实例 1793435241273（16:28）`framework-install-commit.log`：
+  ```text
+  IPCThreadState: Driver returned error (-111 (Connection refused)).
+    This thread's connection to /dev/binder will no longer work.
+  a10binder exchange failed code=630c errno=32
+  a10binder writeRead failed errno=111 write=8 read=0
+  bdev writeRead fd=4 ret=-1 errno=111
+  … GuestCommand.command(:68) → BinderProxy.shellCommand
+  Caused by: android.os.RemoteException: Unknown binder error code. 0xffffff91
+  ```
+  create/write 都成功（`Success: created install session`、`streamed 2628334 bytes`），
+  只有 **commit 这条长事务** 在等回复时，客户端的 bdev 连接被断开（EPIPE → ECONNREFUSED），
+  于是 commit 客户端自己异常退出，宿主侧看到"失败"。
+  同一实例的 `framework-broker.log` 里 **errno=111 = 0 行**，broker 仍在正常服务
+  其它进程（sender_pid=3697 …），所以不是 broker 崩溃，而是**这条连接被单方面关闭**。
+  下一步（单一动作）：在 `vendor/binder/native` 里查"客户端线程长时间阻塞在等回复时
+  谁会关连接"（reclaim / 线程存活检查 / readCapacity 超时），用同一条 errno=111 做判据。
+
+━━ 下一步唯一动作 ━━
+  再导入一次哔哩哔哩（216 MB），在导入完成后读
+  `framework-install-commit.log` 是否有 `Success` + `guest_command_result=0`，
+  以及客人 `/data/app` 里是否出现真实的 `tv.danmaku.bili-*` 目录。
+  在拿到这两条之前不写"导入已修复"。
+
 
 ## 换会话交接（2026-10-31 第 90 轮，最新）
 

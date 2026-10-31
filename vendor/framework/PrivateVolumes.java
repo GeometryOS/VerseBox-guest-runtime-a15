@@ -15,6 +15,8 @@ final class PrivateVolumes implements InvocationHandler {
     private final Set<Integer> unlocked = new HashSet<>();
     private final Set<String> unhandled = new HashSet<>();
     private boolean storageSizeReported;
+    /** One line per candidate path, so the log names which filesystem answered. */
+    private static final java.util.Set<String> candidateReported = new java.util.HashSet<>();
 
     static void register() throws Exception {
         PrivateVolumes volumes = new PrivateVolumes();
@@ -225,14 +227,55 @@ final class PrivateVolumes implements InvocationHandler {
      * the instance, so statvfs is the honest answer for "how big is this device".
      * Tried in order and never throws: a 0 return keeps the old behaviour.
      */
-    private static long totalBytes() {
-        for (String path : new String[] {"/storage/emulated/0", "/data", "/"}) {
-            try {
-                long bytes = new java.io.File(path).getTotalSpace();
-                if (bytes > 0) return bytes;
-            } catch (Throwable ignored) { }
+    /** Reads the host's own total bytes from the shared network snapshot. */
+    private static long hostTotalBytes() {
+        String root = System.getenv("A10VM_STATE_ROOT");
+        if (root == null || root.isEmpty()) return 0;
+        try {
+            Path path = Paths.get(root, "host-network.json");
+            if (!Files.isRegularFile(path)) return 0;
+            org.json.JSONObject snapshot = new org.json.JSONObject(
+                    new String(Files.readAllBytes(path), java.nio.charset.StandardCharsets.UTF_8));
+            org.json.JSONObject storage = snapshot.optJSONObject("storage");
+            return storage == null ? 0 : storage.optLong("totalBytes");
+        } catch (Throwable ignored) {
+            return 0;
         }
-        return 0;
+    }
+
+    private static long totalBytes() {
+        // The device's own /data filesystem is the honest answer, and the instance
+        // state root is guaranteed to live on it: the guest paths below resolve
+        // through the path bridge, so a missing emulated-volume mapping silently
+        // answers for whatever filesystem "/" happens to be. A 256 GB phone reported
+        // 492,196,392,960 B (rounded up by FileUtils to "512 GB") from the previous
+        // measurement, so every candidate is named once in the log and the state
+        // root is tried first.
+        // 1) 宿主写在 host-network.json 里的真实值（唯一不会猜错的来源）。
+        long host = hostTotalBytes();
+        if (host > 0) {
+            if (candidateReported.add("host")) System.out.println("a15_vold_storage_candidate=host:" + host);
+            return host;
+        }
+        // 2) 兜底：客体路径。/data 与 /storage/emulated/0 都落在宿主同一个 data 分区上，
+        //    所以它们比 A10VM_STATE_ROOT（宿主绝对路径，客体里未必解析得到）更可靠。
+        java.util.List<String> paths = new java.util.ArrayList<>();
+        paths.add("/data");
+        paths.add("/storage/emulated/0");
+        String root = System.getenv("A10VM_STATE_ROOT");
+        if (root != null && !root.isEmpty()) paths.add(root);
+        paths.add("/");
+        long answer = 0;
+        for (String path : paths) {
+            long bytes = 0;
+            try {
+                bytes = new java.io.File(path).getTotalSpace();
+            } catch (Throwable ignored) { }
+            if (candidateReported.add(path))
+                System.out.println("a15_vold_storage_candidate=" + path + ":" + bytes);
+            if (answer == 0 && bytes > 0) answer = bytes;
+        }
+        return answer;
     }
 
     /** Android 9 exposes vold operations that Android 10 removed; no-op them without a service. */

@@ -21,7 +21,19 @@ public final class GuestCommand {
     static void run(String[] args, String input) throws Exception {
         int result = command(args, input, FileDescriptor.out, FileDescriptor.err);
         System.out.println("guest_command_result=" + result);
-        if (result != 0) throw new IllegalStateException("Guest command failed: " + result);
+        System.out.flush();
+        // The host waits for this process to exit (FrameworkSession.runPackageCommand
+        // -> Process.waitFor). app_process (A9/A10) exits on its own after main, but
+        // Android 15 runs this class through dalvikvm64 + A15GuestApplication, which
+        // starts a binder thread pool (a15StartBinderThreadPool). Those threads are
+        // not daemons, so the JVM stayed alive after main returned and the host saw
+        // 90 s of silence and reported "应用安装超时" even though the command itself
+        // had already succeeded:
+        //   Success: created install session [1603186381]
+        //   guest_command_result=0
+        // (real device 2026-10-31 15:59-16:01, instance 1793432154923,
+        //  vm/framework-install-create.log, importing 哔哩哔哩 into Android 15).
+        System.exit(result == 0 ? 0 : 1);
     }
 
     static String capture(String[] args, String input) throws Exception {
@@ -55,7 +67,10 @@ public final class GuestCommand {
                     FileDescriptor.class, String[].class, Class.forName("android.os.ShellCallback"),
                     ResultReceiver.class).invoke(service, stream.getFD(), out,
                     err, Arrays.copyOfRange(args, 1, args.length), null, receiver);
-            if (!finished.await(120, TimeUnit.SECONDS)) throw new IllegalStateException("Guest command timed out");
+            // 30 分钟，而不是 120 秒：install-commit 要把整个 APK 落盘并做 verify dexopt，
+            // 哔哩哔哩 226,519,153 B 在这个容器里远不止 120 s。原来的 120 s 让客体自己先把
+            // 命令判死，宿主把超时放宽到 900 s 也没用（实例 1793434047234，16:08-16:11）。
+            if (!finished.await(30, TimeUnit.MINUTES)) throw new IllegalStateException("Guest command timed out");
         }
         return result[0];
     }

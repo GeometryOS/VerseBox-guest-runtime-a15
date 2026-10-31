@@ -1,5 +1,6 @@
 #include "Broker.h"
 #include <algorithm>
+#include <stdio.h>
 #include <unistd.h>
 
 namespace a10binder {
@@ -21,10 +22,21 @@ void Broker::finishCall(uint64_t id) {
     calls.erase(call);
 }
 
-void Broker::closeConnection(uint64_t id) {
+void Broker::closeConnection(uint64_t id, const char* reason) {
     auto it = connections.find(id);
     if (it == connections.end()) return;
     uint64_t process = it->second.process;
+    // The only open question when a guest dies with errno=111 (ECONNREFUSED, see
+    // Driver.cpp driverResult()) is *which* side closed the socket and through
+    // which branch. Naming the branch in the broker log is the difference between
+    // a guess and a cause; the guest side cannot observe it.
+    {
+        auto owner = processes.find(process);
+        fprintf(stderr, "a10binder close connection pid=%d tid=%llu control=%d reason=%s process=%s pending_calls=%zu\n",
+                it->second.peer.pid, static_cast<unsigned long long>(it->second.tid),
+                it->second.control ? 1 : 0, reason,
+                owner == processes.end() ? "none" : "live", calls.size());
+    }
     if (it->second.control) { closeProcess(process); return; }
     if (it->second.registered && processes.find(process) != processes.end())
         --processes.at(process).registeredThreads;
