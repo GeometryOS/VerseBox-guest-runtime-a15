@@ -14,6 +14,7 @@ final class PrivateVolumes implements InvocationHandler {
     private Object listener;
     private final Set<Integer> unlocked = new HashSet<>();
     private final Set<String> unhandled = new HashSet<>();
+    private boolean storageSizeReported;
 
     static void register() throws Exception {
         PrivateVolumes volumes = new PrivateVolumes();
@@ -179,6 +180,22 @@ final class PrivateVolumes implements InvocationHandler {
                 return users;
             }
             case "lockUserKey": unlocked.remove((Integer) args[0]); return null;
+            // S-track (round 90): StorageManagerService.getInternalStorageBlockDeviceSize()
+            // caches mVold.getStorageSize() once (image services.dex, StorageManagerService
+            // .getInternalStorageBlockDeviceSize @0x225da0-0x225dd4), and that cached value is
+            // the total capacity Settings shows. The generic branch below answered 0 and
+            // logged "a15_vold_unhandled=getStorageSize", so Settings displayed 0 B total and
+            // then computed a *negative* "system" usage. Real vold reports the size of the
+            // block device that backs /data; here the equivalent object is the guest's
+            // emulated volume, so ask the guest filesystem itself.
+            case "getStorageSize": {
+                long bytes = totalBytes();
+                if (!storageSizeReported) {
+                    storageSizeReported = true;
+                    System.out.println("a15_vold_storage_size=" + bytes);
+                }
+                return bytes;
+            }
             case "onUserStopped": case "onSecureKeyguardStateChanged": case "shutdown": return null;
             case "fstrim": case "runIdleMaint": case "abortIdleMaint":
                 Object task = args[args.length - 1];
@@ -199,6 +216,23 @@ final class PrivateVolumes implements InvocationHandler {
                     System.out.println("a15_vold_unhandled=" + name);
                 return defaultValue(method.getReturnType());
         }
+    }
+
+    /**
+     * Total bytes of the guest's emulated volume filesystem, i.e. what vold's
+     * getStorageSize() reports for the block device behind /data. The guest paths
+     * resolve through the runtime's path bridge onto the host filesystem that holds
+     * the instance, so statvfs is the honest answer for "how big is this device".
+     * Tried in order and never throws: a 0 return keeps the old behaviour.
+     */
+    private static long totalBytes() {
+        for (String path : new String[] {"/storage/emulated/0", "/data", "/"}) {
+            try {
+                long bytes = new java.io.File(path).getTotalSpace();
+                if (bytes > 0) return bytes;
+            } catch (Throwable ignored) { }
+        }
+        return 0;
     }
 
     /** Android 9 exposes vold operations that Android 10 removed; no-op them without a service. */

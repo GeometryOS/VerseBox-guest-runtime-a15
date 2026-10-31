@@ -1587,6 +1587,11 @@ def build_dex():
         A15 / "bootstrap" / "io" / "a10vm" / "guest" / "A15ApexService.java",
         A15 / "bootstrap" / "io" / "a10vm" / "guest" / "A15GateKeeper.java",
         A15 / "bootstrap" / "io" / "a10vm" / "guest" / "A15GuestApplication.java",
+        # W-track (round 90): the child-zygote endpoint A15AppLaunch starts for a
+        # webview_zygote/app_zygote request. Without an entry here javac fails with
+        # "cannot find symbol: A15GuestChildZygote" -- the same class of mistake the
+        # restored script made with A15Zygote/A15AppLaunch in round 89.
+        A15 / "bootstrap" / "io" / "a10vm" / "guest" / "A15GuestChildZygote.java",
         # Round 79/84: the guest app-process tree. Both were added after the file
         # list was written and the list was never extended, which is why the
         # restored script failed javac with "cannot find symbol: A15Zygote"

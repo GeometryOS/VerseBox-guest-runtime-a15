@@ -41,6 +41,30 @@ final class LocalGuestService {
         return endpoint(Class.forName(descriptor), descriptor, handler);
     }
 
+    /**
+     * The AIDL *object* for an endpoint this process provides, for calls that take
+     * an interface argument (for example
+     * {@code IConnectivityManager.registerNetworkAgent(INetworkAgent, ...)}).
+     *
+     * <p>{@link #endpoint} returns the {@link Binder} transport; passing that Binder
+     * where an {@code INetworkAgent} is expected fails at the call site with
+     * "argument 1 has type android.net.INetworkAgent, got
+     * io.a10vm.guest.LocalGuestService$1" (instance 1793420681206, 2026-10-31).
+     * Binder.queryLocalInterface returns the IInterface that attachInterface()
+     * registered, which is exactly the proxy implementing the AIDL interface.
+     */
+    static Object localEndpoint(String descriptor, InvocationHandler handler) throws Exception {
+        Binder binder = endpoint(descriptor, handler);
+        Object token = descriptor;
+        try {
+            java.lang.reflect.Field field = Class.forName(descriptor + "$Stub").getField("DESCRIPTOR");
+            token = field.get(null);
+        } catch (Throwable ignored) { }
+        Object local = binder.queryLocalInterface((String) token);
+        if (local == null) throw new IllegalStateException("Guest endpoint is not an IInterface: " + descriptor);
+        return local;
+    }
+
     static Binder endpoint(Class<?> api, String descriptor, InvocationHandler handler)
             throws Exception {
         final String token = interfaceToken(api, descriptor);

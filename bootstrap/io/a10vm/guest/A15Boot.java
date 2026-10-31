@@ -319,6 +319,40 @@ public final class A15Boot {
             System.out.println("a15_dnsresolver_binder=unavailable:" + failure);
         }
         System.out.flush();
+        // --- N-track: the two calls DesktopBoot makes and A15Boot never did ------
+        // Android 9/10 register the network relays in DesktopBoot, in this order,
+        // before SystemServer.main():
+        //     GuestNetworks.register();   -> netd + dnsresolver + wifi + discovery
+        //     GuestConnectivity.start();  -> NetworkAgent for the host's network
+        // A15Boot rebuilt the netd and dnsresolver halves and stopped there, so this
+        // runtime never published "wifi" and never registered a NetworkAgent:
+        // framework-server.log has no "guest_host_network_registered=" line, and the
+        // image's own WifiService (no wificond, no vendor HAL, no supplicant) ends in
+        // "WifiController: STA disabled, return to DisabledState" while owning the
+        // name. Same hole class as the zygote endpoint in round 79: the A15 entry
+        // point replaced DesktopBoot and silently dropped what it used to call.
+        //
+        // The fix is to call the same two helpers, in the same order, before
+        // SystemServer.main(): GuestWifi serves android.net.wifi.IWifiManager from
+        // <stateRoot>/host-network.json (written by the host's HostNetworkBridge), and
+        // GuestConnectivity registers that snapshot as a NetworkAgent so
+        // ConnectivityService, apps and the status bar see the host's real network.
+        try {
+            GuestWifi.register();
+            System.out.println("a15_wifi_endpoint=registered");
+        } catch (Throwable failure) {
+            // A duplicate name would mean the image's WifiService registered first.
+            // Keep booting and name the loser; the next log line says who owns it.
+            System.out.println("a15_wifi_endpoint=unavailable:" + failure);
+        }
+        System.out.flush();
+        try {
+            GuestConnectivity.start();
+            System.out.println("a15_host_network=started");
+        } catch (Throwable failure) {
+            System.out.println("a15_host_network=unavailable:" + failure);
+        }
+        System.out.flush();
         // --- B-track: the gatekeeper endpoint ------------------------------------
         // StartBiometricService (SystemServer.java:2680) constructs BiometricService,
         // whose Injector.getGateKeeperService() is GateKeeper.getService():

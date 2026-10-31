@@ -52,18 +52,64 @@ final class GuestWifi implements InvocationHandler {
         WifiInfo info = WifiInfo.class.getConstructor().newInstance();
         String ssid = wifi == null ? WifiManager.UNKNOWN_SSID : wifi.optString("ssid", WifiManager.UNKNOWN_SSID);
         Class<?> type = Class.forName("android.net.wifi.WifiSsid");
-        Object value = null;
-        if (!WifiManager.UNKNOWN_SSID.equals(ssid)) {
-            if (ssid.startsWith("0x")) value = type.getMethod("createFromHex", String.class).invoke(null, ssid);
-            else {
-                if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\""))
-                    ssid = ssid.substring(1, ssid.length() - 1);
-                value = type.getMethod("createFromByteArray", byte[].class).invoke(null,
-                        (Object) ssid.getBytes(StandardCharsets.UTF_8));
-            }
-        }
+        Object value = WifiManager.UNKNOWN_SSID.equals(ssid) ? null : wifiSsid(ssid);
         WifiInfo.class.getMethod("setSSID", type).invoke(info, value);
         return info;
+    }
+
+    /**
+     * Builds the image's own WifiSsid from the host's SSID text.
+     *
+     * <p>The factory the A9/A10 relay used, {@code createFromByteArray(byte[])}, does
+     * not exist on Android 15: the image's WifiSsid (framework-wifi.jar classes.dex)
+     * exposes {@code fromBytes(byte[])}, {@code fromString(String)},
+     * {@code fromUtf8Text(CharSequence)} and {@code createFromAsciiEncoded(String)}.
+     * The missing method was not cosmetic: it was thrown inside
+     * {@code GuestConnectivity.refresh()} *before* {@code registerNetworkAgent}, so
+     * the relay retried once a second and no NetworkAgent ever existed --
+     * 79 x "Guest host network: java.lang.NoSuchMethodException:
+     * android.net.wifi.WifiSsid.createFromByteArray"
+     * (instance 1793419587061, 2026-10-31 12:06).
+     *
+     * <p>Every strategy is tried by name and the one that answered is printed once,
+     * so the next log says which image answered instead of leaving it to memory.
+     */
+    private static Object wifiSsid(String ssid) throws Exception {
+        Class<?> type = Class.forName("android.net.wifi.WifiSsid");
+        Object value = null;
+        if (ssid.startsWith("0x")) {
+            value = factory(type, "createFromHex", String.class, ssid, "createFromHex");
+            if (value == null) value = factory(type, "createFromAsciiEncoded", String.class, ssid, "createFromAsciiEncoded");
+            if (value == null) value = factory(type, "fromString", String.class, ssid, "fromString");
+        } else {
+            String text = ssid;
+            if (text.length() >= 2 && text.startsWith("\"") && text.endsWith("\""))
+                text = text.substring(1, text.length() - 1);
+            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+            value = factory(type, "fromBytes", byte[].class, bytes, "fromBytes");
+            if (value == null) value = factory(type, "createFromByteArray", byte[].class, bytes, "createFromByteArray");
+            if (value == null) value = factory(type, "fromString", String.class, text, "fromString");
+            if (value == null) value = factory(type, "fromUtf8Text", CharSequence.class, text, "fromUtf8Text");
+        }
+        if (value == null)
+            throw new NoSuchMethodException("android.net.wifi.WifiSsid factory for " + ssid);
+        return value;
+    }
+
+    private static final java.util.Set<String> reported = new java.util.HashSet<>();
+
+    private static Object factory(Class<?> type, String method, Class<?> parameter, Object value, String label) {
+        try {
+            Object built = type.getMethod(method, parameter).invoke(null, value);
+            if (reported.add(label)) System.out.println("a15_wifi_ssid=" + label);
+            return built;
+        } catch (NoSuchMethodException absent) {
+            return null;
+        } catch (Throwable failed) {
+            if (reported.add("!" + label))
+                System.out.println("a15_wifi_ssid_failed=" + label + ":" + failed);
+            return null;
+        }
     }
 
     static String ssid(JSONObject wifi) throws Exception {
@@ -111,8 +157,27 @@ final class GuestWifi implements InvocationHandler {
             else if (security == 6) config.allowedKeyManagement.set(9); // OWE in Android 10.
             values.add(config);
         }
-        return Class.forName("android.content.pm.ParceledListSlice").getConstructor(java.util.List.class)
-                .newInstance(values);
+        return parceled(values);
+    }
+
+    /**
+     * Builds the ParceledListSlice the *wifi AIDL* declares.
+     *
+     * Android 15's wifi module is jarjar'd, so its AIDL returns
+     * {@code com.android.wifi.x.com.android.modules.utils.ParceledListSlice}
+     * (image framework-wifi.jar classes.dex, IWifiManager #65/#67/#68), not the
+     * platform {@code android.content.pm.ParceledListSlice}. Both are attempted so
+     * the same relay file still answers API 28/29.
+     */
+    private static Object parceled(List<?> values) throws Exception {
+        for (String type : new String[]{
+                "com.android.wifi.x.com.android.modules.utils.ParceledListSlice",
+                "android.content.pm.ParceledListSlice"}) {
+            try {
+                return Class.forName(type).getConstructor(List.class).newInstance(values);
+            } catch (ClassNotFoundException absent) { }
+        }
+        throw new ClassNotFoundException("ParceledListSlice");
     }
 
     private static boolean request(String action) throws Exception {
@@ -176,11 +241,17 @@ final class GuestWifi implements InvocationHandler {
             // MIUI's developer switch controls a physical radio extension absent from the relay.
             case "isWifiCoverageExtendFeatureEnabled": return false;
             case "enableWifiCoverageExtendFeature": return null;
-            case "getScanResults": return scans(wifi);
+            // A15: IWifiManager.getScanResults(String,String) returns the *jarjar'd*
+            // ParceledListSlice (com.android.wifi.x.com.android.modules.utils),
+            // not a bare List. Returning List made the framework fail to unmarshal the
+            // reply, which is what Settings reports as
+            //   WifiPickerTracker: onWifiEntriesChanged: reason=0 / No entries!
+            // (instance 1793421081689, 2026-10-31 12:34).
+            case "getScanResults": return parceled(scans(wifi));
             case "getFactoryMacAddresses": return new String[0];
             case "getAllMatchingFqdnsForScanResults": case "getMatchingOsuProviders":
             case "getMatchingPasspointConfigsForOsuProviders": return Collections.emptyMap();
-            case "getWifiConfigsForPasspointProfiles": return Collections.emptyList();
+            case "getWifiConfigsForPasspointProfiles": return parceled(Collections.emptyList());
             case "getConfiguredNetworks": case "getPrivilegedConfiguredNetworks":
                 return configurations(wifi);
             case "startScan": return request("scan");

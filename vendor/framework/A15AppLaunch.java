@@ -40,10 +40,22 @@ final class A15AppLaunch {
             else if (argument.equals("--")) { }               // argv separator
             else if (!argument.startsWith("--")) { entry = i; break; }
         }
-        if (childZygote)
-            throw new UnsupportedOperationException("a15_child_zygote=" + name);
-        if (entry < 0 || uid == null || gid == null
-                || Integer.parseInt(uid) < 0 || Integer.parseInt(gid) < 0)
+        // W-track (round 90): a child-zygote request is a *process*, not a fork.
+        // ZygoteProcess.startChildZygote (image framework classes3.dex
+        // 0x2ade1c-0x2adf2c) builds
+        //   --zygote-socket=<prefix>/<uuid>  --abi-list=<abi>
+        //   --uid-range-start=<first>        --uid-range-end=<last>
+        // plus --start-child-zygote and the process class, and expects that process
+        // to answer the ordinary zygote wire protocol on that ABSTRACT socket so it
+        // can fork isolated renderers. This runtime has no fork, so the request is
+        // served by A15GuestChildZygote: it binds the socket and launches each
+        // renderer as a fresh dalvikvm64 process, which is the A9/A10 shape
+        // (GuestChildZygote). Previously this branch threw
+        // "a15_child_zygote=webview_zygote", i.e. WebView never had a renderer.
+        if (entry < 0)
+            throw new IllegalArgumentException("invalid a15 application launch name=" + name);
+        if (!childZygote && (uid == null || gid == null
+                || Integer.parseInt(uid) < 0 || Integer.parseInt(gid) < 0))
             throw new IllegalArgumentException("invalid a15 application launch name=" + name);
 
         String linker = System.getenv("A10VM_EXEC_LINKER");
@@ -73,8 +85,17 @@ final class A15AppLaunch {
         command.add(classPath);
         command.add(wrapper);
         command.add(sdk);
-        command.add(arguments.get(entry));
-        command.addAll(arguments.subList(entry + 1, arguments.size()));
+        if (childZygote) {
+            // Pass the original argv through: the endpoint reads the socket name, the
+            // abi list and the uid range from it, and logs them once, so the next
+            // round can verify the shape from the device log instead of the bytecode.
+            command.add("io.a10vm.guest.A15GuestChildZygote");
+            command.addAll(arguments);
+            System.out.println("a15_child_zygote_launch=" + name + " args=" + arguments.size());
+        } else {
+            command.add(arguments.get(entry));
+            command.addAll(arguments.subList(entry + 1, arguments.size()));
+        }
 
         long started = SystemClock.elapsedRealtimeNanos();
         ProcessBuilder builder = new ProcessBuilder(command)
@@ -82,8 +103,8 @@ final class A15AppLaunch {
                 .redirectErrorStream(true)
                 .redirectOutput(logFile(state, sequence));
         Map<String, String> environment = builder.environment();
-        environment.put("A10VM_GUEST_UID", uid);
-        environment.put("A10VM_GUEST_GID", gid);
+        environment.put("A10VM_GUEST_UID", uid == null ? "0" : uid);
+        environment.put("A10VM_GUEST_GID", gid == null ? "0" : gid);
         environment.put("CLASSPATH", classPath);
         environment.put("A10VM_APPLICATION_PARENT_PID", Integer.toString(android.os.Process.myPid()));
         environment.put("A10VM_APPLICATION_START_NS", Long.toString(started));
@@ -99,7 +120,7 @@ final class A15AppLaunch {
         }
         Process child = builder.start();
         int pid = pid(child);
-        int guestUid = Integer.parseInt(uid);
+        int guestUid = uid == null ? 0 : Integer.parseInt(uid);
         // Publish the child's guest uid before any provider can be requested:
         // ContentProviderHelper.isProcessAliveLocked() compares it with
         // Process.getUidForPid(), which the readProcLines bridge answers from

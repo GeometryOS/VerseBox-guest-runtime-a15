@@ -17,7 +17,7 @@
 
 > **目前的状态：可以启动并操作。**
 > 触摸可用，开机动画由客体自己的 `bootanimation.zip` 绘制。
-> **内部存储空间爆炸，wifi，音频，相机，传感器爆炸，这些问题会在后续修复。**
+> **wifi，音频，相机，传感器爆炸（但wifi的宿主网络注入已修复）这些问题会在后续修复。**
 > overlay/idmap2d 与 networkstack 健康检查尚未处理，详见 [STATUS.md](STATUS.md)。
 
 ![Android 15 桌面与全部应用](assets/screenshot.jpg)

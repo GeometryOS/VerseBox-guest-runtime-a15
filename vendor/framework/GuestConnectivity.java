@@ -29,9 +29,16 @@ public final class GuestConnectivity {
     private static FileObserver observer;
     private static volatile GuestConnectivity active;
     private static String applied = "";
+    private static final java.util.Set<String> reported = new java.util.HashSet<>();
     private final Messenger endpoint;
     private final List<Message> pending = new ArrayList<>();
     private Messenger peer;
+    /** A15: the INetworkAgentRegistry the framework hands to the agent in onRegistered(). */
+    private Object registry;
+    /** A15: the Network object returned by registerNetworkAgent. */
+    private Object network;
+    /** The IConnectivityManager proxy, kept for reportNetworkConnectivity. */
+    private Object connectivity;
     private final int netId;
     private final long hostNetId;
     private final Handler validationHandler;
@@ -82,11 +89,7 @@ public final class GuestConnectivity {
                             (active.netId + "\n").getBytes(StandardCharsets.UTF_8));
                     System.out.println("guest_host_network_registered=" + active.netId);
                 } else {
-                    active.info = networkInfo(snapshot);
-                    active.send("EVENT_NETWORK_PROPERTIES_CHANGED", links(snapshot));
-                    active.send("EVENT_NETWORK_CAPABILITIES_CHANGED", capabilities(snapshot));
-                    active.send("EVENT_NETWORK_INFO_CHANGED", active.info);
-                    active.publishValidation();
+                    active.update(snapshot);
                 }
             }
             GuestWifi.publish(snapshot);
@@ -123,14 +126,168 @@ public final class GuestConnectivity {
                 } catch (Exception error) { System.err.println("Guest network channel: " + error); }
             }
         });
-        Class<?> misc = Class.forName("android.net.NetworkMisc");
-        Object service = Class.forName("android.net.IConnectivityManager$Stub")
+        connectivity = Class.forName("android.net.IConnectivityManager$Stub")
                 .getMethod("asInterface", IBinder.class).invoke(null, binder);
-        java.lang.reflect.Field tracker = service.getClass().getDeclaredField("mTrackerHandler");
+        java.lang.reflect.Field tracker = connectivity.getClass().getDeclaredField("mTrackerHandler");
         tracker.setAccessible(true);
-        validationHandler = (Handler) tracker.get(service);
-        netId = (Integer) LocalGuestService.call(service, "android.net.IConnectivityManager", "registerNetworkAgent",
-                endpoint, info, links(snapshot), capabilities(snapshot), 60, misc.getConstructor().newInstance(), -1);
+        validationHandler = (Handler) tracker.get(connectivity);
+        Object registered = registerAgent(connectivity, info, links(snapshot), capabilities(snapshot));
+        network = registered;
+        // registerNetworkAgent returns android.net.Network on API 35 and an int on
+        // API 28/29. Network's netId is @hide, so read the field reflectively.
+        netId = registered instanceof Integer ? (Integer) registered : netIdOf(registered);
+    }
+
+    /**
+     * registerNetworkAgent carries a different parameter list per API level.
+     *
+     * <p>The image's own AIDL declaration (framework-connectivity.jar classes.dex,
+     * {@code android.net.IConnectivityManager.registerNetworkAgent}) is
+     *
+     * <pre>
+     *   A15: (INetworkAgent, NetworkInfo, LinkProperties, NetworkCapabilities,
+     *         NetworkScore, LocalNetworkConfig, NetworkAgentConfig, int)
+     *   A9/A10: (INetworkAgent, NetworkInfo, LinkProperties, NetworkCapabilities,
+     *         int score, NetworkMisc misc, int providerId)
+     * </pre>
+     *
+     * <p>Passing the API 29 shape here made the relay fail with a reflection
+     * InvocationTargetException on every host-network refresh, so no NetworkAgent
+     * was ever registered. Both shapes are attempted, the A15 one first; the log
+     * line says which one answered.
+     */
+    private Object registerAgent(Object service, NetworkInfo info, LinkProperties links,
+            NetworkCapabilities caps) throws Exception {
+        // Android 15's agent is an AIDL object, not the API 28/29 Messenger:
+        //   IConnectivityManager.registerNetworkAgent(INetworkAgent, NetworkInfo,
+        //       LinkProperties, NetworkCapabilities, NetworkScore,
+        //       LocalNetworkConfig, NetworkAgentConfig, int)
+        // (image framework-connectivity.jar classes.dex, @0x... see the comment above).
+        // The framework answers by calling onRegistered(INetworkAgentRegistry); every
+        // later state update goes through that registry instead of AsyncChannel
+        // messages, which is why the old Messenger shape could never work here.
+        Object agent = LocalGuestService.localEndpoint("android.net.INetworkAgent",
+                (proxy, method, arguments) -> {
+                    String name = method.getName();
+                    if ("onRegistered".equals(name) && arguments.length == 1) {
+                        registry = arguments[0];
+                        System.out.println("a15_network_agent_registered=1");
+                        push(info, links, caps);
+                    } else if ("onNetworkCreated".equals(name)) {
+                        System.out.println("a15_network_agent_created=1");
+                    } else if ("onValidationStatusChanged".equals(name)) {
+                        System.out.println("a15_network_agent_validation=" + arguments[0]);
+                    }
+                    return null;
+                });
+        Object result = LocalGuestService.call(service, "android.net.IConnectivityManager",
+                "registerNetworkAgent", agent, info, links, caps, networkScore(60),
+                localNetworkConfig(), networkAgentConfig(), -1);
+        System.out.println("a15_network_agent_shape=api35");
+        return result;
+    }
+
+    /**
+     * Pushes the host snapshot to ConnectivityService. A15 takes it through the
+     * {@code INetworkAgentRegistry} handed to {@code onRegistered()}; the API 28/29
+     * path used AsyncChannel events on the Messenger, so both shapes are kept and
+     * the registry one wins when it exists.
+     */
+    private void push(NetworkInfo info, LinkProperties links, NetworkCapabilities caps) {
+        Object registry = this.registry;
+        if (registry == null) {
+            try {
+                send("EVENT_NETWORK_INFO_CHANGED", info);
+                send("EVENT_NETWORK_PROPERTIES_CHANGED", links);
+                send("EVENT_NETWORK_CAPABILITIES_CHANGED", caps);
+            } catch (Exception error) { System.err.println("Guest network publish: " + error); }
+            return;
+        }
+        try {
+            LocalGuestService.call(registry, "android.net.INetworkAgentRegistry", "sendNetworkInfo", info);
+            LocalGuestService.call(registry, "android.net.INetworkAgentRegistry", "sendLinkProperties", links);
+            LocalGuestService.call(registry, "android.net.INetworkAgentRegistry", "sendNetworkCapabilities", caps);
+            LocalGuestService.call(registry, "android.net.INetworkAgentRegistry", "sendScore", networkScore(60));
+        } catch (Exception error) {
+            System.err.println("Guest network registry: " + error);
+        }
+    }
+
+    private static int netIdOf(Object network) {
+        if (network == null) return -1;
+        try {
+            return network.getClass().getField("netId").getInt(network);
+        } catch (Throwable failed) {
+            System.out.println("a15_network_id=unavailable:" + failed);
+            return -1;
+        }
+    }
+
+    /** One host-snapshot update, from whichever side can deliver it. */
+    private void update(JSONObject snapshot) throws Exception {
+        info = networkInfo(snapshot);
+        push(info, links(snapshot), capabilities(snapshot));
+        report();
+    }
+
+    /**
+     * A15 replaced the A10 trick "post EVENT_NETWORK_TESTED on ConnectivityService's
+     * private tracker handler" with the public
+     * {@code IConnectivityManager.reportNetworkConnectivity(Network, boolean)}
+     * (image framework-connectivity.jar, IConnectivityManager #58). The host
+     * snapshot already says whether the host itself is validated, so the relay
+     * reports exactly that instead of inventing a verdict.
+     */
+    private void report() throws Exception {
+        if (connectivity == null || network == null) { publishValidation(); return; }
+        LocalGuestService.call(connectivity, "android.net.IConnectivityManager",
+                "reportNetworkConnectivity", network, snapshot().optBoolean("validated"));
+    }
+
+    /** A15 carries a NetworkScore object; API 28/29 carry the raw int. */
+    private static Object networkScore(int value) {
+        try {
+            Class<?> builder = Class.forName("android.net.NetworkScore$Builder");
+            Object instance = builder.getConstructor().newInstance();
+            builder.getMethod("setLegacyInt", int.class).invoke(instance, value);
+            return builder.getMethod("build").invoke(instance);
+        } catch (Throwable absent) {
+            return value;
+        }
+    }
+
+    /**
+     * A15's third new argument. A container network has no local-only/multicast
+     * routing, which is exactly the empty configuration; null is the documented
+     * "not a local network" value and is what this runtime can honestly claim.
+     */
+    private static Object localNetworkConfig() {
+        try {
+            Class<?> type = Class.forName("android.net.connectivity.android.net.LocalNetworkConfig");
+            return type.getConstructor(Class.forName("android.net.NetworkRequest"),
+                    Class.forName("android.net.connectivity.android.net.MulticastRoutingConfig"),
+                    Class.forName("android.net.connectivity.android.net.MulticastRoutingConfig"))
+                    .newInstance(null, null, null);
+        } catch (Throwable failed) {
+            // The image's constructor is private (dexdump shows a direct method), so
+            // only reflection with setAccessible could build it; null is the
+            // documented "not a local network" value and is what this relay is.
+            if (reported.add("localNetworkConfig"))
+                System.out.println("a15_local_network_config=null");
+            return null;
+        }
+    }
+
+    /** A15's fourth new argument: per-agent configuration; the defaults are correct here. */
+    private static Object networkAgentConfig() {
+        try {
+            Class<?> builder = Class.forName("android.net.NetworkAgentConfig$Builder");
+            Object instance = builder.getConstructor().newInstance();
+            return builder.getMethod("build").invoke(instance);
+        } catch (Throwable failed) {
+            System.out.println("a15_network_agent_config=null:" + failed);
+            return null;
+        }
     }
 
     public static int validationResult(int proposed, int netId) {

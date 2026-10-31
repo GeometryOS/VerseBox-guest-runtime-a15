@@ -1,5 +1,93 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
+
+## 换会话交接（2026-10-31 第 90 轮，最新）
+
+━━ 一句话 ━━
+  网络/Wi-Fi 的根因和 zygote 那次是同一类洞：A9/A10 的 `DesktopBoot` 在
+  `SystemServer.main()` 之前调 `GuestNetworks.register()`（netd+dns+wifi）和
+  `GuestConnectivity.start()`，A15 换成 `A15Boot` 之后这两句从来没被调用过。
+  补上之后又暴露两层 API 35 结构差异（`WifiSsid` 工厂、`INetworkAgent` 契约），
+  按镜像 dex 取证逐个修掉。真机 1793421081689 上客人第一次出现
+  `guest_host_network_registered=100`：ConnectivityService 里是一个 WIFI/VALIDATED
+  的网络，SSID 就是宿主的 CMCC-FKAz-5G，带着宿主的 IP/DNS/路由。
+
+━━ 已验证（实例 1793421081689，2026-10-31 12:31，APK D82476A7…）━━
+  1) 宿主网络注入（N/W 轨核心）：
+     `guest_host_network_registered=100`
+     `a15_network_agent_shape=api35`
+     `ConnectivityService: registerNetworkAgent NetworkAgentInfo{network{100} ...
+       ni{WIFI CONNECTED extra: "CMCC-FKAz-5G"}
+       nc{Transports: WIFI ... INTERNET ... VALIDATED ... SSID: "CMCC-FKAz-5G"}
+       lp{{InterfaceName: wlan0 LinkAddresses: [192.168.1.213/24, ...]
+            DnsAddresses: [/192.168.1.1,/114.114.114.114]
+            Routes: [0.0.0.0/0 -> 192.168.1.1 wlan0, ...]}}}`
+     `ConnectivityService: Update score for net 100 : +IS_UNMETERED+IS_VALIDATED`
+  2) Wi-Fi 端点（**只是"注册成功"，不等于可用**）：
+     `a15_wifi_endpoint=registered`、`a15_wifi_ssid=fromBytes`（A9/A10 的
+     `WifiSsid.createFromByteArray` 在 API 35 已不存在，镜像里是
+     `fromBytes/fromString/fromUtf8Text/createFromAsciiEncoded`），
+     Settings 的 Wi-Fi 页也确实收到了我们发的状态广播（`WifiRepository: wifiStateFlow`、
+     `NetworkProviderSettings: onWifiStateChanged…`）。
+     **但 Wi-Fi 列表仍然是空的**：`WifiPickerTracker: onWifiEntriesChanged: reason=1` +
+     `WifiPickerTracker: No entries!`（实例 1793421860752，12:57；上一版是 reason=0）。
+     结论：**虚拟机的 Wi-Fi 目前不可用（列表没有宿主 SSID，也没有已连接项）**。
+     已排查并修掉的：A15 的 `IWifiManager.getScanResults(String,String)` 与
+     `getConfiguredNetworks(String,String,boolean)` 返回的是 jarjar 的
+     `com.android.wifi.x.com.android.modules.utils.ParceledListSlice`，relay 原来返回裸
+     `List`（已改为 `parceled()`）——改完仍是 `No entries!`，说明还有下一层，
+     候选（未取证，不要当结论）：
+       a) A15 的 `ScanResult` 以 `WifiSsid` 字段序列化（`SSID` 只是兼容字段），
+          relay 只写了 `SSID`，框架反序列化后条目被丢掉；
+       b) `WifiConfiguration` 在 A15 要求 `setSecurityParams()`，relay 只写
+          `allowedKeyManagement`，已保存网络被框架判为无效。
+     下一轮判据：在这两条里**只选一条**，用一次构建 + 一次 Wi-Fi 页面打开来区分。
+  3) 内部存储容量（S1）：`a15_vold_storage_size=492196392960`（≈492 GB，宿主文件系统
+     真实容量），同一次开机 `a15_vold_unhandled=getStorageSize` = 0 行（此前返回 0，
+     Settings 总容量 0、系统占用被算成负数）。
+  4) 桌面仍绿：`desktop_boot_completed=1`、`desktop_home_resolved=com.android.launcher3`、
+     `Displayed ...QuickstepLauncher`、Settings 多次 `Displayed ...SubSettings`。
+
+━━ 未验证 ━━
+  1) WebView：代码路径已在（`--start-child-zygote` → A15GuestChildZygote 绑 abstract
+     socket → DesktopProcesses 逐个起 renderer）。真机已经打开过 WebView（12:34，
+     `a15_application_launch=16153/16195/16236:org.chromium.webview_shell uid=10046`），
+     子进程日志走到
+     `WebViewFactory: Loading com.android.webview version 128.0.6613.88`、
+     `GraphicsEnv: Failed to get gpu service`、`Configuring product-clns-7 …webview.apk`
+     之后就停了：**没有 `a15_child_zygote*`、没有 renderer、也没有 `a15_application_exit` 行**。
+     下一轮判据：先拿到这三个 pid 的退出码/最后一行，再判定 renderer 是被拉起还是被 chromium 原生初始化挡死。
+  2) `Guest host network: java.lang.reflect.InvocationTargetException`（18 行/次开机）：
+     refresh 后半段（reportNetworkConnectivity / 旧 mTrackerHandler 路径）抛错，
+     不影响网络注册；下一轮打出 cause 并做容错。
+  3) 应用层真正上网：网络已 VALIDATED、带宿主 DNS/路由，但还没有一次 HTTP 验证。
+
+━━ 产物（已装机；实例 1793421081689 就是这一版）━━
+  APK 1,925,443,781 B / D82476A7E2A3C602C607E8540FB0A08298A3013E80C700087396AF7A1D586AD6
+  framework-check.dex 含 A15GuestChildZygote / GuestWifi 多策略 WifiSsid / GuestConnectivity INetworkAgent
+  prepared：nativeFiles 1134 / dataFiles 2437
+
+━━ 本轮改动（8 个文件）━━
+  1) bootstrap/io/a10vm/guest/A15Boot.java：补 DesktopBoot 漏掉的两个调用
+     （GuestWifi.register() + GuestConnectivity.start()，顺序与 A10 一致）；
+  2) vendor/framework/GuestWifi.java：WifiSsid 工厂多策略，命中打 `a15_wifi_ssid=`；
+  3) vendor/framework/GuestConnectivity.java：A15 的 INetworkAgent/INetworkAgentRegistry
+     契约（8 参 registerNetworkAgent、registry 推送、reportNetworkConnectivity）；
+  4) vendor/framework/LocalGuestService.java：新增 localEndpoint()，把 Binder 换回
+     IInterface 代理（否则 `argument 1 has type INetworkAgent, got LocalGuestService$1`）；
+  5) bootstrap/io/a10vm/guest/A15GuestChildZygote.java（新）：child zygote 端点；
+  6) vendor/framework/PrivateVolumes.java：IVold.getStorageSize；
+  7) vendor/framework/A15AppLaunch.java：`--start-child-zygote` 分支；
+  8) scripts/prepare-a15.py：把新类加入 javac 源表。
+
+━━ 检讨（本轮两篇，均已落盘）━━
+  _audit/coding-log/2026-10-31-CL-A15-第90轮-检讨-装机完不问就停.md
+  _audit/coding-log/2026-10-31-CL-A15-第90轮-检讨-瞎回滚与不反思真实需求.md
+
+━━ 下一步唯一动作 ━━
+  打开“设置 → 关于手机 → 法律信息 → 第三方许可”（WebView 页面），判据：
+  framework-server.log 出现 `a15_child_zygote_ready=`，且没有 `a15_child_zygote=` 报错。
+
 ## 换会话交接（2026-10-30 第 89 轮，最新）
 
 > 本文是唯一准绳。下面第 88 轮及更早的段落是历史，只用于查证据。
