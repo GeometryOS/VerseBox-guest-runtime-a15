@@ -1,5 +1,189 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
+## 第 114 轮（2026-11-01 14:05）· 第三方应用/WebView 闪退真因：apk 内 .so 未命中时 ALOGV 打死 linker
+
+> 状态：**已验证（实例 1793513201278，2026-11-01 14:08 启动）**。
+> 同一份日志的判据行：`A9VM bdev crash` **0 行**（修前每次必现）、`code=139` **0 行**、
+> `Zip: Unable to find entry` **0 行**；并且
+> `Displayed bin.mt.plus/.MainLightIcon for user 0: +2s26ms`、
+> `Displayed mark.via/.Shell for user 0: +1s702ms` —— **第三方应用第一次真正把界面画出来**。
+> 完整取证与推导见
+> `_audit/coding-log/2026-11-01-CL-A15-第三方应用闪退真因-libziparchive-ALOGV.md`。
+
+━━ 1. 真因（真机原文 + 符号还原，不是推演）━━
+
+实例 1793504908164（包名 me.kanadex.versebox）：
+
+```text
+vm/application-23534-65.log（LocalSend）
+27392 [ "…/base.apk!/lib/arm64-v8a/libflutter.so" find_loaded_library_by_soname failed … ]
+27396 Trying zip file open … base.apk!/lib/arm64-v8a/libflutter.so     ← 命中，加载成功
+27404 [ opening libEGL.so from namespace clns-4 ]
+27406 Trying zip file open … base.apk!/lib/arm64-v8a/libEGL.so         ← 这个 apk 里没有
+27408 A9VM bdev crash sig=11 code=1 pid=0 fault=0x0 … pc=liba15vm-guest-ld-android.so+0x7f490
+27410 A9VM bdev regs x0=0x0 x1=0x765f83d480 x2=0x20 …
+27411 A9VM bdev bt …+0x57c8c …+0x5874c …+0x58c50 …+0x5828c …+0x57bac …+0x55c88
+      …+0x2efdc …+0x3a2e4 …+0x38084 …+0x2f4c4 …+0x33218 …+0x2da28
+
+vm/application-8895-48.log（MT 管理器）
+27093 [ opening …/bin.mt.plus…/lib/arm64/libmtprotect.so from namespace clns-5 ]
+27103 Trying zip file open … bin.mt.plus…/base.apk!/lib/arm64-v8a/liblog.so
+（日志到此为止；server.log 随后 a15_application_exit=11320:bin.mt.plus code=139）
+```
+
+换算（打印的 +0x7f490 是文件偏移，LOAD#2 的 Offset 0x2d940/VirtAddr 0x2e940，vaddr=+0x1000）
+后的调用栈：`__strlen_aarch64+0x10`（x0=0）← `std::string::string(const char*)`
+← `GetDefaultTag()` ← `__android_log_level` ← `__android_log_is_loggable`
+← `__android_log_print` ← `CdEntryMapZip32::GetCdEntryOffset` ← `FindEntry`
+← `open_library_at_path` ← `open_library_on_paths` ← `load_library` ← `find_libraries` ← `dlopen`。
+
+三个条件同时成立：
+
+1. linker 构建**没有 `-DNDEBUG`**（AOSP release 有），`log/log.h` 于是
+   `LOG_NDEBUG=0`，`ALOGV` 是活的；
+2. `system/libziparchive/zip_cd_entry_map.cc` 没有定义 `LOG_TAG`，那个
+   `ALOGV("Zip: Unable to find entry …")` 的 tag 是 `NULL`；
+3. liblog 对 NULL tag 走 `GetDefaultTag()` = `new std::string(getprogname())`，
+   而 linker 的私有 `__progname`（local BSS）**永远不会被初始化**：
+   linker 只跑 `__libc_init_globals()/__libc_init_main_thread_*`，从不跑
+   `__libc_init_common()`，`setprogname()` 只在后者里。
+
+⇒ **任何一次 “apk 里没有这个 .so” 的查找都会 strlen(NULL) 崩掉进程**。
+MT（liblog.so）、LocalSend（libEGL.so）、WebView/browser（liblog.so）是同一个根因。
+
+━━ 2. 顺带纠错：第三方应用 `lib/arm64` 为空是 AOSP 正常行为 ━━
+
+- `localsend.apk` / `lawnchair.apk` 里 `lib/arm64-v8a/*.so` 是 stored，
+  应用目录 `lib/arm64` 为空 —— 因为 `extractNativeLibs=false`（AGP release 默认），
+  AOSP 有意不落盘，linker 直接从 APK mmap（与 A10 的观察一致）。
+- `bin.mt.plus` / `com.deepseek.chat` / `com.sukisu.ultra` 的 `lib/arm64`
+  **真有 .so**（真机 `ls -la` 逐个核过），仍然闪退 —— 因为崩在找不到**另一个**库。
+- 所以“把 lib 复制进应用目录”只能绕一半，根治点是 loader 的失败路径。
+
+━━ 3. 本轮改动（两处，均属同一条轨）━━
+
+1. `runtime/compile.sh`：linker 构建加 `-DNDEBUG`（恢复 AOSP release 日志语义，
+   `ALOGV` 编译掉，`ALOGW/ALOGE` 保留）。验证：新 `source-linker64` 里
+   `Zip: Unable to find entry` / `Zip: Could not find entry` 字符串 **0 次**，
+   `Zip: Found duplicate entry`（ALOGW）仍在。
+2. `runtime/patch-linker-a15.py`：`linker_main.cpp` 在
+   `__libc_shared_globals()->init_progname = g_argv[0];` 后补
+   `if (__progname == nullptr) __progname = g_argv[0];`（防御：任何 NULL tag 日志
+   不再 strlen(NULL)）。
+
+━━ 4. 产物（可核对）━━
+
+| 项 | 值 |
+| --- | --- |
+| `runtime/build/bin/source-linker64` | 5,919,000 B（14:01:13；旧 5,919,832） |
+| `prepared/jniLibs/arm64-v8a/liba15vm-guest-ld-android.so` | 5,919,000 B（14:01:50） |
+| APK `app/build/outputs/apk/debug/app-debug.apk` | **1,976,457,411 B**，14:03:53 |
+| APK sha256 | `0693881F4D4421D4B89B74FE23BAF980CB229D618E5ED95D2BEC0FB6F25C9DF7` |
+| APK 内 linker | `lib/arm64-v8a/liba15vm-guest-ld-android.so` 5,919,000 B（已核对） |
+| 装机 | 14:05:53 `Success`；`pm path` = `/data/app/~~LCDXwa_Nb2r3MNUqR77Gdw==/me.kanadex.versebox-ASaN0hdH73eKa7e1KwuI8w==/base.apk` |
+| 备份 | `_bin/a15/scratch/backup-20261101-r114-compile.sh`、`…-patch-linker-a15.py` |
+
+━━ 5. 真机验证结果（实例 1793513201278，14:08 启动）━━
+
+同一份 `vm/framework-server.log` 前后对比：
+
+| 判据行 | 修前（1793504908164） | 修后（1793513201278） |
+| --- | --- | --- |
+| `A9VM bdev crash … __strlen_aarch64` | 每次 zip 未命中必现 | **0 行** |
+| `a15_application_exit=… code=139` | MT / LocalSend / Via / webview 频发 | **0 行** |
+| `Zip: Unable to find entry` | 有 | **0 行**（ALOGV 已编译掉） |
+| `Displayed bin.mt.plus/.MainLightIcon` | 从无 | `:26962 +2s26ms` |
+| `Displayed mark.via/.Shell` | 从无 | `:28012 +1s702ms` |
+
+结论：**W 轨/A 类“闪退”的根因已关闭**（不是改页面、不是复制库，是恢复 AOSP release 的日志语义 +
+初始化 linker 的 `__progname`）。剩下的两堵墙是新的、更靠下的，且有原文：
+
+━━ 5.1 新卡点 1（WebView renderer，W 轨）：隔离渲染进程 dlopen guest libc 的 TLS 失败 ━━
+
+`rootfs/data/system/dropbox/system_app_crash@1793513334688.txt`（sandboxed_process0）原文：
+
+```text
+org.chromium.base.library_loader.ProcessInitException: errorCode=2
+Caused by: java.lang.UnsatisfiedLinkError: dlopen failed: TLS symbol "(null)" in dlopened
+  ".../lib/arm64/liba15vm-guest-libc.so" referenced from
+  ".../lib/arm64/liba15vm-guest-libc.so" using IE access model
+```
+
+即 `linker_relocate.cpp:409`：TLS_TPREL（IE 模型）引用了一个 **dlopen 进来的**模块的 TLS
+（`mod.static_offset == SIZE_MAX`）。普通应用进程的 libc 是进程启动时（LD_PRELOAD/解释器）
+就位的，拿得到 static offset；**isolated/sandboxed renderer 里 guest libc 变成 dlopen 的模块**，
+于是 IE 重定位被拒。下一次改动方向：让 renderer（child zygote / isolated 进程）在启动时就带上
+guest libc 镜像（与普通 app 进程同形），而不是在 Chromium `System.loadLibrary` 里才 dlopen。
+
+**已取证（同一实例，同一个字段对比）：**
+
+```text
+普通应用进程（MT，application-9853-45.log）：
+  LD_PRELOAD = …liba15vm-property-client.so:…guest-devices.so:…binder-devices.so:…guest-log.so
+               :liba15vm-image-1a57….so:liba15vm-image-a2ba….so:liba15vm-image-3b85….so
+               :liba15vm-image-841b….so:libc.so            ← libc 在启动时就位
+
+webview 子进程（application-10456-1.log）：
+  LD_PRELOAD = …property-client.so:…guest-devices.so:…binder-devices.so:…guest-log.so
+                                                             ← 没有 libc 镜像
+  → 之后 dlopen liba15vm-guest-libc.so 才发生 → TLS IE 失败
+```
+
+差值就出在启动器：`vendor/framework/AppLaunch.java:53-60` 把 LD_PRELOAD 过滤成“只留容器 shim”，
+于是 child-zygote 分支（`--start-child-zygote` → `GuestChildZygote` → webview_zygote 的孩子们）
+拿不到 `liba15vm-image-*:libc.so`。**下一次改动方向：给 child-zygote/isolated 进程补回
+libc 镜像的启动期 preload（与普通 app 进程同形），而不是改 TLS/重定位逻辑。**
+
+━━ 5.2 新卡点 2（N 轨“能上网”的最后一层）：NetworkMonitor 的 PROBE_DNS 全部 ENONET ━━
+
+`vm/application-9853-4.log`（networkstack 进程）原文：
+
+```text
+NetworkMonitor/100: Starting on network 100 …
+NetworkMonitor/100: PROBE_DNS connectivitycheck.gstatic.com 8ms FAIL … 
+  android.system.ErrnoException: resNetworkQuery failed: ENONET (Machine is not on the network)
+NetworkMonitor/100: PROBE_HTTPS https://www.google.com/generate_204 Probe failed …
+NetworkMonitor/100: isCaptivePortal: isSuccessful()=false isPortal()=false …
+ConnectivityService: Update score for net 100 : -IS_VALIDATED     ← 之前是 +IS_VALIDATED
+（此后 24 次 “validation failed” / a15_network_agent_validation=2）
+```
+
+- 这是 **Android 自己的 DNS 解析路径（netd、`resNetworkQuery`）没接**，不是 wifi 连不上：
+  同一实例 `registerNetworkAgent … ni{WIFI CONNECTED extra: "CMCC-FKAz-5G"}`、
+  `LinkProperties … 192.168.1.12/24 … DnsAddresses: [/192.168.1.1]` 都在。
+- 后果正是维护者看到的 UI 形状：网络被标成**未验证**，设置里的“互联网”预览就按“网络可用/
+  无互联网”渲染，而不是“已连接的 SSID”。
+- 取证：guest libc（`runtime/build/lib/libc.so`，1,193,744 B）导出的是
+  `__res_nquery`/`res_query`/`android_getaddrinfofornet`，**没有** `resNetworkQuery`；
+  A15 的 netd DNS AIDL 在我们的 `GuestDnsResolver` 里只有配置类方法，
+  其余落到 `Host resolver operation: <name>`（code 95）。下一轮在这条路径上补齐。
+
+━━ 5.3 新卡点 3（MT 管理器）：界面已经画出来，第二次 startActivity 时被 137 杀 ━━
+
+`:26962 Displayed bin.mt.plus/.MainLightIcon +2s26ms` 之后
+`:27089 START … bin.mt.plus/l.۬ۖ᩷`、`:27090 a15_application_exit=14091:bin.mt.plus code=137`。
+137=SIGKILL，不是崩（无 A9VM crash、无 dropbox java crash）。下一轮先看是 MT 自己的加固
+保护自杀、还是我们/lmkd 的回收；**当前不能声称 MT 完全可用**。
+
+━━ 5.4 待真机判据（旧的，保留作下一轮模板）━━
+
+新实例开机后各打开一次 **MT 管理器 / LocalSend / Via / 系统 WebView 测试浏览器**，
+读对应 `vm/application-*-*.log`：
+
+1. 修前：`Trying zip file open …` 后紧跟 `A9VM bdev crash … __strlen_aarch64`；
+2. 修后：同一行后面**继续**出现 `[ opening … ]` / `Load … : ok`，
+   且 `vm/framework-server.log` 的 `a15_application_exit=… code=139` 不再出现（或改号）。
+
+━━ 6. 仍未做 / 下一轮 ━━
+
+- WiFi：本实例（1793504908164）数据面是真的（`isDefaultNetwork=true`、
+  `WIFI CONNECTED extra: "CMCC-FKAz-5G"`、IP `192.168.1.12`、DNS 192.168.1.1）；
+  Settings 里“互联网预览显示网络可用/MAC 空”需在新实例抓
+  `a15_wifi_connection_info=` + 屏幕取证后再动，不在本轮盲改。
+- 存储容量 2×（`FileUtils: Rounded bytes from 478941978624`）未动。
+- `sUidOwnerMap does not have entry for uid` 的 `NetworkPolicy` 异常仍会刷屏，
+  与 A15BpfMaps 的假 map 的 deleteEntry 语义有关，排下一轮。
+
 ## 第 111 轮（2026-11-01 01:41）· 事故与手工回滚：linker 默认禁用 apk 库 → 系统卡死、Wi-Fi 图标回退（已回滚，用户已验证恢复）
 
 > **结论先行**：r111 的改动（`open_library_in_zipfile` 默认返回 -1）是**全局行为改动**，

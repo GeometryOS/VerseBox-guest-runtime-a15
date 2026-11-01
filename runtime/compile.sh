@@ -86,6 +86,17 @@ compile() {
         -MD -MF "$object.d" "$@"
     if [ "${BUILD_KIND:-}" = linker ]; then
         set -- "$@" -DLIBC_STATIC -fvisibility=hidden '-DLIB_PATH="lib64"'
+        # AOSP builds ld-android and its support libraries as release code, so
+        # log/log.h resolves LOG_NDEBUG to 1 through NDEBUG and strips ALOGV.
+        # Without NDEBUG every ALOGV survives into the loader; libziparchive
+        # logs "Zip: Unable to find entry" with the default LOG_TAG (NULL), and
+        # liblog resolves NULL tags through GetDefaultTag() ->
+        # std::string(getprogname()). The linker's own __progname is never set
+        # (it runs embedded, see patch-linker-a15.py), so that strlen(NULL)
+        # killed the app process on every "zip entry not found" lookup:
+        # MT Manager / LocalSend / WebView all died at pc=__strlen_aarch64
+        # +0x10 with x0=0 (instance 1793504908164, 2026-11-01 12:00).
+        set -- "$@" -DNDEBUG
     else
         set -- "$@" -DPLATFORM_SDK_VERSION=35
         # Android 15's bionic_ifuncs.h only defines DEFINE_IFUNC_FOR when one of

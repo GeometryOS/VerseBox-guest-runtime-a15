@@ -48,16 +48,21 @@ final class AppLaunch {
         ProcessBuilder builder = new ProcessBuilder(command).directory(new File(System.getenv("A10VM_ROOTFS"))).redirectErrorStream(true)
                 .redirectOutput(logFile(sequence));
         Map<String, String> environment = builder.environment();
-        // Preloading framework libraries exposes their bundled codecs to application JNI.
-        // Keep only the container shims; app_process loads Android libraries via DT_NEEDED.
-        List<String> preloads = new ArrayList<>();
-        for (String path : environment.getOrDefault("LD_PRELOAD", "").split(":")) {
-            for (String shim : new String[] {"property-client", "guest-devices", "binder-devices",
-                    "guest-log", "malloc-leak-shim", "libdl-compat"}) {
-                if (path.contains(shim)) { preloads.add(path); break; }
-            }
-        }
-        environment.put("LD_PRELOAD", String.join(":", preloads));
+        // Round 115 (W track): keep the runtime preload exactly as the child zygote
+        // inherited it -- the same shape every ordinary A15 app process gets from
+        // A15AppLaunch. The old A9-era filter kept only the container shims, which
+        // dropped "...liba15vm-image-*.so:libc.so:libm.so:libdl.so". The isolated
+        // WebView renderer then met libc only as a dlopen()ed module and the guest
+        // linker rejected its initial-exec TLS reference
+        //   UnsatisfiedLinkError: dlopen failed: TLS symbol "(null)" in dlopened
+        //   ".../liba15vm-guest-libc.so" ... using IE access model
+        // (linker_relocate.cpp:409, instance 1793513201278 dropbox
+        // system_app_crash@1793514712215.txt). With libc named at process start the
+        // linker promotes the already-loaded copy into the namespace shared group
+        // instead of mapping a second one, which is the mechanism FrameworkSession
+        // already relies on for frameworkSdk >= 35.
+        System.out.println("a15_child_preload=" +
+                (environment.getOrDefault("LD_PRELOAD", "").contains("libc.so") ? "libc" : "missing"));
         environment.put("A10VM_GUEST_UID", uid);
         environment.put("A10VM_GUEST_GID", gid);
         environment.remove("A10VM_DEX_CACHE");

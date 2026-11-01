@@ -31,7 +31,7 @@ UP = RT / "upstream" / "bionic" / "linker"
 OUT = RT / "build" / "derived" / "bionic" / "linker"
 
 SOURCES = ("linker.cpp", "linker_config.cpp", "linker_utils.cpp", "linker_soinfo.cpp",
-           "linker_phdr.cpp")
+           "linker_phdr.cpp", "linker_main.cpp")
 
 LINKER_CPP = [
     (
@@ -335,12 +335,36 @@ LINKER_PHDR_CPP = [
     ),
 ]
 
+LINKER_MAIN_CPP = [
+    (
+        '#include <bionic/libc_init_common.h>\n',
+        '#include <bionic/libc_init_common.h>\n'
+        '// A10VM guest patch: this linker also runs embedded (see below).\n'
+        'extern "C" const char* __progname;\n',
+    ),
+    (
+        "  __libc_shared_globals()->init_progname = g_argv[0];\n",
+        "  __libc_shared_globals()->init_progname = g_argv[0];\n"
+        "  // A10VM guest patch: the loader is also mapped as a library inside the\n"
+        "  // host app process, where __linker_init() is the only initialiser that\n"
+        "  // runs: __libc_init_common() (and therefore setprogname()) is not part\n"
+        "  // of that path, so this binary's private copy of __progname stays null.\n"
+        "  // liblog resolves a NULL log tag through GetDefaultTag(), which does\n"
+        "  // std::string(getprogname()); strlen(NULL) then kills the process.\n"
+        "  // Real device 2026-11-01 (instance 1793504908164): every apk-zip .so\n"
+        "  // miss (LocalSend libEGL.so, MT Manager liblog.so, WebView liblog.so)\n"
+        "  // died at __strlen_aarch64+0x10 with x0=0, fault=0x0.\n"
+        "  if (__progname == nullptr) __progname = g_argv[0];\n",
+    ),
+]
+
 EDITS = {
     "linker.cpp": LINKER_CPP,
     "linker_config.cpp": LINKER_CONFIG_CPP,
     "linker_utils.cpp": LINKER_UTILS_CPP,
     "linker_soinfo.cpp": LINKER_SOINFO_CPP,
     "linker_phdr.cpp": LINKER_PHDR_CPP,
+    "linker_main.cpp": LINKER_MAIN_CPP,
 }
 
 
