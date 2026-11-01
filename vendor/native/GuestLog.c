@@ -191,12 +191,23 @@ extern uintptr_t __stack_chk_guard;
 static int stack_chk_reports = 0;
 
 void __stack_chk_fail(void) {
-    if (stack_chk_reports++ < 2) {
+    // Round 115: report EVERY failure, not just the first two. The WebView
+    // browser process dies with SIGTRAP (133) at the canary-failure stub
+    // ("brk #0" immediately after this call) in libwebviewchromium, i.e. this
+    // interposer returned into a path the compiler marked noreturn, and the old
+    // "first two only" cap made that third (and fatal) failure completely
+    // silent -- log instance 1793503945104 had no stack_chk line at all before
+    // the SIGTRAP. The caller address is printed because Chromium is built
+    // without frame pointers, so backtrace() alone cannot name it.
+    ++stack_chk_reports;
+    {
         void* frames[32];
         int count = backtrace(frames, 32);
-        char line[160];
+        char line[224];
         int written = snprintf(line, sizeof(line),
-                               "A9VM stack_chk_fail frames=%d guard_slot=0x%lx guard=0x%lx\n",
+                               "A9VM stack_chk_fail n=%d caller=0x%lx frames=%d guard_slot=0x%lx guard=0x%lx\n",
+                               stack_chk_reports,
+                               (unsigned long)(uintptr_t)__builtin_return_address(0),
                                count,
                                (unsigned long)(uintptr_t)&__stack_chk_guard,
                                (unsigned long)__stack_chk_guard);

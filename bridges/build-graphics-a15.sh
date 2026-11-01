@@ -153,6 +153,7 @@ apply_patch "$MODULE/bridges/patches/sampler-external-precision.patch"
 # "Unable to generate SkImage" before SurfaceFlinger can register
 # SurfaceFlingerAIDL. A15-only.
 apply_patch "$MODULE/bridges/patches/gl-ext-half-float.patch"
+apply_patch "$MODULE/bridges/patches/surfaceless-context.patch"
 apply_patch "$SRC/desktop/config-handles.patch"
 apply_patch "$SRC/desktop/texture-contexts.patch"
 apply_patch "$SRC/desktop/format-conversions.patch"

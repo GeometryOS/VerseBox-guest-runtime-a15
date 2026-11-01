@@ -2,6 +2,8 @@
 #include "Wire.h"
 #include "ClientBuffers.h"
 #include <errno.h>
+#include <fcntl.h>
+#include <string.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,9 +13,24 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace a10binder {
-struct Driver { std::string path; uint64_t process; std::set<int> sockets; bool commandRead; };
+// Chromium's renderer installs a seccomp policy after startup that denies socket()/connect()
+// with EPERM (real device 2026-11-01, instance 1793525278509: "a10binder thread connect failed
+// errno=1 .../vm/binder.sock" from the renderer's binder thread, which kills the thread pool and
+// makes IChildProcessService unreachable). AOSP's binder needs no connect per thread, so this
+// transport pre-connects a small pool while the process is still unsandboxed and hands one
+// socket to each later thread. Sockets taken from the pool skip connect() but still perform the
+// normal Hello handshake, so the broker sees them as ordinary per-thread connections.
+static constexpr int kSpareThreadSockets = 8;
+struct Driver {
+    std::string path;
+    uint64_t process;
+    std::set<int> sockets;
+    bool commandRead;
+    std::vector<int> spare;
+};
 static std::mutex driverMutex;
 static std::map<int, Driver> drivers;
 static const pid_t driverOwner = getpid();
@@ -80,6 +97,7 @@ static bool exchange(int fd, Packet* request, Packet* reply) {
 }
 static int threadSocket(int fd) {
     Driver driver;
+    int socket = -1;
     {
         std::lock_guard<std::mutex> lock(driverMutex);
         auto it = drivers.find(fd);
@@ -87,10 +105,31 @@ static int threadSocket(int fd) {
         Session* session = findSession(fd);
         if (session && session->process == it->second.process &&
             it->second.sockets.count(session->socket)) return session->socket;
+        if (!it->second.spare.empty()) {
+            socket = it->second.spare.back();
+            it->second.spare.pop_back();
+            fprintf(stderr, "a10binder spare used left=%zu\n", it->second.spare.size());
+        }
         driver = it->second;
     }
-    int socket = connectSocket(driver.path.c_str());
-    if (socket < 0) return -1;
+    if (socket < 0) socket = connectSocket(driver.path.c_str());
+    if (socket < 0) {
+        char status[512] = {0};
+        int statusFd = open("/proc/self/status", O_RDONLY);
+        ssize_t got = statusFd >= 0 ? read(statusFd, status, sizeof(status) - 1) : -1;
+        if (statusFd >= 0) close(statusFd);
+        const char* seccomp = "Seccomp:\t0";
+        if (got > 0) {
+            const char* at = strstr(status, "Seccomp:");
+            if (at) {
+                size_t length = strcspn(at, "\n");
+                if (length < sizeof(status)) { memcpy(status, at, length); status[length] = 0; seccomp = status; }
+            }
+        }
+        fprintf(stderr, "a10binder thread connect failed errno=%d path=%s %s\n",
+                errno, driver.path.c_str(), seccomp);
+        return -1;
+    }
     Packet hello, response;
     hello.header.kind = Hello;
     hello.header.token = driver.process;
@@ -165,7 +204,10 @@ static bool refreshWakeups(int fd) {
 
 static int writeRead(int fd, binder_write_read* operation) {
     int socket = threadSocket(fd);
-    if (socket < 0) return -1;
+    if (socket < 0) {
+        fprintf(stderr, "a10binder thread socket failed errno=%d\n", errno);
+        return -1;
+    }
     operation->write_consumed = operation->read_consumed = 0;
     bool readRequested = false;
     while (operation->write_consumed < operation->write_size) {
@@ -178,7 +220,11 @@ static int writeRead(int fd, binder_write_read* operation) {
         if (length > remaining - sizeof(code)) { errno = EINVAL; return -1; }
         uint64_t capacity = findSession(fd)->commandRead && remaining == sizeof(code) + length
                 ? operation->read_size : 0;
-        if (!writeCommand(socket, code, input + sizeof(code), length, capacity)) return -1;
+        if (!writeCommand(socket, code, input + sizeof(code), length, capacity)) {
+            fprintf(stderr, "a10binder command failed code=%x size=%zu errno=%d\n",
+                    unsigned(code), length, errno);
+            return -1;
+        }
         operation->write_consumed += sizeof(code) + length;
         readRequested = capacity != 0;
     }
@@ -186,7 +232,14 @@ static int writeRead(int fd, binder_write_read* operation) {
         Packet read, event;
         read.header.kind = Read;
         read.header.arg = operation->read_size;
-        if ((!readRequested && !sendPacket(socket, read)) || !receivePacket(socket, &event)) return -1;
+        if (!readRequested && !sendPacket(socket, read)) {
+            fprintf(stderr, "a10binder read request failed errno=%d\n", errno);
+            return -1;
+        }
+        if (!receivePacket(socket, &event)) {
+            fprintf(stderr, "a10binder read event failed errno=%d\n", errno);
+            return -1;
+        }
         static int traceCount = 0;
         if (traceCount < 12) {
             char line[160];
@@ -244,8 +297,24 @@ extern "C" int a10binder_open(const char* path) {
     hello.header.kind = Hello;
     hello.header.command = getuid() + 1;
     if (!exchange(fd, &hello, &reply)) { int error = errno; close(fd); errno = error; return -1; }
+    // Isolated WebView renderers run a real binder thread pool (libbinder asks the driver
+    // for more loopers, capped at 15 by default) and every one of those threads needs its
+    // own transport socket. Real device 2026-11-01 (instance 1793525278509): a renderer
+    // drained all 8 spares ("spare used left=0") and the 9th thread's connect() was EPERM.
+    // Ordinary processes can still connect() later, so they only get a small pool.
+    int poolSize = 4;
+    const char* guestUid = getenv("A10VM_GUEST_UID");
+    if (guestUid && atoi(guestUid) >= 90000) poolSize = 24;
+    std::vector<int> spare;
+    for (int index = 0; index < poolSize; ++index) {
+        int extra = connectSocket(path);
+        if (extra < 0) break;
+        spare.push_back(extra);
+    }
     std::lock_guard<std::mutex> lock(driverMutex);
-    drivers.emplace(fd, Driver{path, reply.header.token, {}, (reply.header.arg & kCommandRead) != 0});
+    fprintf(stderr, "a10binder open spare=%zu path=%s\n", spare.size(), path);
+    drivers.emplace(fd, Driver{path, reply.header.token, {}, (reply.header.arg & kCommandRead) != 0,
+                               std::move(spare)});
     return fd;
 }
 extern "C" int a10binder_close(int fd) {
@@ -256,6 +325,7 @@ extern "C" int a10binder_close(int fd) {
     auto driver = drivers.find(fd);
     if (driver == drivers.end()) { errno = EBADF; return -1; }
     for (int socket : driver->second.sockets) { shutdown(socket, SHUT_RDWR); close(socket); }
+    for (int socket : driver->second.spare) { shutdown(socket, SHUT_RDWR); close(socket); }
     drivers.erase(driver);
     forgetSession(fd);
     return close(fd);

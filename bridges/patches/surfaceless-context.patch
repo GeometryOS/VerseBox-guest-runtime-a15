@@ -1,0 +1,39 @@
+diff --git a/egl/egl.cpp b/egl/egl.cpp
+--- a/egl/egl.cpp
++++ b/egl/egl.cpp
+@@ -1663,8 +1663,14 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
+     // thread can suddenly jump in any eglMakeCurrent
+     setTlsDestructor((tlsDtorCallback)s_eglReleaseThreadImpl);
+ 
+-    if ((read == EGL_NO_SURFACE && draw == EGL_NO_SURFACE) && (ctx != EGL_NO_CONTEXT))
+-        setErrorReturn(EGL_BAD_MATCH, EGL_FALSE);
++    // EGL_KHR_surfaceless_context: Android 15's WebView (Chromium 128) makes a
++    // context current without any surface on its compositor threads. The
++    // upstream goldfish EGL rejected that with EGL_BAD_MATCH (real device
++    // 2026-11-01, instance 1793525278509: "eglMakeCurrent(1694): error 0x3009
++    // (EGL_BAD_MATCH)" immediately before "eglDestroyContext failed"), which
++    // left the encoder without a shared group and the next GL call crashed in
++    // GL2Encoder::s_glProgramUniform2fv via GLSharedGroup::isProgram.
++    // Accept the surface-less binding; the second check below still rejects
++    // surfaces with no context.
+     if ((read != EGL_NO_SURFACE || draw != EGL_NO_SURFACE) && (ctx == EGL_NO_CONTEXT))
+         setErrorReturn(EGL_BAD_MATCH, EGL_FALSE);
+ 
+@@ -1705,10 +1711,17 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
+         setErrorReturn(EGL_BAD_ACCESS, EGL_FALSE);
+     }
+ 
++    const bool surfaceless = context && !draw && !read;
+     DEFINE_AND_VALIDATE_HOST_CONNECTION(EGL_FALSE);
+     if (rcEnc->rcMakeCurrent(rcEnc, ctxHandle, drawHandle, readHandle) == EGL_FALSE) {
+-        ALOGE("rcMakeCurrent returned EGL_FALSE");
+-        setErrorReturn(EGL_BAD_CONTEXT, EGL_FALSE);
++        ALOGE("rcMakeCurrent returned EGL_FALSE surfaceless=%d", int(surfaceless));
++        // The host render thread may refuse a surface-less bind. Keep the
++        // local binding (shared group + client state) anyway so the encoder is
++        // never left half-initialized; GL commands then fail cleanly instead
++        // of dereferencing a null shared group.
++        if (!surfaceless) setErrorReturn(EGL_BAD_CONTEXT, EGL_FALSE);
+     }
+ 
+     //Now make the local bind

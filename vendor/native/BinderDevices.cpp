@@ -240,7 +240,10 @@ static void crashHandler(int sig, siginfo_t* info, void* context) {
         if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
         else cursor = end;
     }
-    for (int index = 0; index < 9; ++index) {
+    // Round 115: print every general register (x0-x30). The WebView trap below
+    // sits at the stack-protector failure stub, and the compared values live in
+    // x25/x29, so the old x0-x8/x19 subset could not show what actually differed.
+    for (int index = 0; index < 31; ++index) {
         written = snprintf(cursor, remaining(cursor, end), " x%d=0x%lx", index,
                            static_cast<unsigned long>(uc->uc_mcontext.regs[index]));
         if (written > 0) {
@@ -248,8 +251,7 @@ static void crashHandler(int sig, siginfo_t* info, void* context) {
             else { cursor = end; break; }
         }
     }
-    written = snprintf(cursor, remaining(cursor, end), " x19=0x%lx\n",
-                       static_cast<unsigned long>(uc->uc_mcontext.regs[19]));
+    written = snprintf(cursor, remaining(cursor, end), "\n");
     if (written > 0) {
         if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
         else cursor = end;
@@ -272,6 +274,42 @@ static void crashHandler(int sig, siginfo_t* info, void* context) {
         appendAddress(&cursor, end, pair[1]);
         if (pair[0] <= fp) break;
         fp = pair[0];
+    }
+    written = snprintf(cursor, remaining(cursor, end), "\n");
+    if (written > 0) {
+        if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
+        else cursor = end;
+    }
+    write(2, buffer, static_cast<size_t>(cursor - buffer));
+
+    // Round 115: stack scan. Chromium's libraries are built without frame
+    // pointers, so the fp walk above yields garbage for them, while the return
+    // addresses that identify the caller are still on the stack. Print the first
+    // words of the crashing thread that point into an executable mapping; every
+    // value is resolved with the same maps table as pc/lr, so it can be checked
+    // offline. A slot that is itself unmapped ends the scan instead of faulting
+    // inside the handler.
+    cursor = buffer;
+    written = snprintf(cursor, remaining(cursor, end), "A9VM bdev stack");
+    if (written > 0) {
+        if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
+        else cursor = end;
+    }
+    for (int index = 0; index < 128; ++index) {
+        uintptr_t slot = sp + static_cast<uintptr_t>(index) * 8;
+        const char* slotLine = mapsLineFor(slot);
+        if (slotLine == nullptr || strchr(slotLine, 'r') == nullptr) break;
+        uintptr_t value = 0;
+        memcpy(&value, reinterpret_cast<void*>(slot), sizeof(value));
+        const char* valueLine = mapsLineFor(value);
+        if (valueLine == nullptr || strstr(valueLine, "r-xp") == nullptr) continue;
+        char resolved[192];
+        formatAddress(resolved, sizeof(resolved), value);
+        written = snprintf(cursor, remaining(cursor, end), " %d:%s", index, resolved);
+        if (written > 0) {
+            if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
+            else { cursor = end; break; }
+        }
     }
     written = snprintf(cursor, remaining(cursor, end), "\n");
     if (written > 0) {
@@ -316,6 +354,19 @@ struct Activator {
         // reporting the same 134. SIGQUIT is deliberately NOT caught: ART's
         // thread dump depends on it.
         sigaction(SIGABRT, &action, nullptr);
+        // Round 115 (W track): the WebView browser process dies with exit 133
+        // (128+SIGTRAP) right after the loader tries the apk zip path for a
+        // NEEDED library, and nothing at all is printed: no Java exception, no
+        // abort line, no dropbox entry. On AArch64 __builtin_trap() (used by
+        // Chromium's CHECK/IMMEDIATE_CRASH) and a bare "brk" both arrive as
+        // SIGTRAP, so without this entry the faulting pc is unobservable.
+        // Evidence, instance 1793503945104 (2026-11-01 15:11, new device
+        // 3B15AV00JCP00000): org.chromium.webview_shell .WebViewBrowserActivity
+        // is Displayed +1s771ms, then the process dies code=133 while the log's
+        // last line is 'Trying zip file open ... webview.apk!/lib/arm64-v8a/liblog.so'.
+        // The handler prints pc/lr/frames and still exits with 128+SIGTRAP, so
+        // the host's exit-code diagnostic is unchanged.
+        sigaction(SIGTRAP, &action, nullptr);
     }
 } activator;
 

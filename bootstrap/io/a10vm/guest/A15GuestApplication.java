@@ -78,6 +78,22 @@ public final class A15GuestApplication {
             init = "unavailable:" + failure;
         }
         System.out.println("a15_application_runtime_init=" + init);
+        // Round 115 (W track): the guest has no logd ("logcat: Failed to wait for
+        // logd.ready to become true. logd not running?"), and both
+        // RuntimeInit.commonInit()'s handler and ART's own uncaught handler report
+        // the stack through Slog -> logd. The result is a process that dies with
+        // "AndroidRuntime: Shutting down VM" on stderr and NO exception text
+        // anywhere (instance 1793503945104: org.chromium.webview_shell exits 133
+        // ~2 s after Displayed, dropbox has no data_app_crash, stderr has no
+        // FATAL EXCEPTION). Print the throwable to stdout -- which the launcher
+        // redirects into the same application-*.log -- before the process dies.
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            System.out.println("a15_application_uncaught thread=" + thread.getName() + " " + throwable);
+            throwable.printStackTrace(System.out);
+            System.out.flush();
+            android.os.Process.killProcess(android.os.Process.myPid());
+            System.exit(10);
+        });
         // The MIME database MediaProvider resolves extensions through. Android 15
         // builds it from classpath resources (/res/*.mime.types in framework.jar);
         // when that lookup comes back empty every MediaStore insert with an

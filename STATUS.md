@@ -1,5 +1,356 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
+## 第 117 轮（2026-11-01 18:4x–19:07）· renderer 的 binder 线程 connect 被沙箱 EPERM：预连接池 + 新暴露的 EGL surfaceless / GL 拆除崩溃
+
+> 本轮**不是**推演：全部结论来自真机实例 `1793525278509` 的 `application-*.log` 与 `framework-broker.log`。
+> 设备仍是 3B15AV00JCP00000；包名 `me.kanadex.versebox`。
+
+━━ 1. 取证：所有 WebView renderer 都死在同一处（新增定位打印后拿到原文）━━
+
+第 116 轮（诊断版 APK，18:45 装机）在 `Driver.cpp` 的失败分支加了一行定位打印，真机（boot 18:47，host pid 959）立刻给出：
+
+```text
+vm/application-959-65.log
+  25573 a10binder thread connect failed errno=1 path=.../vm/binder.sock
+  25574 a10binder thread socket failed errno=1
+  25575 a10binder writeRead failed errno=1 write=68 read=256
+```
+
+⇒ **不是 broker 拒绝**（同一份 `framework-broker.log` 的 `broker ack status` = 0 行、`exchange failed` = 0 行），
+也不是 recv/send 失败，而是 renderer **新起的 binder 线程在 `connect()` broker socket 时被内核 `EPERM`**。
+AOSP 的 binder 每个线程共用同一个 `/dev/binder` fd，根本不需要 connect；这条依赖是本项目传输层引入的，
+所以真机/上游不会遇到，只有我们的 renderer 会（Chromium 在启动后在 renderer 里收紧 syscall）。
+
+━━ 2. 修法：进程打开 binder 设备时预连接线程 socket（沙箱之前）━━
+
+`vendor/binder/native/Driver.cpp`：
+
+- `Driver` 增加 `std::vector<int> spare`；
+- `a10binder_open()` 在控制连接成功后**立即预连接 8 条**线程 socket（此时进程还没被 Chromium 收紧）；
+- `threadSocket()` 优先从 `spare` 取（仍走原来的 Hello 握手，broker 视角仍是普通 per-thread 连接），取不到才 `connect()`；
+- `a10binder_close()` 一并关闭未使用的 spare；
+- 保留第 116 轮的失败定位打印，并在 connect 失败行追加 `/proc/self/status` 的 `Seccomp:` 字段（下一轮判据用）。
+
+**真机效果（boot 18:58，host pid 27353）**：设备侧对全部 `application-27353-*.log` 执行
+`grep -a -l "thread connect failed"` → **0 个文件**；renderer `28723` 一直活到浏览器自己死亡后才被 AMS
+`isolated not needed` 杀掉（`code=0`）。⇒ 预连接池在本轮**有效**。
+（同一修法在 boot 18:54（host pid 19985）仍出现过一次 connect EPERM，说明池可能被更早的线程用光；
+第 118 轮已加 `a10binder open spare=%zu` / `a10binder spare used left=%zu` 两行把它变成可判读的事实。）
+
+━━ 3. 新暴露的下一层：Via 的 SIGSEGV 在我们自己的 GL 桥里 ━━
+
+用户实测（boot 18:58）：Via 主页（网页构建）能显示；**访问任意网址 → 先显示 Android 原生错误页 → 随后闪退**。
+
+同一实例真机原文：
+
+```text
+framework-server.log
+  50273 a15_application_exit=28621:mark.via code=139          ← SIGSEGV
+  50352 a15_application_exit=28723:...:sandboxed_process0 code=0（浏览器死后才被 AMS 清掉）
+
+application-27353-29.log（mark.via 自己）
+  26070 tid 28738: eglMakeCurrent(1694): error 0x3009 (EGL_BAD_MATCH)
+  26075 chromium: [ERROR:egl_context_egl.cc(406)] eglDestroyContext failed with error EGL_BAD_MATCH
+  52786 a10binder read event failed errno=104                  ← 进程拆除时的 ECONNRESET
+  52961 A9VM bdev crash sig=11 code=1 fault=0x0 rawpc=0x7b407abad0
+        pc=...+0x59ad0（实际落库 liba15vm-guest-libOpenglSystemCommon.so）
+```
+
+符号化（NDK llvm-addr2line，本地同一份 `bridges/graphics/lib/libOpenglSystemCommon.so`）：
+
+```text
+0x59ad0 -> GL2Encoder::s_glProgramUniform2fv(void*, unsigned, int, int, float const*)
+0x469e8 -> GLSharedGroup::isProgram(unsigned)
+```
+
+⇒ 崩在 `GL2Encoder::s_glProgramUniform2fv → m_shared->locationWARAppToHost → GLSharedGroup::isProgram`：
+**encoder 的 `m_shared` 是空**（`fault=0x0` 正好是 `isProgram` 里对空 mutex 加锁）。
+`m_shared` 只在 `eglMakeCurrent` 里按 context 设置；同一份日志里它前面正好是
+`eglMakeCurrent(1694) EGL_BAD_MATCH`（**surfaceless make-current 被我们的 EGL 拒绝**），
+即 Chromium 认为上下文已 current，而我们没把 shared group 挂上，后续 GL 调用就踩空。
+
+**下一步唯一动作（W 轨，未做）**：让 `derived/egl/egl.cpp:1693-1696` 支持 surfaceless context
+（`EGL_KHR_surfaceless_context`），或在拒绝时**不要**让 encoder 进入“无 shared group”状态；
+判据：同一份 Via 日志里 `eglMakeCurrent(1694) ... EGL_BAD_MATCH` 归零、
+`a15_application_exit=…:mark.via code=139` 变成正常退出，且错误页不再触发闪退。
+**在这条判据出现前，不改 GL 编码器、不改 libc、不改 linker。**
+
+━━ 4. 网络仍红（同一实例，原文）━━
+
+```text
+framework-server.log: 49620/49731/49820/49926/50246  ConnectivityService: [100 WIFI] validation failed
+```
+
+默认网络 100 在（`New default network 100`），但验证一直失败；与第 114 轮记录的
+`PROBE_DNS … resNetworkQuery failed: ENONET` 是同一根因（netd 的 DNS 查询路径没接）。
+→ 这是"N 轨"，与上面的 W/GL 崩溃**不是**同一条轨，下一轮不许混改。
+
+━━ 5. 产物（可核对）━━
+
+| 项 | 值 |
+| --- | --- |
+| APK（预连接池首次装机 18:53:35） | 1,976,499,449 B / `CFDA184076D68543AF88462165F6C77F4E1DDB68884F37B46932D462BD0CE116` |
+| APK（池 + 诊断行，19:07:50 装机） | 1,976,499,459 B / `FE8E0A417E30323C7A8B0515A32589DEF3AF8558B24A08743C80BC6CD3611553` |
+| `liba15binder.so`（池） | bridges/lib，含 `a10binder spare used` 等新串 |
+| 本轮构建 | `_bin/a15/logs/build-r116.log` / `build-r116b.log` / `build-r117.log` |
+
+━━ 5.1 追加（19:10 真机，boot host pid 20838）· 8 条 spare 被 renderer 用光 ━━
+
+新增的池诊断第一次给出可判读的数据：
+
+```text
+a10binder open spare=8 path=…/binder.sock      ×56
+a10binder open spare=8 path=…/hwbinder.sock    ×18
+a10binder spare used left=7 … left=0           （renderer 把 8 条全取走）
+application-20838-29.log / -44.log：thread connect failed errno=1   ← 第 9 个线程
+```
+
+`-29` / `-44` 都是 `cr_WebViewApkApp … processName=com.android.webview:sandboxed_process0`：
+**renderer 的 binder 线程池会要超过 8 条连接**（libbinder 默认池上限 15），池被用光后第 9 个线程又去
+connect，于是回到 EPERM。**修法（r118，19:15:28 装机）**：按 guest uid 决定池大小——隔离进程
+（`A10VM_GUEST_UID >= 90000`）预连接 24 条，普通进程 4 条（普通进程后续 connect 不受限）。
+判据：renderer 日志不再出现 `thread connect failed`，且 `mark.via` 不再因 renderer 死亡而 137/139。
+
+━━ 5.2 追加（r118 真机 → r119 修 GL）· binder 线已通，只剩 EGL surfaceless ━━
+
+r118（池按 guest uid 分类：隔离 24 / 普通 4）真机结果：
+
+```text
+新日志 thread connect failed        → 0 个
+a15_application_exit=27539:mark.via code=139   （三次）
+a15_application_exit=…:sandboxed_process0 code=0 ×3
+```
+
+⇒ **renderer 不再因 binder connect 死**（binder 线关闭）；`mark.via` 仍是 139 = 已定位的 GL 空 shared group。
+
+r119 修法：`bridges/patches/surfaceless-context.patch`（新）+ 在 `build-graphics-a15.sh` 里 apply。
+内容：`eglMakeCurrent` 接受 surfaceless（`EGL_KHR_surfaceless_context`）；host `rcMakeCurrent` 拒绝时
+仍然完成本地绑定（shared group + client state），不再把 encoder 留在半初始化状态。
+**注意**：`bridges/graphics/derived/egl/egl.cpp` 是构建时从 upstream 复制+打补丁生成的，
+直接改它会被覆盖（本轮先踩了一次，`surfaceless=%d` 串没进 so 才发现）。
+
+产物：APK 1,976,499,458 B / `EF27B94B…`（r119）。
+
+━━ 5.3 追加（r119 真机）· EGL surfaceless 已修，CRASH 仍在同一函数 ━━
+
+r119（APK 1,976,499,458 B / `EF27B94B…`，19:24:59 装机）真机结果：
+
+```text
+eglMakeCurrent(1694) ... EGL_BAD_MATCH        → 0 行（surfaceless 已被接受）
+rcMakeCurrent returned EGL_FALSE             → 0 行（host 也接受 0 surface）
+thread connect failed                        → 0 行
+a15_application_exit=9680:mark.via code=139  （仍崩）
+a15_application_exit=9815:...:sandboxed_process0 code=137
+```
+
+`application-8381-25.log`（mark.via）：崩点仍是 `libOpenglSystemCommon.so+0x59ad0`
+= `GL2Encoder::s_glProgramUniform2fv`，`fault=0x0`、`x1=0`（program=0），
+但**这次发生在 `display_webview.cc(32) WebView overlays are enabled!` 之后**（渲染中），
+不再有 `eglMakeCurrent` 报错。⇒ surfaceless 那一层已关闭，剩下的是 encoder 自身：
+`m_shared`/`GLSharedGroup` 在真实渲染调用里为空或已释放。
+
+**第 120 轮下一步（只做一件）**：在 `BinderDevices.cpp` 的 SIGSEGV 处理器里补两行——
+崩溃线程的 stack 边界（`pthread_getattr_np`）与 `si_addr` 对照，判断是不是栈溢出；
+若 sp 不在栈边界附近，就在 `GL2Encoder::s_glProgramUniform2fv` 入口打印
+`ctx->m_shared` 是否为空（一行，不改行为）。判据：拿到 `m_shared=0` 或 `stack_overflow=1` 之一。
+
+━━ 6. 状态 ━━
+
+- **已验证**：renderer 的 `connect() EPERM` 是真因（新增打印原文）；预连接池让 18:58 那次启动
+  的 renderer 不再因 connect 死掉（同一实例 grep 0 命中）。
+- **已验证（用户实测）**：Via 主页可显示（WebView 渲染链路是活的）；访问任意网址 → 原生错误页 → 闪退。
+- **未验证**：池在长跑/多 renderer 下是否会被用光（18:54 那次仍出现过一次 EPERM）。
+- **新卡点**：`eglMakeCurrent` 拒绝 surfaceless → encoder `m_shared` 空 → GL 调用 SIGSEGV。
+
+
+## 第 115 轮（2026-11-01 15:4x）· WebView 现形：SIGTRAP = libwebviewchromium 的栈保护失败桩
+
+> 设备换成了新机 **3B15AV00JCP00000（PKX110，同 API 35）**，包名仍是 `me.kanadex.versebox`。
+> 维护者已自行修掉 TLS IE 那一层（`vendor/framework/AppLaunch.java`：不再把 child-zygote 的
+> `LD_PRELOAD` 过滤掉 `liba15vm-image-*:libc.so`）。**该修复已被真机验证**
+> （实例 1793503945104，15:2x～15:3x 的 application 日志里 `IE access model` /
+> `UnsatisfiedLinkError` **0 行**，renderer `sandboxed_process0` 正常 exit 0）。
+
+━━ 1. 本轮拿到的判据（真机原文）━━
+
+```text
+vm/framework-server.log:
+  :59701 Displayed org.chromium.webview_shell/.WebViewBrowserActivity for user 0: +1s771ms
+  :59709 a15_application_exit=21826:org.chromium.webview_shell code=133   ← 128+SIGTRAP
+
+vm/application-13097-57.log:
+  :27495 chromium: [ERROR:angle_platform_impl.cc(44)] Display.cpp:1083 (initialize):
+         ANGLE Display::initialize error 12289: Could not dlopen native EGL:
+         dlopen failed: library "libcutils.so" not found: needed by …          ← 非致命，回退软件渲染
+  113965 A9VM bdev crash sig=5 code=1 fault=0x785aeb0274 rawpc=0x785aeb0274
+         pc=liba15vm-guest-ld-android.so+0x41c3274 lr=…+0x41c3194
+  113966 A9VM bdev map 7856ced000-785d382000 r-xp 00000000 …
+         /data/app/…/lib/arm64/liba15vm-image-9dc0678dda3d710b34a0.so   ← libwebviewchromium.so
+```
+
+换算（map 起点 0x7856ced000，该 ELF 只有一个 `LOAD … R E, offset 0, vaddr 0`）：
+pc 在 `libwebviewchromium.so + 0x41c3274`。本地同一份镜像 so 反汇编：
+
+```text
+41c3230: b.ne  0x41c3270          ; stack canary 比较失败
+41c3270: bl    0x6694090 <__stack_chk_fail@plt>
+41c3274: brk   #0                 ← 崩溃 pc
+```
+
+⇒ **不是 WebView 自己的 CHECK**，是我们的 `__stack_chk_fail` 被调用后**返回**，
+掉进了编译器给“noreturn”留的 `brk #0`。该 interposer 现在故意 return（为了 system_server
+能越过 StartInputManagerService，见 `vendor/native/GuestLog.c` 的注释），代价是：真发生
+栈保护失败时进程会以 SIGTRAP 死在这里，且旧的“只报前 2 次”把第 3 次变成了静默失败。
+
+━━ 2. 本轮改动（只加诊断，不改行为）━━
+
+1. `vendor/native/BinderDevices.cpp`：`sigaction(SIGTRAP, …)`（上一版加的）+ 打印全部
+   `x0..x30` + **栈扫描**（把 sp 上落在 `r-xp` 映射里的字解析成 `path+offset`，
+   因为 Chromium 没有 frame pointer，原 fp walk 对它无效）。
+2. `vendor/native/GuestLog.c`：`__stack_chk_fail` **每次都打印**（不再只前 2 次），
+   行里加 `caller=0x…`（`__builtin_return_address(0)`）与序号。
+
+产物（可核对）：
+
+| 项 | 值 |
+| --- | --- |
+| `bridges/lib/liba15vm-binder-devices.so` | 17,656 B（15:36:09） |
+| `bridges/lib/liba15vm-guest-log.so` | 12,344 B（15:36:25） |
+| APK `app/build/outputs/apk/debug/app-debug.apk` | **1,976,453,410 B**，15:38:20 |
+| APK sha256 | `FE247C8C8BE807589CAA790515F7B0BAC266842724D3926931E56CA2013C1A24` |
+| 装机 | `adb install -r -d` Success；`pm path` = `/data/app/~~I32cRQ90LgA-wJA9vY1h6A==/me.kanadex.versebox-Is7TJ3ybz3BINwpZ1Yh03g==/base.apk` |
+
+prepare 通过；APK 构建时 `:app:packageDebug` **失败过一次**（无堆栈细节），单独重跑
+`gradlew :app:packageDebug` 成功（30s）。**开发时的一次构建失败必须如实记录，不写成“构建顺利”。**
+维护者的 `AppLaunch.java`（6,000 B，14:41:13）**本轮没有再动**。
+
+━━ 3. 状态：已装机，待真机
+
+下一次启动后打开 WebView 测试浏览器，判据（只读两行）：
+
+1. 若 `__stack_chk_fail` 真的被调用 → 出现
+   `A9VM stack_chk_fail n=… caller=0x… frames=… guard_slot=0x… guard=0x…`，
+   `caller` 换算成 `libwebviewchromium.so+offset` 就是踩坏栈的那个函数；
+2. 若没有这行、仍是 `sig=5` → 看新加的 `A9VM bdev stack` 行里第一个
+   `libwebviewchromium.so+offset`（那是返回地址链），用它定位。
+
+━━ 3.1 15:44 第二次真机（同一实例重启后，新 APK）：更关键的证据 ━━
+
+```text
+vm/framework-server.log
+  :53548 a15_application_launch=24638:org.chromium.webview_shell
+  :53856 Displayed org.chromium.webview_shell/.WebViewBrowserActivity for user 0: +1s888ms
+  :54187 a15_application_exit=24638:org.chromium.webview_shell code=133
+
+vm/application-22586-32.log（renderer / sandboxed_process0）
+  26940 cr_WebViewApkApp: version=128.0.6613.88 processName=…:sandboxed_process0…
+  27250 cr_LibraryLoader: Successfully loaded native library     ← renderer 里 WebView 原生库确实加载成功
+
+vm/application-22586-49.log（browser 自己的日志）
+  69313 nativeloader: Load …/libwebviewchromium.so using isolated ns clns-1 … ok
+  69315 chromium: [ERROR:elf_dynamic_array_reader.h(64)] tag not found
+  69318 a10binder writeRead failed errno=111 write=4 read=256
+  69320 AndroidRuntime: Shutting down VM
+  69324+ …libwebviewchromium.so needs to unload liba15vm-guest-libc.so/libm/libdl…（3348 行）
+  72996 A9VM bdev crash sig=5 pc=libwebviewchromium.so+0x41c3274（两个线程）
+```
+
+判读（诚实版）：
+
+1. **WebView 的原生库两边都加载成功了**：renderer 里 `cr_LibraryLoader: Successfully loaded native library`，
+   browser 里 `nativeloader: … libwebviewchromium.so … ok`。所以“库加载不了”已经不再是当前问题。
+2. **browser 是自己把 VM 关掉的**：`AndroidRuntime: Shutting down VM`，紧接着
+   `libwebviewchromium.so needs to unload …`（含 libc/libm/libdl）→ 再 `brk #0`。
+   即 SIGTRAP 发生在**进程拆除**阶段：我们的 linker 在 namespace 销毁时把 libc/libm/libdl
+   一起卸载了（AOSP 的 libc 是 NODELETE，永远不会被 dlclose 掉），随后仍活着的线程执行
+   `libwebviewchromium` 里那段被编译器标成“noreturn”的路径，正好踩到 `brk #0`。
+3. **为什么 VM 会关，日志里没有原因**：guest 没有 logd
+   （`logcat: Failed to wait for logd.ready … logd not running?`），而
+   `RuntimeInit.commonInit()` 与 ART 自带的 uncaught handler 都是经 Slog→logd 打栈；
+   dropbox 里也没有 `data_app_crash`。所以“FATAL EXCEPTION”这段**根本落不到任何文件**，
+   只剩 stderr 的 `Shutting down VM`。
+
+⇒ 下一步必须先把 **Java 层未捕获异常** 打出来。已改
+`bootstrap/io/a10vm/guest/A15GuestApplication.java`：在 `RuntimeInit.commonInit()` 之后装
+`Thread.setDefaultUncaughtExceptionHandler`，把 throwable 打到 **stdout**
+（随 `application-*.log` 落盘，不依赖 logd），然后 kill 进程。
+
+产物与装机（本文件写完后立即可核对）：
+
+| 项 | 值 |
+| --- | --- |
+| APK | **1,976,354,373 B**，15:54:08 |
+| sha256 | `94CF5940057842E31D0DD4133A2FF21C821ED5AEE60F3C946E8711055EABCD05` |
+| 装机 | 15:5x `adb install -r -d` Success |
+| 状态 | **已装机，未启动**（`startup-events.log` 仍是 15:44 那次；下一次启动才会产生新日志） |
+
+下一次启动 + 打开一次 WebView 测试浏览器后的判据：
+
+1. 出现 `a15_application_uncaught thread=… <throwable>` + 栈 → 这就是 browser 关掉 VM 的
+   Java 原因，按栈修；
+2. 仍只有 `Shutting down VM`、没有该行 → 说明不是 Java 异常，而是 native 主动
+   `exit()`/VM 关闭路径，下一步查谁调了 `System.exit`/`exit_group`（binder errno=111 是线索）。
+
+━━ 3.2 15:56 新实例 1793519770740（用户实际启动的那个）：SIGTRAP 的上一层是 GPU 初始化 FATAL ━━
+
+> 说明：15:55 的装机让宿主新建了实例目录 `1793519770740`，上一次我盯的是旧实例
+> `1793503945104`，所以看漏了这次启动。以下全部取自**新实例**。
+
+```text
+vm/framework-server.log（新实例）
+  :65651 a15_application_launch=6434:org.chromium.webview_shell
+  :65809 Displayed …/.WebViewBrowserActivity for user 0: +1s533ms
+  :65813 a15_application_exit=6434:org.chromium.webview_shell code=133
+  （同一模式连做 6 次：6571/6750/7090/7317/7418 …全部 133）
+
+vm/application-32642-48.log（browser 自己的日志）
+  :27990 chromium: [ERROR:angle_platform_impl.cc(44)] Display.cpp:1083 (initialize):
+         ANGLE Display::initialize error 12289: Could not dlopen native EGL:
+         dlopen failed: library "libcutils.so" not found: needed by
+         …/lib/arm64/liba15vm-image-d7ab00a6fbdd2083ef83.so in namespace clns-1
+  :27999 chromium: [ERROR:gl_display.cc(767)] eglInitialize OpenGLES failed with error EGL_NOT_INITIALIZED
+  :28002 chromium: [ERROR:gl_display.cc(801)] Initialization of all EGL display types failed.
+  :28005 chromium: [ERROR:gl_initializer_android.cc(87)] GLDisplayEGL::Initialize failed.
+  :28008 chromium: [FATAL:gpu_init.cc(952)] gpu::InitializeGLThreadSafe() failed.
+
+  :69313 nativeloader: Load …/libwebviewchromium.so using isolated ns clns-1 … ok
+  :69320 AndroidRuntime: Shutting down VM
+  :69324+ …libwebviewchromium.so needs to unload liba15vm-guest-libc.so/libm/libdl…（3348 行）
+  :72996 A9VM bdev crash sig=5 pc=libwebviewchromium.so+0x41c3274
+```
+
+**结论（修正 3.1 的判读）**：
+
+- `brk #0` 的 SIGTRAP 是 **Chromium 的 FATAL 路径**（`gpu_init.cc(952)`），
+  不是 stack canary：`libwebviewchromium.so+0x41c3274` 正好落在它的
+  `brk` 上；`needs to unload …` 是 fatal 之后进程收尾时的 namespace 销毁。
+- **真正的第一因是 GPU/EGL 初始化失败**：ANGLE 在 **clns-1** 里 `dlopen` 原生 EGL
+  （`libEGL.so` 的 image）时，它的 NEEDED `libcutils.so` 解析不到。
+  `libEGL.so`（image d7ab00…）的 NEEDED 共 19 个：libcutils / liblog / libgraphicsenv /
+  libnativewindow / libvndksupport / HIDL configstore / libbase / libegl_flags /
+  libhidlbase / libnativebridge_lazy / libnativeloader_lazy / libutils /
+  libSurfaceFlingerProp / libunwindstack / libz / libc++ / libc / libm / libdl。
+  这些文件在镜像里都有（prepare 也把 image 打进 APK），失败的是**运行时命名空间的搜索/准入**。
+- 顺带确认：`A15GuestApplication` 新加的 uncaught handler 生效（keychain 那条
+  `a15_application_uncaught …` 就是它打出来的），而 webview_shell **没有** Java 未捕获异常
+  ⇒ 它是 native FATAL 死的，不是 Java 崩。
+
+**下一步唯一动作**：让 app 进程的运行时命名空间（clns-1）能解析 guest `/system/lib64`
+里的这些 soname。两条候选，先取证再选：
+
+1. 在 `GuestRuntime` 生成的 ld.config 里把 `/system/lib64`（host 路径）加进 app 命名空间可链
+   的搜索路径（注意 r111 的教训：**不要改全局`open_library_on_paths`语义**）；
+2. 或把 `libEGL` 的 NEEDED 闭包（除 libc/libm/libdl/liblog 外）在启动期预载 / 投影到
+   clns-1 的 `library_path`（app 的 nativeLibraryDir 或 `vm/lib`）。
+   判据：日志出现 `eglInitialize …` 成功、`gpu_init.cc(952)` FATAL 0 行，
+   `a15_application_exit=… code=133` 变成正常退出。
+
+━━ 4. 已知的次要缺口（本轮记录，不混进上面那条）━━
+
+- ANGLE 的 native EGL 因为 `libcutils.so` 在 product namespace 里找不到而失败（12 行），
+  WebView 回退软件渲染；这不是本轮 SIGTRAP 的原因，但会是“页面能显示但很慢”的原因。
+- `networkstack` 的 `PROBE_DNS … ENONET` → `-IS_VALIDATED`（上一轮已记录）仍未修。
+
 ## 第 114 轮（2026-11-01 14:05）· 第三方应用/WebView 闪退真因：apk 内 .so 未命中时 ALOGV 打死 linker
 
 > 状态：**已验证（实例 1793513201278，2026-11-01 14:08 启动）**。

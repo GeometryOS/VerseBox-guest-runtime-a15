@@ -1,6 +1,7 @@
 #include "ClientBuffers.h"
 #include "TransactionLayout.h"
 #include <sys/mman.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
 #include <algorithm>
@@ -14,7 +15,11 @@ ClientBuffers& clientBuffers() {
 bool ClientBuffers::receive(Packet* packet, binder_transaction_data* transaction, binder_uintptr_t* securityContext) {
     if (securityContext) *securityContext = 0;
     TransactionLayout layout;
-    if (!validateTransaction(*packet, &layout)) return false;
+    if (!validateTransaction(*packet, &layout)) {
+        fprintf(stderr, "a10binder client buffer invalid command=%x size=%zu fds=%zu errno=%d\n",
+                unsigned(packet->header.command), packet->data.size(), packet->fds.size(), errno);
+        return false;
+    }
     if (layout.securityContextOffset && !securityContext) { errno = EINVAL; return false; }
     *transaction = layout.transaction;
     size_t page = sysconf(_SC_PAGESIZE);
@@ -22,7 +27,10 @@ bool ClientBuffers::receive(Packet* packet, binder_transaction_data* transaction
     std::lock_guard<std::mutex> lock(mutex);
     if (size > kArenaLimit - counts.bytes) { errno = ENOSPC; return false; }
     void* data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (data == MAP_FAILED) return false;
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "a10binder client buffer mmap failed size=%zu errno=%d\n", size, errno);
+        return false;
+    }
     memcpy(data, packet->data.data() + sizeof(*transaction), packet->data.size() - sizeof(*transaction));
     auto* offsets = reinterpret_cast<binder_size_t*>(static_cast<uint8_t*>(data) + aligned(transaction->data_size));
     auto local = [&](size_t offset) { return static_cast<uint8_t*>(data) + offset - sizeof(*transaction); };
@@ -54,7 +62,10 @@ bool ClientBuffers::receive(Packet* packet, binder_transaction_data* transaction
             memcpy(local(object.offset), &fd, sizeof(fd));
         }
     }
-    if (mprotect(data, size, PROT_READ) != 0) { munmap(data, size); return false; }
+    if (mprotect(data, size, PROT_READ) != 0) {
+        fprintf(stderr, "a10binder client buffer mprotect failed size=%zu errno=%d\n", size, errno);
+        munmap(data, size); return false;
+    }
     transaction->data.ptr.buffer = reinterpret_cast<uintptr_t>(data);
     transaction->data.ptr.offsets = reinterpret_cast<uintptr_t>(offsets);
     if (layout.securityContextOffset)
