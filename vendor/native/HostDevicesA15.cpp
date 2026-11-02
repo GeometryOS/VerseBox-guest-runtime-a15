@@ -54,15 +54,24 @@
 #include <aidl/android/hardware/vibrator/BnVibrator.h>
 #include <aidl/android/hardware/vibrator/BnVibratorManager.h>
 
+#include <fmq/AidlMessageQueue.h>
 #include <math.h>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <set>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "HostDeviceTransport.h"
 
 namespace {
 
+using android::AidlMessageQueue;
 using aidl::android::hardware::common::fmq::MQDescriptor;
 using aidl::android::hardware::common::fmq::SynchronizedReadWrite;
 using aidl::android::hardware::sensors::BnSensors;
@@ -163,13 +172,23 @@ class NoVibratorManager final : public BnVibratorManager {
     ScopedAStatus clearSessions() override { return unsupported(); }
 };
 
-// A device with no sensors is a legal configuration for this HAL: SensorService
-// tolerates an empty sensor list and still registers "sensorservice", which is
-// what DeviceStateManagerService (and everything after it in startOtherServices)
-// is waiting for. Evidence for the wait:
-//   ServiceManagerCppClient: Waiting for service 'sensorservice' on '/dev/binder'
-//   HidlServiceManagement: Waited one second for android.hardware.sensors@1.0::
-//     ISensors/default
+// Sensors: A15's sensorservice only speaks the AIDL ISensors interface and
+// expects the HAL to push events into an FMQ ring; there is no poll() callback
+// like A10's HIDL HAL. The data source is the same host socket A10 used
+// (HostDeviceSocket, magic 0x41313053):
+//   1 = sensor list, 2 = activate, 3 = batch, 4 = poll, 5 = flush
+//
+// The wake-up bit is cleared in the reported list because this HAL does not
+// maintain a wake-lock event queue. Auto-rotate only needs the accelerometer,
+// which is a non-wake-up sensor.
+// Sensors: DISABLED at registration while the service-side crash below is open.
+// r136/r137 reported the real 23-sensor list from the host and initialize()
+// succeeded, but sensorservice then died in its event thread
+// (A9VM bdev crash sig=11 fault=0x0 pc=0x0) and the VM stayed on the boot
+// animation. Gating events on activate() did not help, so the fault is on the
+// framework side of the FMQ, not "unsolicited samples". Keep the empty list —
+// sensorless is a legal configuration and boots — until a tombstone/stack for
+// that sig=11 is available.
 class NoSensors final : public BnSensors {
   public:
     ScopedAStatus activate(int32_t, bool) override { return unsupported(); }
@@ -199,6 +218,215 @@ class NoSensors final : public BnSensors {
     }
     ScopedAStatus setOperationMode(ISensors::OperationMode) override { return ScopedAStatus::ok(); }
     ScopedAStatus unregisterDirectChannel(int32_t) override { return ScopedAStatus::ok(); }
+};
+
+class HostSensors final : public BnSensors {
+  public:
+    HostSensors() { load(); }
+
+    ScopedAStatus getSensorsList(std::vector<SensorInfo>* out) override {
+        *out = sensors_;
+        std::printf("a15_sensors_getList=%zu\n", out->size());
+        std::fflush(stdout);
+        return ScopedAStatus::ok();
+    }
+
+    ScopedAStatus initialize(const MQDescriptor<Event, SynchronizedReadWrite>& eventQueue,
+                             const MQDescriptor<int32_t, SynchronizedReadWrite>&,
+                             const std::shared_ptr<ISensorsCallback>& callback) override {
+        if (running_) return ScopedAStatus::ok();
+        events_ = std::make_unique<AidlMessageQueue<Event, SynchronizedReadWrite>>(eventQueue, true);
+        if (!events_->isValid()) {
+            std::printf("a15_sensors_queue=invalid\n");
+            std::fflush(stdout);
+            events_.reset();
+            return ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
+        }
+        callback_ = callback;
+        running_ = true;
+        std::thread([this] { loop(); }).detach();
+        std::printf("a15_sensors_initialize=ok count=%zu\n", sensors_.size());
+        std::fflush(stdout);
+        return ScopedAStatus::ok();
+    }
+
+    ScopedAStatus activate(int32_t handle, bool enabled) override {
+        HostDeviceSocket socket("sensors", 0x41313053, 2);
+        int32_t value = 0;
+        if (!socket.valid() || !socket.put(handle) || !socket.put(enabled ? 1u : 0u) ||
+                !socket.get(&value)) return ScopedAStatus::fromExceptionCode(EX_TRANSACTION_FAILED);
+        if (value == 0) {
+            std::lock_guard<std::mutex> guard(enabledMutex_);
+            if (enabled) enabled_.insert(handle); else enabled_.erase(handle);
+            std::printf("a15_sensors_activate=%d enabled=%zu\n", handle, enabled_.size());
+            std::fflush(stdout);
+        }
+        return status(value);
+    }
+
+    ScopedAStatus batch(int32_t handle, int64_t samplingPeriodNs, int64_t maxReportLatencyNs) override {
+        HostDeviceSocket socket("sensors", 0x41313053, 3);
+        int32_t value = 0;
+        if (!socket.valid() || !socket.put(handle) ||
+                !socket.put64(static_cast<uint64_t>(samplingPeriodNs)) ||
+                !socket.put64(static_cast<uint64_t>(maxReportLatencyNs)) ||
+                !socket.get(&value)) return ScopedAStatus::fromExceptionCode(EX_TRANSACTION_FAILED);
+        return status(value);
+    }
+
+    ScopedAStatus flush(int32_t handle) override {
+        HostDeviceSocket socket("sensors", 0x41313053, 5);
+        int32_t value = 0;
+        if (!socket.valid() || !socket.put(handle) || !socket.get(&value))
+            return ScopedAStatus::fromExceptionCode(EX_TRANSACTION_FAILED);
+        return status(value);
+    }
+
+    ScopedAStatus setOperationMode(ISensors::OperationMode mode) override {
+        return mode == ISensors::OperationMode::NORMAL
+                ? ScopedAStatus::ok()
+                : ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+    }
+    ScopedAStatus injectSensorData(const Event&) override {
+        return ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+    }
+    ScopedAStatus configDirectReport(int32_t, int32_t, ISensors::RateLevel, int32_t* out) override {
+        *out = -1;
+        return ScopedAStatus::ok();
+    }
+    ScopedAStatus registerDirectChannel(const ISensors::SharedMemInfo&, int32_t* out) override {
+        *out = -1;
+        return ScopedAStatus::ok();
+    }
+    ScopedAStatus unregisterDirectChannel(int32_t) override { return ScopedAStatus::ok(); }
+
+  private:
+    static ScopedAStatus status(int32_t value) {
+        if (value == 0) return ScopedAStatus::ok();
+        if (value == -13) return ScopedAStatus::fromExceptionCode(EX_SECURITY);
+        if (value == -22) return ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
+        return ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+    }
+
+    void load() {
+        HostDeviceSocket socket("sensors", 0x41313053, 1);
+        int32_t count = 0;
+        if (!socket.valid() || !socket.get(&count) || count < 0 || count > 256) {
+            std::printf("a15_sensors_list=failed\n");
+            std::fflush(stdout);
+            return;
+        }
+        for (int32_t index = 0; index < count; ++index) {
+            SensorInfo info;
+            int32_t type = 0, version = 0, flags = 0, minDelay = 0, maxDelay = 0;
+            std::string name, vendor, typeString;
+            float maxRange = 0, resolution = 0, power = 0;
+            if (!socket.get(&info.sensorHandle) || !socket.get(&type) || !socket.getString(&name) ||
+                    !socket.getString(&vendor) || !socket.getString(&typeString) ||
+                    !socket.get(&version) || !socket.getFloat(&maxRange) ||
+                    !socket.getFloat(&resolution) || !socket.getFloat(&power) ||
+                    !socket.get(&minDelay) || !socket.get(&maxDelay) || !socket.get(&flags)) {
+                std::printf("a15_sensors_list=truncated at %d/%d\n", index, count);
+                sensors_.clear();
+                std::fflush(stdout);
+                return;
+            }
+            info.name = name;
+            info.vendor = vendor;
+            info.typeAsString = typeString;
+            info.type = static_cast<decltype(info.type)>(type);
+            info.version = version;
+            info.maxRange = maxRange;
+            info.resolution = resolution;
+            info.power = power;
+            info.minDelayUs = minDelay;
+            info.maxDelayUs = maxDelay;
+            info.flags = flags & ~1;  // SENSOR_FLAG_WAKE_UP
+            info.fifoReservedEventCount = 0;
+            info.fifoMaxEventCount = 0;
+            sensors_.push_back(std::move(info));
+        }
+        std::printf("a15_sensors_list=count=%zu\n", sensors_.size());
+        std::fflush(stdout);
+    }
+
+    void loop() {
+        while (running_) {
+            {
+                std::lock_guard<std::mutex> guard(enabledMutex_);
+                if (enabled_.empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    continue;
+                }
+            }
+            HostDeviceSocket socket("sensors", 0x41313053, 4, true);
+            int32_t count = 0;
+            if (!socket.valid() || !socket.put(16) || !socket.get(&count) || count <= 0 || count > 16) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+            for (int32_t index = 0; index < count && running_; ++index) {
+                Event event;
+                int64_t timestamp = 0;
+                int32_t handle = 0, type = 0, accuracy = 0, values = 0;
+                float data[16] = {};
+                if (!socket.get64(&timestamp) || !socket.get(&handle) || !socket.get(&type) ||
+                        !socket.get(&accuracy) || !socket.get(&values) || values < 0 || values > 16)
+                    break;
+                for (int32_t value = 0; value < values; ++value)
+                    if (!socket.getFloat(&data[value])) break;
+                if (handle >= 0) {
+                    std::lock_guard<std::mutex> guard(enabledMutex_);
+                    if (!enabled_.count(handle)) continue;
+                }
+                event.timestamp = timestamp;
+                event.sensorHandle = handle;
+                event.sensorType = static_cast<decltype(event.sensorType)>(type);
+                fill(event, type, accuracy, data, values);
+                if (events_ && !events_->writeBlocking(&event, 1)) {
+                    std::printf("a15_sensors_write=failed\n");
+                    std::fflush(stdout);
+                } else if (!reported_.exchange(true)) {
+                    std::printf("a15_sensors_first_event handle=%d type=%d\n", handle, type);
+                    std::fflush(stdout);
+                }
+            }
+        }
+    }
+
+    static void fill(Event& event, int32_t type, int32_t accuracy, const float* data, int32_t count) {
+        using Payload = Event::EventPayload;
+        switch (type) {
+            case 0: {  // META_DATA
+                typename Payload::MetaData meta;
+                meta.what = Payload::MetaData::MetaDataEventType::META_DATA_FLUSH_COMPLETE;
+                event.payload.set<Payload::Tag::meta>(meta);
+                break;
+            }
+            case 1: case 2: case 3: case 4: case 9: case 10: {
+                typename Payload::Vec3 vec{};
+                vec.x = count > 0 ? data[0] : 0.0f;
+                vec.y = count > 1 ? data[1] : 0.0f;
+                vec.z = count > 2 ? data[2] : 0.0f;
+                vec.status = static_cast<decltype(vec.status)>(accuracy);
+                event.payload.set<Payload::Tag::vec3>(vec);
+                break;
+            }
+            default:
+                event.payload.set<Payload::Tag::scalar>(count > 0 ? data[0] : 0.0f);
+                break;
+        }
+    }
+
+    std::vector<SensorInfo> sensors_;
+    std::unique_ptr<AidlMessageQueue<Event, SynchronizedReadWrite>> events_;
+    std::shared_ptr<ISensorsCallback> callback_;
+    std::atomic<bool> running_{false};
+    // Sensors only report after activate(): pushing samples for inactive handles
+    // made the framework's event thread call through a null pointer (r136).
+    std::mutex enabledMutex_;
+    std::set<int32_t> enabled_;
+    std::atomic<bool> reported_{false};
 };
 
 // Thermal: the last HAL HardwarePropertiesManagerService needs before

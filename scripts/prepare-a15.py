@@ -1704,7 +1704,12 @@ def build_dex():
                  "AppRuntimeOptions", "GuestWebView", "AppDexCache", "GuestNetworks",
                  "GuestConnectivity", "GuestWifi", "GuestWifiChannel", "GuestDiscovery",
                  "GuestDnsResolver", "GuestOemNetd", "A15BpfMaps", "ProcessEvidence",
-                 "GuestPersistentDataBlock", "GuestWifiScanner", "A15ServiceGuard"):
+                 "GuestPersistentDataBlock", "GuestWifiScanner", "A15ServiceGuard",
+                 # Round 139 (I track): clears the write bit on a package that is about
+                 # to start. A15 refuses a dex the calling process can write, and a
+                 # package installed by the *guest's* PackageInstaller is 0644 in this
+                 # container (every guest process runs as the host app uid).
+                 "AppCodeReadOnly"):
         framework_sources.append(A15 / "vendor" / "framework" / (name + ".java"))
     missing = [str(path) for path in framework_sources if not path.is_file()]
     if missing:

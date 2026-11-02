@@ -120,7 +120,14 @@ GpuBackend::~GpuBackend() {
 
 uint32_t GpuBackend::context(uint32_t config, uint32_t share, uint32_t version) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (config >= configs_.size() || version != 2) {
+    // version 1 = the guest asked for an OpenGL ES 1.x context (its libGLESv1_CM.so).
+    // This endpoint has no GLES1 decoder, but refusing the request is worse than serving
+    // it: refusal surfaces as EGL_BAD_ALLOC and a GLSurfaceView app dies immediately
+    // (AIDA64: "rcCreateContext returned 0 (… version=1 …)" + "eglCreateContext: error
+    // 0x3003"). Serving it keeps the app alive; its GLES1 calls are dropped one at a time
+    // in DesktopDecoder::next() (separate opcode space 1024.., logged once per opcode),
+    // so the 3D view renders nothing while the rest of the app's UI works.
+    if (config >= configs_.size() || (version != 1 && version != 2)) {
         __android_log_print(ANDROID_LOG_ERROR, "A10VM_GPU", "Rejected context config=%u/%zu share=%u version=%u contexts=%zu",
                             config, configs_.size(), share, version, contexts_.size());
         return 0;

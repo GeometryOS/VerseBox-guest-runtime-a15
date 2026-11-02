@@ -1,4 +1,5 @@
 #include "DesktopDecoder.h"
+#include "DesktopTrace.h"
 #include "DesktopDisplay.h"
 #include "DesktopThread.h"
 #include "codec_defs.h"
@@ -155,7 +156,10 @@ void DesktopDecoder::initializeRC() {
             for (auto attribute : configAttributes) {
                 eglGetConfigAttrib(backend.display(), config, attribute, values);
                 if (attribute == EGL_SURFACE_TYPE) *values |= EGL_WINDOW_BIT;
-                if (attribute == EGL_RENDERABLE_TYPE || attribute == EGL_CONFORMANT) *values &= EGL_OPENGL_ES2_BIT;
+                // ES1 is served too (see GpuBackend::context): report it so an app that
+                // filters configs by EGL_OPENGL_ES_BIT still finds one.
+                if (attribute == EGL_RENDERABLE_TYPE || attribute == EGL_CONFORMANT)
+                    *values &= (EGL_OPENGL_ES_BIT | EGL_OPENGL_ES2_BIT);
                 ++values;
             }
         }
@@ -167,7 +171,7 @@ void DesktopDecoder::initializeRC() {
         for (uint32_t i = 0; i + 1 < bytes / sizeof(EGLint) && attributes[i] != EGL_NONE; i += 2) {
             if ((attributes[i] == EGL_RENDERABLE_TYPE || attributes[i] == EGL_CONFORMANT) &&
                     attributes[i + 1] != EGL_DONT_CARE &&
-                    (attributes[i + 1] & ~EGL_OPENGL_ES2_BIT)) return 0;
+                    (attributes[i + 1] & ~(EGL_OPENGL_ES_BIT | EGL_OPENGL_ES2_BIT))) return 0;
             if (attributes[i] == EGL_SURFACE_TYPE) adapted.insert(adapted.end(), {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT});
             else adapted.insert(adapted.end(), {attributes[i], attributes[i + 1]});
         }
@@ -247,6 +251,140 @@ void DesktopDecoder::initializeRC() {
     rc_.rcSetPuid = [](uint64_t) { };
 }
 
+namespace {
+uint32_t readU32(const unsigned char* data, size_t size, size_t offset) {
+    uint32_t value = 0;
+    if (offset + sizeof(value) <= size) std::memcpy(&value, data + offset, sizeof(value));
+    return value;
+}
+}
+
+// Write a reply (payload + protocol checksum) back to the guest. The GL protocol v1
+// checksum covers the reply payload and then a per-reply counter, so the host has to
+// produce it with the same calculator it validates requests with.
+bool DesktopDecoder::reply(SocketStream& stream, const void* data, size_t size) {
+    const size_t checksumSize = checksum_.checksumByteSize();
+    std::vector<unsigned char> out(size + checksumSize);
+    if (size) std::memcpy(out.data(), data, size);
+    if (checksumSize) {
+        checksum_.addBuffer(data, size);
+        checksum_.writeChecksum(out.data() + size, checksumSize);
+    }
+    return stream.writeFully(out.data(), out.size()) >= 0;
+}
+
+// GLES1 queries. Wire format (GLESv1_enc/gl_enc.cpp):
+//   get*v:   [opcode][total][pname][payloadSize][checksum]  -> payloadSize bytes + checksum
+//   geterror:[opcode][total][checksum]                      -> 4 bytes + checksum
+//   is*:     [opcode][total][arg][checksum]                 -> 1 byte + checksum
+//   tex/buf: [opcode][total][target][pname][payloadSize][checksum]
+bool DesktopDecoder::es1Query(uint32_t opcode, uint32_t bytes, SocketStream& stream) {
+    const auto u32 = [&](size_t offset) { return readU32(packet_.data(), bytes, offset); };
+    const auto payload = [&](size_t offset) {
+        size_t size = u32(offset);
+        return size > 65536 ? size_t{65536} : size;
+    };
+    std::vector<unsigned char> result;
+    switch (opcode) {
+        case 1105: {  // glGetError
+            const GLenum error = gl_.glGetError ? gl_.glGetError() : GL_NO_ERROR;
+            result.resize(sizeof(error));
+            std::memcpy(result.data(), &error, sizeof(error));
+            break;
+        }
+        case 1107: case 1034: case 1100: case 1106: {  // GetIntegerv/Floatv/Booleanv/Fixedv
+            const GLenum pname = u32(8);
+            result.assign(payload(12), 0);
+            if (opcode == 1107) { if (gl_.glGetIntegerv) gl_.glGetIntegerv(pname, reinterpret_cast<GLint*>(result.data())); }
+            else if (opcode == 1034) { if (gl_.glGetFloatv) gl_.glGetFloatv(pname, reinterpret_cast<GLfloat*>(result.data())); }
+            else if (opcode == 1100) { if (gl_.glGetBooleanv) gl_.glGetBooleanv(pname, reinterpret_cast<GLboolean*>(result.data())); }
+            else {
+                // glGetFixedv: ES2 has no fixed-point getter; answer 16.16 from GLfloat.
+                GLfloat floats[64];
+                std::memset(floats, 0, sizeof(floats));
+                if (gl_.glGetFloatv) gl_.glGetFloatv(pname, floats);
+                int32_t* fixed = reinterpret_cast<int32_t*>(result.data());
+                for (size_t i = 0; i < 64 && (i + 1) * sizeof(int32_t) <= result.size(); ++i)
+                    fixed[i] = static_cast<int32_t>(floats[i] * 65536.0f);
+            }
+            break;
+        }
+        case 1103: case 1104: {  // glGenBuffers / glGenTextures
+            const GLsizei count = static_cast<GLsizei>(u32(8));
+            result.assign(payload(12), 0);
+            GLuint* names = reinterpret_cast<GLuint*>(result.data());
+            if (opcode == 1104) { if (gl_.glGenTextures) gl_.glGenTextures(count, names); }
+            else { if (gl_.glGenBuffers) gl_.glGenBuffers(count, names); }
+            break;
+        }
+        case 1118: {  // glIsEnabled
+            const GLboolean enabled = gl_.glIsEnabled ? gl_.glIsEnabled(u32(8)) : GL_FALSE;
+            result.assign(1, enabled ? 1 : 0);
+            break;
+        }
+        case 1119: {  // glIsTexture
+            const GLboolean texture = gl_.glIsTexture
+                ? gl_.glIsTexture(static_cast<GLuint>(u32(8))) : GL_FALSE;
+            result.assign(1, texture ? 1 : 0);
+            break;
+        }
+        case 1117: {  // glIsBuffer
+            const GLboolean buffer = gl_.glIsBuffer
+                ? gl_.glIsBuffer(static_cast<GLuint>(u32(8))) : GL_FALSE;
+            result.assign(1, buffer ? 1 : 0);
+            break;
+        }
+        case 1101: case 1038: case 1114: case 1115: {  // tex/buffer parameter queries
+            const GLenum target = u32(8);
+            const GLenum pname = u32(12);
+            result.assign(payload(16), 0);
+            if (opcode == 1101) { if (gl_.glGetBufferParameteriv) gl_.glGetBufferParameteriv(target, pname, reinterpret_cast<GLint*>(result.data())); }
+            else if (opcode == 1114) { if (gl_.glGetTexParameteriv) gl_.glGetTexParameteriv(target, pname, reinterpret_cast<GLint*>(result.data())); }
+            break;
+        }
+        // Fixed-function state queries: ES2 has no equivalent getter, and these calls only
+        // need a reply of the right size. The shapes below are copied from gl_enc.cpp.
+        case 1033: case 1210: case 1209:                 // glGetClipPlanef / glGetClipPlanex{,OES}
+            result.assign(payload(12), 0);
+            break;
+        case 1035: case 1108: case 1212:                 // glGetLight{fv,xv,xvOES}
+        case 1036: case 1109: case 1213:                 // glGetMaterial{fv,xv,xvOES}
+        case 1037: case 1112: case 1113: case 1214:      // glGetTexEnv{fv,iv,xv,xvOES}
+            result.assign(payload(16), 0);
+            break;
+        case 1110: {  // glGetPointerv: client arrays live in the guest
+            result.assign(payload(12), 0);
+            break;
+        }
+        case 1185: {  // glFinishRoundTrip: [op][total][checksum] -> 4 bytes + checksum
+            // Measured with the host trace (instance 1793525278509, round 147):
+            //   desktop_gpu_skip opcode=1025 bytes=32 decoded=0   (glClearColor, one-way)
+            //   desktop_gpu_skip opcode=1185 bytes=16 decoded=0   (glFinishRoundTrip, reply!)
+            // Skipping 1185 left the guest blocked in readback and produced
+            // "GL receive: Try again" -> abort(134).
+            if (gl_.glFinish) gl_.glFinish();
+            result.assign(4, 0);
+            break;
+        }
+        default:
+            return false;
+    }
+    // Every incoming packet carries one checksum counter tick, including the ones this
+    // endpoint answers itself instead of decoding. The generated decoders advance that
+    // counter through validate(); a query answered here has to do the same or the next
+    // decoded packet compares against a stale counter. Measured consequence without this
+    // (instance 1793525278509, round 147):
+    //   desktop_gpu_es1_query opcode=1185 size=4
+    //   desktop_gpu_client_error ... OP_rcSetWindowColorBuffer: GL checksumCalculator failure
+    const size_t requestChecksum = checksum_.checksumByteSize();
+    if (requestChecksum && packet_.size() >= 8 + requestChecksum)
+        checksum_.validate(packet_.data() + 8, requestChecksum);
+    if (answered_.insert(opcode).second)
+        desktop_gpu_trace("desktop_gpu_es1_query opcode=%u size=%zu\n", opcode, result.size());
+    reply(stream, result.data(), result.size());
+    return true;
+}
+
 bool DesktopDecoder::next(SocketStream& stream) {
     current_ = this;
     uint32_t header[2];
@@ -260,6 +398,13 @@ bool DesktopDecoder::next(SocketStream& stream) {
     auto& packet = packet_;
     std::memcpy(packet.data(), header, sizeof(header));
     stream.readFully(packet.data() + 8, packet.size() - 8);
+    // GLES1 queries first: they need a reply, and the GLES2 decoder cannot produce one
+    // for an ES1 opcode.
+    if (header[0] < 10000 && es1Query(header[0], static_cast<uint32_t>(packet.size()), stream)) {
+        previousOpcode_ = header[0];
+        previousBytes_ = header[1];
+        return true;
+    }
     size_t decoded;
     try {
         decoded = header[0] >= 10000 && header[0] < 11000
@@ -271,7 +416,37 @@ bool DesktopDecoder::next(SocketStream& stream) {
         throw std::runtime_error("Desktop GPU missing handle " + std::to_string(handle) +
                                  " for opcode " + std::to_string(header[0]));
     }
-    if (decoded != packet.size()) throw std::runtime_error("Unsupported desktop GPU opcode " + std::to_string(header[0]));
+    if (decoded != packet.size()) {
+        // A packet this endpoint cannot decode must not end the session. The protocol is
+        // length-prefixed and the whole packet has already been read in (readFully above),
+        // so dropping it keeps the stream aligned and only this one call is lost.
+        //
+        // The concrete case is GLES1: the guest's libGLESv1_CM.so encodes a *separate*
+        // opcode space (gl_opcodes.h: 1024..1317) that this desktop endpoint has no
+        // decoder for, while GLES2 starts at 2048 (gl2_opcodes.h). Throwing here is what
+        // let a single unknown call take the whole virtual machine down:
+        //   application-…-49.log: "Unsupported desktop GPU opcode 1025"
+        //   session-state.log: state=ERROR            (round 131, AIDA64)
+        // renderControl (>= 10000) stays fatal: a failure there means a broken handle.
+        if (header[0] >= 10000)
+            throw std::runtime_error("Unsupported desktop GPU opcode " + std::to_string(header[0]));
+        // Keep the checksum counter in step. GL protocol v1 stores "reversed argument
+        // length + packet counter" after the 8-byte header, and the decoder advances that
+        // counter once per validated packet. A skipped packet never reaches the generated
+        // validate() call, so every later packet would compare against a stale counter and
+        // die with "GL checksumCalculator failure" - exactly how the first ES1 attempt
+        // ended (session-state.log: state=ERROR / OP_rcGetGLString checksum failure).
+        // The result is deliberately ignored here: this call advances the counter and
+        // resets the per-packet length, which is all the next packet needs.
+        const size_t checksumSize = checksum_.checksumByteSize();
+        if (decoded == 0 && checksumSize && packet.size() >= 8 + checksumSize)
+            checksum_.validate(packet.data() + 8, checksumSize);
+        if (skipped_.insert(header[0]).second)
+            desktop_gpu_trace("desktop_gpu_skip opcode=%u bytes=%u decoded=%zu\n", header[0], header[1], decoded);
+        previousOpcode_ = header[0];
+        previousBytes_ = header[1];
+        return true;
+    }
     previousOpcode_ = header[0];
     previousBytes_ = header[1];
     return true;

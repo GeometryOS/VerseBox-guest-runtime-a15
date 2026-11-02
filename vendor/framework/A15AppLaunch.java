@@ -122,6 +122,18 @@ final class A15AppLaunch {
                         + error.getClass().getSimpleName());
             }
         }
+        // Android 15 refuses to load a dex file the calling process may write
+        // (AppCodeReadOnly quotes the exception). A package installed by the guest's
+        // own PackageInstaller is 0644 and therefore writable by the guest, because
+        // this container runs every guest process as the host app uid. Fix the package
+        // that is about to start, so installing inside Android 15 no longer needs a
+        // virtual-machine restart before the app can be opened.
+        int readOnly = 0;
+        try {
+            readOnly = AppCodeReadOnly.apply(state, name);
+        } catch (Throwable failure) {
+            System.out.println("a15_application_readonly_failed=" + name + ":" + failure);
+        }
         Process child = builder.start();
         int pid = pid(child);
         int guestUid = uid == null ? 0 : Integer.parseInt(uid);
@@ -132,6 +144,7 @@ final class A15AppLaunch {
         A15Boot.noteGuestProcess(pid, guestUid);
         System.out.println("a15_application_launch=" + pid + ":" + name
                 + " uid=" + guestUid
+                + " readonly=" + readOnly
                 + " spawn_ms=" + (SystemClock.elapsedRealtimeNanos() - started) / 1000000);
         watch(name, pid, child);
         return child;

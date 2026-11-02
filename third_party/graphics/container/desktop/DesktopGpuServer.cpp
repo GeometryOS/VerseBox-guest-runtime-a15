@@ -15,8 +15,40 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "DesktopTrace.h"
+
+namespace {
+FILE* traceFile = nullptr;
+}
+
+void desktop_gpu_trace_path(const char* socketPath) {
+    if (!socketPath || traceFile) return;
+    std::string path(socketPath);
+    const auto slash = path.find_last_of('/');
+    if (slash != std::string::npos) path.resize(slash + 1);
+    path += "gpu-host.log";
+    traceFile = fopen(path.c_str(), "a");
+}
+
+void desktop_gpu_trace(const char* format, ...) {
+    char buffer[1024];
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    if (written <= 0) return;
+    if (written >= (int)sizeof(buffer)) written = sizeof(buffer) - 1;
+    fwrite(buffer, 1, (size_t)written, stderr);
+    fflush(stderr);
+    if (traceFile) {
+        fwrite(buffer, 1, (size_t)written, traceFile);
+        fflush(traceFile);
+    }
+}
+
 DesktopGpuServer::DesktopGpuServer(const std::string& path) : path_(path) {
     listener_ = listenLocal(path_);
+    desktop_gpu_trace_path(path_.c_str());
     if (chmod(path_.c_str(), 0600) < 0) {
         close(listener_);
         unlink(path_.c_str());
@@ -200,10 +232,16 @@ void DesktopGpuServer::client(int fd, pid_t process, int processDescriptor) {
         const bool truncated = reason == "Truncated GL stream" ||
                                reason == "Unexpected GL EOF";
         if (truncated) {
-            std::fprintf(stderr, "desktop_gpu_client_closed pid=%d reason=%s\n",
-                         int(process), reason.c_str());
+            desktop_gpu_trace("desktop_gpu_client_closed pid=%d reason=%s\n", int(process), reason.c_str());
         } else if (!dead && !disconnected) {
-            fail(error);
+            // A decoder error belongs to *this* client's stream, not to the GPU server.
+            // Failing the server here is what turned one bad packet into a whole-VM stop:
+            //   session-state.log: state=ERROR / "Unsupported desktop GPU opcode 1025"
+            //   session-state.log: state=ERROR / "OP_rcGetGLString: GL checksumCalculator failure"
+            // (r131 and r141, same shape). Close this connection, keep every other
+            // process's GL alive, and leave the cause on one line so the next round can
+            // still see it. Server-level failures (poll/accept) keep going through fail().
+            desktop_gpu_trace("desktop_gpu_client_error pid=%d reason=%s\n", int(process), reason.c_str());
         }
     }
     backend_.makeCurrent(0, 0, 0);

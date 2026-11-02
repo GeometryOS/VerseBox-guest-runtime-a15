@@ -1,5 +1,231 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
+## 当前状态（2026-11-02 15:0x，r148：AIDA64 可进主界面并交互 —— 真机已验证，3D 页仍空白）
+
+- **判据（实例 1793525278509，14:59:18 启动，用户操作 + 日志双证）**：
+  - `ActivityTaskManager: Displayed com.finalwire.aida64/.HHPageDetailActivity for user 0: +157ms`
+    （能进主界面，还能点进详情页）；
+  - `a15_application_exit=.*aida64` 在 server log 里 **0 行**；
+  - 本次会话的 `application-*.log` 里 `GL receive` **0 个文件**；
+  - `session-state.log` = `state=RUNNING`；
+  - 宿主 `native-window/gpu-host.log` 本轮尾部：
+    `desktop_gpu_skip opcode=1025 bytes=32` → `desktop_gpu_es1_query opcode=1185 size=4`，
+    **后面没有 `desktop_gpu_client_error`**（前几轮同一位置都是 `OP_rcSetWindowColorBuffer: GL checksumCalculator failure`）。
+
+- **这条轨解决的三层（按发现顺序，都是实测）**：
+  1. GPU 端点其实不是 `desktop-gpu-host`，而是 app 侧 `liba10vm-desktop-window.so`（r141）；
+  2. ES1 上下文被拒 → `EGL_BAD_ALLOC`；解开后 GLESv1 的**带返回值的调用**必须回包，
+     否则客体 `readback` 等不到 → `GL receive: Try again` → `code=134`（r144/r145）；
+  3. 每个进来的包都占一个**校验和计数**：跳过要补、自己应答的查询也要补，
+     否则下一个包（实测是 `rcSetWindowColorBuffer`）校验失败（r147 的宿主日志定位，r148 修）。
+
+- **产物**：window 库 **6,812,176 B** /
+  `d605dcb3bb672b47d5c7bf258c22e6c2f9a8883c4670d7966f6d7e83781b3dd9`；
+  APK **1,979,819,845 B** / `b0de3cbf8429c1cca8d66d3914f57ca76c58a51498e605ae2cc722c28573a568`，
+  装机 Success。已实现 GLESv1 回包 opcode：1033/1034/1035/1036/1037/1038/1100/1101/1103/1104/
+  1105/1106/1107/1108/1109/1110/1112/1113/1114/1115/1117/1118/1119/1185/1209/1210/1212/1213/1214。
+
+- **边界（不要写成「GLES1 已实现」）**：绘制类 GLESv1 调用仍然被跳过，AIDA64 的 3D 图形页是空白；
+  要渲染必须实现宿主侧 GLESv1 绘制解码（294 个入口），另开轨。
+
+- **新增观测手段（以后先看这里）**：宿主端点的 trace 落盘到
+  `<实例>/native-window/gpu-host.log`（`desktop_gpu_skip` / `desktop_gpu_es1_query` /
+  `desktop_gpu_client_error`），app 进程的 stderr 用 adb 读不到——前几轮「宿主没日志」就是因为这个。
+## 当前状态（2026-11-02 15:4x，r145：给 GLESv1 查询回包 —— 已被 r148 取代）
+
+- **r144 的断点**：AIDA64 已经 `Displayed com.finalwire.aida64/.HHMainActivity +1s556ms`，随后
+  `libc++abi: terminating … NSt3__112system_errorE: GL receive: Try again` → `code=134`。
+  原因：GLESv1 **带回包的查询**（glGetIntegerv / glGetError / glIsEnabled …）被当未知 opcode 跳过，
+  宿主不回包 → 客体 `readback` 等不到 → EAGAIN → abort。
+- **r145 改动（仍只有一条轨：AIDA64/GLES1，宿主端点）**：
+  `DesktopDecoder` 在通用跳过之前先走 `es1Query()`，按 `GLESv1_enc/gl_enc.cpp` 的线格式回包：
+  `get*v` = `[opcode][total][pname][payloadSize][checksum]` → 回 `payloadSize` 字节 + 协议校验和；
+  `glGetError` → 回 4 字节；`glIsEnabled`/`glIsTexture` → 回 1 字节；
+  `glGetTexParameter*`/`glGetBufferParameteriv`/`glGetPointerv` → 回同尺寸零值；
+  回包校验和用与校验请求同一个 `ChecksumCalculator`（`addBuffer` + `writeChecksum`）生成。
+  已实现 opcode：1034/1038/1100/1101/1105/1106/1107/1110/1114/1115/1118/1119。
+  **绘制类仍然跳过**（GLES1 解码未实现），3D 图形页仍会空白。
+- **产物**：window 库 **6,804,200 B** /
+  `04088575eaca68c3b8de950d662a2ba8208d02c179603a91346339b75494f3e4`（含 `desktop_gpu_es1_query`）；
+  APK **1,979,819,845 B** / `e0f151665ba28825d1b344cf9bee458a8de847a8a4cbbe134a12006c77586f3b`，
+  装机 Success。
+- **判据（下一次真机）**：① `application-<server>-*.log` 不再出现 `GL receive: Try again`、
+  `code=134` 归零；② AIDA64 主界面可交互、不再卡死后退出；③ `state=RUNNING`；
+  ④ 宿主侧若能看到 stderr，会出现 `desktop_gpu_es1_query opcode=…`（每个 opcode 一行）。
+- **不要重试**：不要再把「GLES1 绘制解码」和「查询回包」捆在一版（本轮只做回包）。
+## 当前状态（2026-11-02 15:2x，r144：AIDA64 已经能进主界面，随后因「GLES1 查询没有回包」abort）
+
+- **r144 结果（真机，用户操作 + 日志双证）**：AIDA64 **能显示主界面**：
+  `ActivityTaskManager: Displayed com.finalwire.aida64/.HHMainActivity for user 0: +1s556ms`；
+  随后 `Activity top resumed state loss timeout` → `Process com.finalwire.aida64 (pid 9379) has died`、
+  `a15_application_exit=9379:com.finalwire.aida64 code=134`（SIGABRT）。
+  同一会话 `session-state.log` = **state=RUNNING**（VM 没被带走，r143 的隔离层成立）。
+- **abort 的直接原因（应用日志原文）**：
+  `libc++abi: terminating due to uncaught exception of type NSt3__112system_errorE: GL receive: Try again`。
+  即：客体的 GL 客户端在等一个**回包**（GLESv1 的查询调用，如 glGetIntegerv/glGetString/glGetError），
+  宿主这边把该包当未知 opcode 跳过、没有回包，客户端读不到 → EAGAIN → 未捕获异常 → abort。
+- **本轮改动（一条轨：AIDA64/GLES1）**：`GpuBackend::context()` 接受 `version==1`；
+  `DesktopDecoder` 跳过 GLES1 包时同步校验和计数器（`checksum_.validate(...)` 只推进、忽略结果）；
+  r143 的「解码错误只关一个客户端」保留作兜底。窗口库 **6,798,680 B** /
+  `4f1049f7d763a730003f9003fd5eb253cfa70f481f10ca01beff2d376cd97de2`；
+  APK **1,979,819,845 B** / `9f87da0f6e1d0e9e5a05a57b827359aeae4bd270bb9406eb35b21eef3d624d95`。
+- **下一步（唯一动作）**：给 GLESv1 **带回包的查询调用**实现回包。
+  范围（从 `GLESv1_enc/gl_enc.cpp` 的 `stream->readback()` 点统计）：
+  `glGetError`/`glGetIntegerv`/`glGetFloatv`/`glGetBooleanv`/`glGetFixedv`/`glGetString`/
+  `glGetPointerv`/`glIsEnabled`/`glIsTexture`/`glGetTexParameter*`/`glGetBufferParameteriv` 等；
+  其余绘制类继续跳过。**没有回包就没有 ES1 应用能跑**（这是本轮证明的）。
+- **不要重试**：① 不要再在「跳过 GLES1 包」时不回包；② 不要用「让 AIDA64 拿 ES2 上下文」绕
+  （r131 已证伪）；③ 不要把「绘制类解码」和「查询回包」捆在同一版里——先只让查询回包，
+  判据是 `Displayed` 之后不再出现 `GL receive: Try again`。
+## 当前状态（2026-11-02 15:0x，r142 回滚 + r143 只做「解码错误不外溢」，AIDA64 仍会崩、VM 必须活着）
+
+- **r141 失败的真因（原文）**：`session-state.log`（14:20:21）`state=ERROR` +
+  `renderControl_decoder_context_t::decode, OP_rcGetGLString: GL checksumCalculator failure`。
+  即：接受 ES1 之后，GLES1 包被跳过（没有喂 checksum），下一个带校验和的 `rcGetGLString` 比对失败，
+  `DesktopGpuServer::client()` 走 `fail(error)` → 整个 GPU 端点判死 → **整机被带走**（r131 同型）。
+- **r142 = 回滚**：`liba10vm-desktop-window.so` 换回从 `_bin/A10VM.apk` 解包的旧库
+  （6,806,024 B / `41a723ad…`），manifest 同步；APK `578d3c76…`，装机 Success。
+  `GpuBackend::context()` 也回退为 `version != 2` 拒绝 ES1。
+- **r143 = 只加一层隔离（本轮唯一行为改动）**：`DesktopGpuServer::client()` 里，解码器异常
+  不再 `fail(error)`（整机），改为**只关掉这一个客户端的连接**并打印一行
+  `desktop_gpu_client_error pid=… reason=…`；poll/accept 这类服务器级错误仍走 `fail()`。
+  这样即使还有别的解码错误，代价也只是那一个应用的 GL 死掉，不再是整台 VM。
+- **r143 产物**：window 库 **6,798,584 B** / `b9821e6e90da12a1d1ed1bbfacddc17f97eb1185d193555c794072b8dfdad285`，
+  含 `desktop_gpu_client_error` 与 `desktop_gpu_skip` 标记；APK **1,979,819,845 B** /
+  `1ec330050dfc2a0b094d9ca327053449d059633c7cf745e99ccdf4f4299f2198`，装机 Success；
+  设备上 window 库 6,798,584 B（已核对）。**ES1 仍然拒绝**（这一步故意不动 `GpuBackend`）。
+- **本步判据（只验这一条）**：虚拟机启动、桌面正常出画、触摸可用；打开 AIDA64 仍会闪退
+  （预期，因为 ES1 仍被拒），但 `session-state.log` 必须仍是 `state=RUNNING`。
+- **下一步（等本步判据成立后再做）**：r144 = 打开 ES1 + 关掉宿主侧 checksum 校验
+  （`checksum_.setVersion(0)`，避免跳过包导致后续包校验失败）+ 跳过 GLES1 包；
+  那时 AIDA64 才应该进主界面（3D 页仍空白，GLES1 解码未实现）。
+- **不要重试**：① 不要再一次把「换库 + 接受 ES1 + 跳过 opcode」捆在一版里；
+  ② 不要在跳过 GLES1 包时保持 checksum 校验（r141 就是这么把 VM 打死的）；
+  ③ 不要在没确认 `desktop_gpu_client_error` 这层隔离生效前就开 ES1。
+## 当前状态（2026-11-02 14:5x，r141：真正的 GPU 端点是 liba10vm-desktop-window.so；**已被 r142 回滚**）
+
+> **r140 已被现场证伪**：用户 14:06 复现的 AIDA64 仍是 `rcCreateContext returned 0 (version=1)`
+> + `EGL_BAD_ALLOC`（`application-14431-51.log`）⇒ r140 编的 `desktop-gpu-host` 没有参与运行。
+> 更正见本节；r140 段落保留作历史。
+
+- **运行路径的真身**：桌面会话由 app 传入 `<instance>/native-window/gpu.sock`
+  （`NativeGraphicsSession.start()` 第 105 行），端点由 `NativeWindow`/`WindowBridge` 提供，
+  即 **`liba10vm-desktop-window.so`**（源码 = `third_party/graphics/container/window/WindowJni.cpp`
+  + `desktop/*`；构建行见 `container/build-desktop-host.sh` 第 44–50 行）。
+  `FrameworkSession.startDesktop()` 只在 `externalGraphics == null` 时才 spawn `desktop-gpu-host`，
+  所以 **r120/r121/r140 对 `desktop/*` 的宿主侧改动从未进入真机运行路径**。
+- **旧库证据**：线上 `liba10vm-desktop-window.so` 从 `_bin/A10VM.apk` 解包（`runtime-inputs/native-display/`，
+  6,806,024 B / 2026-10-22），含 `Rejected context`、`Truncated GL`，**不含** r120 的
+  `desktop_gpu_client_closed` ⇒ r120 的 truncated 流修复同样没上线。
+- **本轮唯一改动（AIDA64/GLES1 轨）**：用本仓库 `guest-runtime-a15/third_party/graphics/container`
+  （含 r120 + r140 的 ES1 接受 / 未知 opcode 跳过）重编 `liba10vm-desktop-window.so`：
+  **6,798,816 B** / `dc0626537348172bc1d2c1d119255693252472fea0d19513e2ac1b0233ce251b`，
+  13 个 `Java_io_a10vm_nativedisplay_WindowBridge_*` 与旧库逐一齐全，含 `desktop_gpu_skip` 标记；
+  按 `-PnativeDisplayPrepared=native-display/build/prepared` 打包（manifest 的 sha/bytes 按新库重算）。
+- **产物**：APK **1,979,819,845 B** / `3b6f699f86da1325cc3d0dcecba1b48585df9ead18a39667ba007f0c555c72d6`，
+  14:4x `adb install -r -d` Success；APK 内 window 库 6,798,816 B、manifest 622 B（逐项核对）。
+- **状态：已构建、已装机、未真机验证。** 判据：① 桌面显示与触摸正常；② 宿主侧
+  `desktop_gpu_context guest_version=1 host_version=…` 与 `desktop_gpu_skip opcode=1025` 出现；
+  ③ `application-<server>-*.log` 里 `EGL_BAD_ALLOC` 0 行；④ `Displayed com.finalwire.aida64/…` + `state=RUNNING`。
+- **风险/回滚**：这是 GPU 呈现链替换，失败表现为黑屏/起不来。旧库 `_bin/a15/scratch/liba10vm-desktop-window.so`
+  （6,806,024 B）可直接换回 `runtime-inputs/native-display/jniLibs/arm64-v8a/`，manifest sha 改回
+  `41a723ad…/6806024`，`assembleDebug`（不带 `-PnativeDisplayPrepared`）后装机。
+- **CI 缺口（下一步必须补）**：CI 从 `_bin/A10VM.apk` 解包，不构建 window 库 ⇒ CI 产物里的 window 库
+  不是我们装的这个。要把 window 构建并进 `scripts/build.sh`/`bridges/build-*.sh` 与 workflow，
+  否则「CI 绿」不代表该修复在。
+## 当前状态（2026-11-02 14:0x，r140：AIDA64 的 ES1 上下文与未知 GL opcode，已被 r141 更正——不是运行路径）
+
+- **AIDA64 闪退的两处代码级根因都在宿主 GPU 端点上，本轮各改一处（同一条轨）：**
+  1. `GpuBackend::context()` 只接受 `version == 2`，AIDA64 请求的是 **ES1**，于是 `rcCreateContext` 返回 0
+     → 客体 EGL 报 `EGL_BAD_ALLOC` → `GLSurfaceView` FATAL（本轮原文：`application-29608-66.log:278`
+     `rcCreateContext returned 0 (config=38 numConfigs=72 version=1 maxVersion=0 share=0)`、
+     `:279 eglCreateContext(1649): error 0x3003 (EGL_BAD_ALLOC)`、`:282 createContext failed`）；
+  2. 硬给 ES2 上下文也不行：它的第一个 GL 调用是 GLESv1 编码器的 `OP_glClearColor = 1025`，
+     `DesktopDecoder` 只有 GLES2 解码（2048 起），未知 opcode 会 `throw` 把 GPU 端点打死、
+     `session-state.log` 变 `state=ERROR`（r131 实测，整台 VM 被带走）。
+- **改法**：`context()` 接受 `version==1`（宿主仍建 ES2/ES3 上下文）；`DesktopDecoder` 对解不了的
+  **GL** opcode（<10000）改成「每个 opcode 记一次 `desktop_gpu_skip` + 跳过」——协议是长度前缀、
+  `readFully` 已把整包读掉，跳过不会让流错位；renderControl（>=10000，句柄错）仍保持 fatal。
+  另把 `RENDERABLE_TYPE/CONFORMANT` 与 `rcChooseConfig` 的掩码放宽到 `EGL_OPENGL_ES_BIT`。
+- **边界（必须写清）**：宿主没有 GLES1 解码器（goldfish `GLESv1_dec` 不在仓库，`a9/definitions` 只有
+  `gl2.attrib`），所以 GLES1 调用全部被跳过 → **AIDA64 的 3D 图形页会空白**，其余界面可用。
+  这是把「闪退 + 可能带走整机」降级成「界面可用、3D 不渲染」，**不是「已实现 GLES1」**。
+- **构建**：本机没有 sh/bash，按 `scripts/build-desktop-host.sh` 同一 NDK 29 / flags / 源清单用 clang++ 重编；
+  `bridges/bin/desktop-gpu-host` = **6,466,336 B**（上一版 6,463,584 B），ELF64/AArch64/DYN，
+  二进制内含 `desktop_gpu_skip`、`desktop_gpu_context guest_version` 两个新标记（python 逐字节确认）；
+  prepare 后 `prepared/jniLibs/arm64-v8a/liba15vm-desktop-gpu-host.so` 同字节数。
+- **产物**：APK **1,979,819,845 B** /
+  `407F48466ACCDD6C3357DE08754045ACC4131193226BBCDF8173682EA87F442A`（13:59:04），
+  14:0x `adb install -r -d` Success。
+- **状态：已构建、已装机、未真机验证。** 判据：`application-<server>-*.log` 里 `EGL_BAD_ALLOC` 0 行；
+  宿主日志出现 `desktop_gpu_context guest_version=1` 与 `desktop_gpu_skip opcode=1025`；
+  `Displayed com.finalwire.aida64/…` 出现且没有 `app died, no saved state`；`state=RUNNING`。
+- **不要重试**：不要再用「让 AIDA64 拿到 ES2 上下文」当修复（r131 已证伪：第一个 GLES1 调用就带走整机）；
+  本次的区别是把未知 opcode 同时改成跳过。
+## 当前状态（2026-11-02 13:5x，r139：客体自己装的 APK 不再需要重启虚拟机，真机已验证）
+
+- **I 轨（应用安装/启动）里用户报的那条已闭环**：虚拟机内用系统「软件包安装程序」
+  装完 APK → 直接点打开 → 闪退 → 必须重启虚拟机才能用。
+  - **根因（同机原文，上一次会话 13:09，实例 1793525278509，server pid 25306）**：
+    `application-25306-49.log`：
+    ```text
+    java.lang.SecurityException: Writable dex file
+      '/data/app/~~zovRBuKivdCgkiH2h1N7sg==/com.huawei.appmarket-2N1dvGBG6IMmfp_kziYFiA==/base.apk'
+      is not allowed.
+      at dalvik.system.DexFile.openDexFileNative(Native Method)
+      … at android.app.LoadedApk.getClassLoader(LoadedApk.java:1134)
+      … at android.app.ActivityThread.handleBindApplication(ActivityThread.java:7575)
+    ```
+    该 APK 装出来是 **0644**：`stat` 显示安装 mtime 13:09:36、chmod ctime **13:10:54**
+    —— 也就是说写位是宿主侧 `makeDataApksReadOnly()` 在**切前后台**时才清掉的，安装那一刻没人清。
+    容器里 `/data/app` 的属主就是宿主 App 的 uid，客体进程也用同一个 uid，于是"属主可写"
+    命中 A14+ 的 dex 检查。**"必须重启虚拟机"也由此得到解释**：只有下一次会话的
+    `setDisplayInteractive()` 才会再清一次写位。
+  - **修法（只改 A15 域：1 个新类 + 1 处调用 + prepare 源表 1 行）**：
+    新增 `vendor/framework/AppCodeReadOnly.java`，在**每个应用进程启动之前**把该包在
+    `<vm>/rootfs/data/app` 下的普通文件写位清掉（0644→0444、0755→0555、0600→0400）；
+    `A15AppLaunch.start()` 在 `ProcessBuilder.start()` 之前调用它，结果写进启动行
+    `readonly=<n>`。只清**文件**、不动目录：替换/升级仍靠目录内 rename，与真机
+    "root 属主 0644、应用不可写"等价；属主改不了（容器不是 root），所以复现的是**性质**。
+  - **真机判据（2026-11-02 13:5x，同一实例 1793525278509，13:45:44 启动，server pid 29608）**：
+    - 客体安装器确实在跑：`Displayed com.android.packageinstaller/.InstallStaging`、
+      `/.PackageInstallerActivity`、`/.InstallInstalling`、`/.InstallSuccess`；
+    - `a15_application_launch=32174:com.huawei.appmarket uid=10103 readonly=11 spawn_ms=2`
+      （启动前当场清了 11 个文件）；
+    - 该会话 `application-29608-*.log` 里 `Writable dex file` **0 个文件**；
+    - `Displayed com.huawei.appmarket/.MainActivity for user 0: +528ms`、
+      `Displayed com.huawei.appmarket/.MarketActivity for user 0: +183ms`；
+      `a15_application_exit=32174` **0 行**（进程没死）；
+    - 新包 `~~Y-ZuQYrQWiLzpkVE10BueQ==/com.huawei.appmarket-ba8YKjcwTUAJ9d13kkdPnQ==/base.apk`
+      现为 `-r--r--r--`。
+  - **产物**：APK **1,979,819,845 B** /
+    `9419DB3D3BA5BC778C20A44DE7A8528DEC85C69B7C2E25082B1D975192C34C31`（13:42:23 构建），
+    13:4x `adb install -r -d` Success；`framework-check.dex` 163,696 → **164,744 B**
+    （含 `AppCodeReadOnly`）。
+  - **仍未验 / 另开轨**：① 走**宿主导入**（`importApk`/`installApks`）的包（旧路径本来就有
+    `makeDataApksReadOnly()`，本轮没动它）；② 桌面图标当场刷新（`PACKAGE_ADDED` = 0 行的老问题）。
+  - **不要重试**：不要再把"清 /data/app 写位"只挂在"commit 成功"或"切前后台"上——那覆盖不了
+    客体自己装的包，正是本轮之前的形态。
+
+## 当前状态（2026-11-02 12:5x，r138：传感器尝试被真机证伪并回退）
+
+- **传感器：真实 AIDL ISensors 已经能报出 23 个传感器，但 sensorservice 在事件线程
+  崩溃，已回退到 NoSensors 恢复开机。**
+  - 做了什么：`HostDevicesA15.cpp` 新增 `HostSensors`（读宿主 `sensors.sock` 列表，
+    `initialize` 收下 `AidlMessageQueue<Event, SynchronizedReadWrite>` 并起线程写事件）；
+    补了 r36 缺失的 `vendor/fmq/include/fmq/MQDescriptorBase.h`，libfmq 的 NDK
+    编译闭包打通；`build-host-hal.sh` 链接镜像的 `libfmq.so`。
+  - 真机（r136，实例 1793525278509，12:45）：`a15_sensors_list=count=23`、
+    `a15_sensors_initialize=ok count=23`、`a15_sensors_getList=23`，
+    随后 `framework-sensorservice.log`：
+    `A9VM bdev crash sig=11 code=1 fault=0x0 rawpc=0x0`（在
+    `nuSensorService thread starting...` 之后），整机停在开机动画。
+  - r137 假设“未激活就推样本导致”被证伪：改成只在 `activate()` 后推事件，
+    **同样卡开机**。
+  - r138：注册回退为 `NoSensors`（`HostSensors` 代码保留但未注册），开机恢复。
+    **在拿到 sensorservice 的 `sig=11` 栈之前，不要再注册 `HostSensors`。**
+  - 观测缺口与设备信息一致：guest 没有 tombstoned/debuggerd 产出可符号化的栈。
+
 ## 当前状态（2026-11-02 12:0x，r135：音频出声，真机已验证）
 
 - **音频主链路已打通（用户实测“有声音了”）**：镜像的静音 stub
@@ -26,6 +252,14 @@
 - 产物：APK 1,979,819,845 B / `3B78CBCC…`（11:54 构建，11:55 装机 Success）。
 - 仍红：传感器 0、设备信息 `134/139`、AIDA64（GLES1，见下）、GPU 端点对未知
   opcode 会整机退出（`Unsupported desktop GPU opcode`）。
+- **传感器的实现路径已定（下一步）**：A15 只认 AIDL `ISensors` + 事件 FMQ，
+  A10 的 HIDL `poll()` 方案在 A15 不会被调用。`HostDevicesA15.cpp` 里是
+  `NoSensors`（`getSensorsList count=0`），镜像已有 `libfmq.so` /
+  `android.hardware.common.fmq-V1-ndk.so` / `sensors-V3-ndk.so`，宿主数据源是
+  `<state>/sensors.sock`（协议同 A10）。**唯一 blocker 是 libfmq 的 NDK 头**：
+  r36 的 `AidlMQDescriptorShim.h` 仍引用 `fmq/MQDescriptorBase.h`，而 r36 已不提供；
+  打通这个编译闭包前不要动 `NoSensors`（半成品会把 sensorservice 带崩）。细节见
+  `docs/android15-port/日用修复/06-传感器/README.md` §0。
 
 ## 当前状态（2026-11-02 11:4x，r132：图库绿、AIDA64 回退到“只诊断”）
 

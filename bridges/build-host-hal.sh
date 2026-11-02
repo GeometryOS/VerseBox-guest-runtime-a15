@@ -102,20 +102,26 @@ builtins=$(clang --target=$TARGET --print-libgcc-file-name)
 #    ships the C API (binder_ibinder.h / binder_parcel.h / binder_status.h), the
 #    C++ ndk:: wrappers and the servicemanager/process entry points are platform
 #    headers. They are vendored with hashes for that reason.
+# vendor/fmq/include carries the libfmq headers plus the minimal
+# fmq/MQDescriptorBase.h that r36 no longer ships (sensor event FMQ).
+platform_compile "$MODULE/vendor/native/HostDeviceTransport.cpp" "$OBJ/host-device-transport.o" \
+    -I"$MODULE/vendor/native"
 platform_compile "$MODULE/vendor/native/HostDevicesA15.cpp" "$OBJ/host-devices-a15.o" \
-    -I"$AIDL_OUT" -I"$NDK_HDR/include_ndk" -I"$NDK_HDR/include_cpp" -I"$NDK_HDR/include_platform"
+    -I"$AIDL_OUT" -I"$NDK_HDR/include_ndk" -I"$NDK_HDR/include_cpp" -I"$NDK_HDR/include_platform" \
+    -I"$MODULE/vendor/fmq/include"
 
 # 3. Link as a guest PIE against the ROM's binder/AIDL libraries. Everything it
 #    needs at run time lives in the instance's vm/lib (the image libraries are
 #    staged there with their real sonames).
 ld.lld -pie -e _start -dynamic-linker /system/bin/linker64 \
     -z now -z relro -z max-page-size=4096 --no-undefined --exclude-libs ALL \
-    "$OUT/obj/crt/crtbegin.o" "$OBJ/host-devices-a15.o" \
+    "$OUT/obj/crt/crtbegin.o" "$OBJ/host-devices-a15.o" "$OBJ/host-device-transport.o" \
     "$IMG/libbinder_ndk.so" "$IMG/android.hardware.vibrator-V3-ndk.so" \
     "$IMG/android.hardware.sensors-V3-ndk.so" \
     "$IMG/android.hardware.thermal-V3-ndk.so" \
     "$IMG/android.hardware.common-V2-ndk.so" "$IMG/android.hardware.common.fmq-V1-ndk.so" \
     "$IMG/libbase.so" "$IMG/liblog.so" "$IMG/libutils.so" "$IMG/libcutils.so" \
+    "$IMG/libfmq.so" \
     "$LIBCXX" "$LIBC" "$LIBM" "$LIBDL" "$LINKER" "$builtins" \
     "$OUT/obj/crt/crtend.o" -o "$OUT/bin/host-devices"
 llvm-readelf -hlWd "$OUT/bin/host-devices" > "$OUT/bin/host-devices.elf.txt"
