@@ -1,0 +1,59 @@
+diff --git a/encoder/GL2Encoder.cpp b/encoder/GL2Encoder.cpp
+--- a/encoder/GL2Encoder.cpp
++++ b/encoder/GL2Encoder.cpp
+@@ -66,6 +66,19 @@
+         ctx->setError(err);   \
+         return ret; \
+     } \
+ 
++#define GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type) \
++    if ((ctx)->m_state->currentIndexVbo() == 0 && (count) > 0 && (indices) == NULL) { \
++        ALOGE("glDrawElements: null client index pointer with no element buffer bound " \
++              "(count=%d type=0x%x vao=%u ibo=%u lastEncoded=%u); GL_INVALID_OPERATION", \
++              (int)(count), (unsigned)(type), \
++              (unsigned)(ctx)->m_state->currentVertexArrayObject(), \
++              (unsigned)(ctx)->m_state->currentIndexVbo(), \
++              (unsigned)(ctx)->m_state->getLastEncodedBufferBind(GL_ELEMENT_ARRAY_BUFFER)); \
++        (ctx)->setError(GL_INVALID_OPERATION); \
++        return; \
++    }
++
+ GL2Encoder::GL2Encoder(IOStream *stream, ChecksumCalculator *protocol)
+         : gl2_encoder_context_t(stream, protocol)
+ {
+@@ -1356,6 +1369,7 @@
+ void GL2Encoder::s_glDrawElements(void *self, GLenum mode, GLsizei count, GLenum type, const void *indices)
+ {
+ 
+     GL2Encoder *ctx = (GL2Encoder *)self;
+     assert(ctx->m_state != NULL);
++    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
+     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
+     SET_ERROR_IF(count < 0, GL_INVALID_VALUE);
+@@ -1471,6 +1485,7 @@
+ void GL2Encoder::s_glDrawElementsNullAEMU(void *self, GLenum mode, GLsizei count, GLenum type, const void *indices)
+ {
+ 
+     GL2Encoder *ctx = (GL2Encoder *)self;
+     assert(ctx->m_state != NULL);
++    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
+     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
+     SET_ERROR_IF(count < 0, GL_INVALID_VALUE);
+@@ -4183,6 +4198,7 @@
+ void GL2Encoder::s_glDrawElementsInstanced(void* self, GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount)
+ {
+ 
+     GL2Encoder *ctx = (GL2Encoder *)self;
+     assert(ctx->m_state != NULL);
++    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
+     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
+     SET_ERROR_IF(count < 0, GL_INVALID_VALUE);
+@@ -4275,6 +4291,7 @@
+ void GL2Encoder::s_glDrawRangeElements(void* self, GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices)
+ {
+ 
+     GL2Encoder *ctx = (GL2Encoder *)self;
+     assert(ctx->m_state != NULL);
++    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
+     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
+     SET_ERROR_IF(end < start, GL_INVALID_VALUE);

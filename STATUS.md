@@ -1,6 +1,158 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
+## 当前状态（2026-11-02 08:16）
+
+- **W WebView：已验证关闭。** Via 页面/网页内容正常显示；`mark.via` 不 `code=139`、
+  VM 保持 `RUNNING`。三层修法：r120 空索引守卫（726→1 条）、r120 host
+  `Truncated GL stream` 隔离、r121 `GL_VERSION` 按真实 context 版本上报
+  （ES2 不再冒充 ES3，`Requested version is not supported` 0 行）。
+- **新卡点：第三方 `com.liuzh.deviceinfo` 的 Bugly `sig=6`（SIGABRT）** ——
+  `SuspendThreadByPeer timed out: BuglyThread-1` → `Aborting culprit thread`，
+  与 WebView 空索引无关，另开轨。
+- 产物：APK **1,978,159,229 B** / `C379212E3020E1E53E629FABE467FFB5B8E034E534A255822FFC965FB2D708DC`
+  （2026-11-02 08:13:07），实例 `1793525278509`。
+- **htmlviewer 已验证（08:19）**：`a15_application_launch=17144:com.android.htmlviewer` +
+  `Displayed … +604ms/+436ms`，`a15_application_exit=…:htmlviewer` **0 行**，日志中
+  `Requested version` / 守卫行 / `A9VM bdev crash` 均 **0 行**。W 轨双入口关闭。
+
+## 第 120 轮（2026-11-02 07:5x–08:0x）· 更正符号化：崩点是 glDrawElements 的空索引，不是 m_shared；VM 被 "Truncated GL stream" 整机带走
+
+> 本轮先纠正第 117/119 轮的**错误结论**，再修两个独立问题。两处代码都已构建、装机，
+> **待真机验证**。下面每一条都来自实例 `1793525278509` 的同一份日志，不是推演。
+
+━━ 1. 取证：0x59ad0 不是 s_glProgramUniform2fv ━━
+
+r119 真机（`vm/application-27121-50.log`）：
+
+```text
+A9VM bdev crash sig=11 code=1 fault=0x0 rawpc=0x72594e7ad0 rawlr=0x72594d49e8 sp=0x72597a6dd0
+                 pc=liba15vm-guest-ld-android.so+0x59ad0 lr=liba15vm-guest-ld-android.so+0x469e8
+x0/x19=0xb4000072d8c874d0（encoder） x1=0 x2=0x1403 x3=0x6c x4=0x72597a6dfc x5=0x72597a6df8
+x20=0x1403 x21=0x6c x22=0x4 x23=0x0
+A9VM bdev map 72594cb000-7259532000 r-xp 0003d000 … liba15vm-guest-libOpenglSystemCommon.so
+```
+
+`r-xp` 的 offset 是 0x3d000，而 ELF 第二段 off=0x3d5e4 / vaddr=0x415e4（p_align=16K，
+宿主按 4K 映射）。所以 `pc` 的**文件偏移** 0x59ad0 对应的 **vaddr** 是 0x5dad0，不是 0x59ad0：
+
+```text
+0x5dad0: 79400029  ldrh w9, [x1]       ← fault=0x0，x1=0
+```
+
+`lr=0x469e8` 对应 vaddr 0x4a9e8 = `GL2Encoder::s_glDrawElements+0x1dc`，
+正是 `bl calcIndexRange`（0x4a9e4）的返回地址。寄存器组（mode=4、count=0x6c=108、
+type=0x1403=GL_UNSIGNED_SHORT、indices=0）也只匹配 `s_glDrawElements`，不匹配
+`s_glProgramUniform2fv`。
+
+⇒ 第 117/119 轮的 `m_shared` 结论是**符号化偏移错误**造成的误判：0x59ad0 恰好落在
+`s_glProgramUniform2fv` 符号（0x59ac8）+8，0x469e8 恰好落在
+`GLSharedGroup::isProgram`（0x46940）+0xa8，两个巧合把整条线带偏。
+r119 的 surfaceless 补丁保留（`EGL_KHR_surfaceless_context` 本身合法，且
+`eglMakeCurrent … EGL_BAD_MATCH` 确实归零），但它不是本次崩溃的根因。
+
+━━ 2. 真因 A（app 崩溃）：无 EBO 时把 NULL 当客户端索引数组 ━━
+
+`s_glDrawElements` 只在 `m_state->currentIndexVbo()==0` 时走
+`calcIndexRange(indices, …)`。本次 `ibo=0`、`indices=NULL`、`count=108`，
+`calcIndexRange` 直接读 `[x1]` → SIGSEGV。goldfish 上游没有空指针检查。
+
+修法（`bridges/patches/drawelements-null-indices.patch`）：在
+`s_glDrawElements` / `s_glDrawElementsNullAEMU` / `s_glDrawElementsInstanced` /
+`s_glDrawRangeElements` 入口加 `GUARD_MISSING_CLIENT_INDICES`：
+`ibo==0 && count>0 && indices==NULL` → 打印 vao/ibo/lastEncoded 并
+`GL_INVALID_OPERATION` 返回。先让进程不因这一条绘制死掉；同时该行日志回答
+“EBO 是没绑、被解绑，还是跨 VAO 丢了”。
+
+━━ 3. 真因 B（整机停止）：一个客户端的 truncated GL stream 被当成 GPU server 致命错误 ━━
+
+实例 `1793525278509` 的 `session-state.log`：
+
+```text
+state=ERROR
+Truncated GL stream
+```
+
+`DesktopGpuServer::client()` 在 `readFully` 抛 `Truncated GL stream` 时，只把
+`ECONNRESET/EPIPE/ENOTCONN` 当断线；`std::runtime_error` 不是 `system_error`，
+而 pidfd 在进程刚死的一瞬间还可能 poll 不到，于是 `fail(error)` →
+`DesktopHost` 主循环 `throw` → `desktop_gpu_error=Truncated GL stream` → 整个 VM 停。
+**一个 app 的 GL 流截断不应该杀死 GPU server，更不应该杀死整个虚拟机。**
+
+修法（`third_party/graphics/container/desktop/DesktopGpuServer.cpp`）：
+`Truncated GL stream` / `Unexpected GL EOF` 一律按客户端断开处理，打印
+`desktop_gpu_client_closed pid=… reason=…`，关闭该连接，继续服务其他进程；
+pidfd 回收时照常 `releaseProcess`。其他传输错误保持原逻辑。
+
+━━ 4. 产物与状态 ━━
+
+| 项 | 值 |
+| --- | --- |
+| `liba15vm-guest-libOpenglSystemCommon.so` | 864,104 B（r119 为 863,592 B） |
+| `desktop-gpu-host`（A15） | 6,463,584 B（vendored 源码重建，含 `-gline-tables-only`；比 pinned 约大 1.6 MB，APK 因此变大） |
+| APK | 1,978,159,229 B / `DD623B4E36C11B408CDA73DB3EC714965F9B00D1BC3F3270186D962A10302E09`（2026-11-02 07:59:39） |
+| 装机 | 08:0x `adb install -r -d` Success |
+
+**已验证（2026-11-02 08:03–08:05 真机，实例 1793525278509）**：
+- `session-state.log` = `state=RUNNING`（VM 未停）；
+- `framework-server.log` 中 `a15_application_exit=…:mark.via` 与 `…:com.android.htmlviewer` **0 行**；
+- Via 的 `application-21272-24.log`：守卫行 **726** 条（count=12/18/108/36/24/6，
+  全部 `vao=0 ibo=0 lastEncoded=0`），`A9VM bdev crash` **0 行**；
+- ⇒ 空索引不再 SIGSEGV，truncated stream 不再停 VM。**“不崩/不停机”已验证；页面是否真正可用未验证。**
+
+**新卡点（同一份 Via 日志尾部）**：
+```text
+chromium: [ERROR:gl_display.cc(497)] EGL Driver message (Error) eglCreateContext: Requested version is not supported
+Dawn: Warning: eglCreateContext failed with EGL_BAD_ATTRIBUTE
+```
+原因：guest `GL2Encoder` 在 **ES2 context** 上把 `GL_VERSION` 硬编码成 "OpenGL ES 3.0"
+（上游 goldfish 默认），而宿主 `DesktopDecoder::rcGetGLString` 是 ES2 endpoint
+（`GL_VERSION`="OpenGL ES 2.0 A10VM"、只有 ES2 扩展/配置）。Chromium 请求 ES3 失败后
+又按 `GL_VERSION` 3.0 使用 ES3 路径（VAO/R8），726 条 `vao=0 ibo=0` 就是这条不一致的产物。
+r121 修法：`GL_VERSION`/`GL_SHADING_LANGUAGE_VERSION` 按 `ctx->majorVersion()` 返回
+2.0/1.00（ES2 context）或 3.0/3.00（ES3 context）。
+
+## 第 121 轮（2026-11-02 08:1x）· 让 GL_VERSION 说真话：ES2 context 不再冒充 ES3
+
+**只改了什么**：`bridges/patches/gl-version-string.patch`（新）+ build 脚本 apply。
+`GL2Encoder::s_glGetString`/`s_glGetStringi` 的 `GL_VERSION` 按 `ctx->majorVersion()` 返回
+`OpenGL ES 2.0` 或 `OpenGL ES 3.0`；`GL_SHADING_LANGUAGE_VERSION` 返回 1.00/3.00（原来直接
+`GL_INVALID_ENUM`）。理由：本项目的 host endpoint 是 ES2（`DesktopDecoder::rcGetGLString`
+明确返回 "OpenGL ES 2.0 A10VM"、`rcGetConfigs` 只放 ES2 config），而 guest 之前对所有
+context 都报 3.0；Chromium 于是请求 ES3 失败后仍按 ES3 caps 走。
+
+**产物**：`liba15vm-guest-libOpenglSystemCommon.so` 864,296 B；APK 1,978,159,229 B /
+`C379212E3020E1E53E629FABE467FFB5B8E034E534A255822FFC965FB2D708DC`（08:13:07），
+08:15:33 启动新实例。
+
+**已验证（2026-11-02 08:15–08:16 真机，实例 1793525278509，`state=RUNNING`）**：
+
+- 用户实测：**Via 页面/网页内容正常显示**；
+- `framework-server.log`：`a15_application_launch=11189:mark.via`、
+  `Displayed mark.via/.Shell`，`a15_application_exit=…:mark.via` **0 行**、
+  `a15_application_exit=…:htmlviewer` **0 行**；
+- Via 的 `application-9530-24.log`：`Requested version is not supported` **0 行**，
+  `glDrawElements: null client index pointer` 从 r120 的 **726 条降到 1 条**，
+  `A9VM bdev crash` **0 行**；
+- ⇒ ES3 冒充已关闭，Chromium/Skia 走 ES2 路径，页面正常渲染。
+
+**htmlviewer 补测（2026-11-02 08:19 真机，同一实例）**：
+`a15_application_launch=17144:com.android.htmlviewer`、
+`Displayed com.android.htmlviewer/.HTMLViewerActivity +604ms/+436ms`，
+`a15_application_exit=…:htmlviewer` **0 行**；`application-9530-71.log` 中
+`Requested version is not supported` / `glDrawElements: null client index pointer` /
+`A9VM bdev crash` 均 **0 行**，用户实测正常显示。
+⇒ **W 轨（WebView）完整关闭（Via + htmlviewer 双入口）。**
+
+**新卡点**：`application-9530-49/51.log` 的 `com.liuzh.deviceinfo` **sig=6（SIGABRT）**：
+`SuspendThreadByPeer timed out: BuglyThread-1` → `Aborting culprit thread`。
+这是 Bugly SDK 的线程挂起超时，不是 WebView 空索引；下一步先确认是 Bugly 自身兼容性
+还是我们 ART 的线程挂起/信号路径。**在拿到证据前不改 libc/linker/WebView。**
+
 ## 第 117 轮（2026-11-01 18:4x–19:07）· renderer 的 binder 线程 connect 被沙箱 EPERM：预连接池 + 新暴露的 EGL surfaceless / GL 拆除崩溃
+
+> **已被第 120 轮更正**：本节 §3/§5.3 的 `s_glProgramUniform2fv` / `m_shared` 符号化是
+> 偏移错误（16K 段对齐 vs 4K maps offset）。真实崩点是 `s_glDrawElements → calcIndexRange`
+> 在 `ibo=0 && indices=NULL` 时读 `[x1]`。原文保留供追溯，不要再按 `m_shared` 改代码。
 
 > 本轮**不是**推演：全部结论来自真机实例 `1793525278509` 的 `application-*.log` 与 `framework-broker.log`。
 > 设备仍是 3B15AV00JCP00000；包名 `me.kanadex.versebox`。

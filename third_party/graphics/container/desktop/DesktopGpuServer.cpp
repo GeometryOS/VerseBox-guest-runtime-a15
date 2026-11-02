@@ -4,7 +4,9 @@
 #include "DesktopThread.h"
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <memory>
+#include <string>
 #include <system_error>
 #include <poll.h>
 #include <sys/socket.h>
@@ -187,7 +189,22 @@ void DesktopGpuServer::client(int fd, pid_t process, int processDescriptor) {
         // The socket can reset before pidfd becomes readable during app shutdown.
         const bool disconnected = transport && transport->code().category() == std::generic_category() &&
             (code == ECONNRESET || code == EPIPE || code == ENOTCONN);
-        if (!dead && !disconnected) fail(error);
+        // A guest process can die in the middle of a GL command (SIGSEGV in the
+        // encoder, which is what mark.via does). The last frame then arrives
+        // truncated. That is a property of one client, not of the GPU server:
+        // failing the server here turned every browser crash into a whole-VM
+        // stop (session-state.log: state=ERROR / "Truncated GL stream").
+        // Close this connection, keep serving the other processes, and let
+        // pidfd reaping release the process-owned EGL resources.
+        const std::string reason = error.what();
+        const bool truncated = reason == "Truncated GL stream" ||
+                               reason == "Unexpected GL EOF";
+        if (truncated) {
+            std::fprintf(stderr, "desktop_gpu_client_closed pid=%d reason=%s\n",
+                         int(process), reason.c_str());
+        } else if (!dead && !disconnected) {
+            fail(error);
+        }
     }
     backend_.makeCurrent(0, 0, 0);
     std::lock_guard<std::mutex> lock(mutex_);

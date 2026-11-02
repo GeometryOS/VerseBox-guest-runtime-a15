@@ -154,6 +154,19 @@ apply_patch "$MODULE/bridges/patches/sampler-external-precision.patch"
 # SurfaceFlingerAIDL. A15-only.
 apply_patch "$MODULE/bridges/patches/gl-ext-half-float.patch"
 apply_patch "$MODULE/bridges/patches/surfaceless-context.patch"
+# A WebView page can issue glDrawElements(count>0, indices=NULL) while our
+# GLClientState has no element buffer bound. Upstream goldfish treats the NULL
+# as a real client array and calcIndexRange() dereferences it
+# (mark.via SIGSEGV at libOpenglSystemCommon.so ldrh [x1], x1=0, 2026-11-02).
+# Guard the four draw paths and report the VAO/EBO state on the guard line.
+apply_patch "$MODULE/bridges/patches/drawelements-null-indices.patch"
+# The EGL context is created as ES2 (the host endpoint reports ES 2.0 and only
+# ES2 configs), but upstream goldfish's GL_VERSION string is hardcoded "OpenGL
+# ES 3.0". Chromium/Skia therefore used ES3 paths (VAO/R8) and its ES3 context
+# request failed with "eglCreateContext: Requested version is not supported"
+# (mark.via, 2026-11-02). Report the version of the context that actually
+# exists, and answer GL_SHADING_LANGUAGE_VERSION instead of INVALID_ENUM.
+apply_patch "$MODULE/bridges/patches/gl-version-string.patch"
 apply_patch "$SRC/desktop/config-handles.patch"
 apply_patch "$SRC/desktop/texture-contexts.patch"
 apply_patch "$SRC/desktop/format-conversions.patch"

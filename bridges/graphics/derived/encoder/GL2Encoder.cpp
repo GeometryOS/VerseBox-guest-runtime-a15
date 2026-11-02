@@ -37,6 +37,9 @@
 static GLubyte *gVendorString= (GLubyte *) "Android";
 static GLubyte *gRendererString= (GLubyte *) "Android HW-GLES 3.0";
 static GLubyte *gVersionString= (GLubyte *) "OpenGL ES 3.0";
+static GLubyte *gVersionStringES2= (GLubyte *) "OpenGL ES 2.0";
+static GLubyte *gGLSLStringES2= (GLubyte *) "OpenGL ES GLSL ES 1.00";
+static GLubyte *gGLSLStringES3= (GLubyte *) "OpenGL ES GLSL ES 3.00";
 static GLubyte *gExtensionsString= (GLubyte *) "GL_OES_EGL_image_external ";
 
 #define SET_ERROR_IF(condition, err) if((condition)) { \
@@ -66,6 +69,18 @@ static GLubyte *gExtensionsString= (GLubyte *) "GL_OES_EGL_image_external ";
         ctx->setError(err);   \
         return ret; \
     } \
+
+#define GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type) \
+    if ((ctx)->m_state->currentIndexVbo() == 0 && (count) > 0 && (indices) == NULL) { \
+        ALOGE("glDrawElements: null client index pointer with no element buffer bound " \
+              "(count=%d type=0x%x vao=%u ibo=%u lastEncoded=%u); GL_INVALID_OPERATION", \
+              (int)(count), (unsigned)(type), \
+              (unsigned)(ctx)->m_state->currentVertexArrayObject(), \
+              (unsigned)(ctx)->m_state->currentIndexVbo(), \
+              (unsigned)(ctx)->m_state->getLastEncodedBufferBind(GL_ELEMENT_ARRAY_BUFFER)); \
+        (ctx)->setError(GL_INVALID_OPERATION); \
+        return; \
+    }
 
 GL2Encoder::GL2Encoder(IOStream *stream, ChecksumCalculator *protocol)
         : gl2_encoder_context_t(stream, protocol)
@@ -510,6 +525,7 @@ const GLubyte *GL2Encoder::s_glGetString(void *self, GLenum name)
         name != GL_VENDOR &&
         name != GL_RENDERER &&
         name != GL_VERSION &&
+        name != GL_SHADING_LANGUAGE_VERSION &&
         name != GL_EXTENSIONS,
         GL_INVALID_ENUM,
         retval);
@@ -521,7 +537,17 @@ const GLubyte *GL2Encoder::s_glGetString(void *self, GLenum name)
         retval = gRendererString;
         break;
     case GL_VERSION:
-        retval = gVersionString;
+        // The EGL context is created as ES2 (HostConnection's endpoint is an
+        // ES2 endpoint: DesktopDecoder::rcGetGLString reports "OpenGL ES 2.0"
+        // and only ES2 configs). Upstream goldfish reports 3.0 because it
+        // creates ES3 contexts; reporting 3.0 on an ES2 context made Skia and
+        // Chromium use ES3 paths (VAOs, R8 renderbuffers) that this endpoint
+        // does not provide, and their ES3 context request failed with
+        // "eglCreateContext: Requested version is not supported".
+        retval = ctx->majorVersion() >= 3 ? gVersionString : gVersionStringES2;
+        break;
+    case GL_SHADING_LANGUAGE_VERSION:
+        retval = ctx->majorVersion() >= 3 ? gGLSLStringES3 : gGLSLStringES2;
         break;
     case GL_EXTENSIONS:
         retval = gExtensionsString;
@@ -1358,6 +1384,7 @@ void GL2Encoder::s_glDrawElements(void *self, GLenum mode, GLsizei count, GLenum
 
     GL2Encoder *ctx = (GL2Encoder *)self;
     assert(ctx->m_state != NULL);
+    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
     SET_ERROR_IF(count < 0, GL_INVALID_VALUE);
     SET_ERROR_IF(!(type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT || type == GL_UNSIGNED_INT), GL_INVALID_ENUM);
@@ -1473,6 +1500,7 @@ void GL2Encoder::s_glDrawElementsNullAEMU(void *self, GLenum mode, GLsizei count
 
     GL2Encoder *ctx = (GL2Encoder *)self;
     assert(ctx->m_state != NULL);
+    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
     SET_ERROR_IF(count < 0, GL_INVALID_VALUE);
     SET_ERROR_IF(!(type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT || type == GL_UNSIGNED_INT), GL_INVALID_ENUM);
@@ -4185,6 +4213,7 @@ void GL2Encoder::s_glDrawElementsInstanced(void* self, GLenum mode, GLsizei coun
 
     GL2Encoder *ctx = (GL2Encoder *)self;
     assert(ctx->m_state != NULL);
+    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
     SET_ERROR_IF(count < 0, GL_INVALID_VALUE);
     SET_ERROR_IF(!(type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT || type == GL_UNSIGNED_INT), GL_INVALID_ENUM);
@@ -4277,6 +4306,7 @@ void GL2Encoder::s_glDrawRangeElements(void* self, GLenum mode, GLuint start, GL
 
     GL2Encoder *ctx = (GL2Encoder *)self;
     assert(ctx->m_state != NULL);
+    GUARD_MISSING_CLIENT_INDICES(ctx, indices, count, type);
     SET_ERROR_IF(!isValidDrawMode(mode), GL_INVALID_ENUM);
     SET_ERROR_IF(end < start, GL_INVALID_VALUE);
     SET_ERROR_IF(count < 0, GL_INVALID_VALUE);
@@ -4405,7 +4435,7 @@ const GLubyte* GL2Encoder::s_glGetStringi(void* self, GLenum name, GLuint index)
         retval = gRendererString;
         break;
     case GL_VERSION:
-        retval = gVersionString;
+        retval = ctx->majorVersion() >= 3 ? gVersionString : gVersionStringES2;
         break;
     case GL_EXTENSIONS:
         retval = (const GLubyte*)(ctx->m_currExtensionsArray[index].c_str());
