@@ -1641,9 +1641,11 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
     if (majorVersion == 3 && minorVersion == 2) {
         rcMajorVersion = 4;
     }
-    uint32_t rcContext = rcEnc->rcCreateContext(rcEnc, a10egl::configIndex(config), rcShareCtx, rcMajorVersion);
+    uint32_t rcConfigIndex = a10egl::configIndex(config);
+    uint32_t rcContext = rcEnc->rcCreateContext(rcEnc, rcConfigIndex, rcShareCtx, rcMajorVersion);
     if (!rcContext) {
-        ALOGE("rcCreateContext returned 0");
+        ALOGE("rcCreateContext returned 0 (config=%u numConfigs=%d version=%d maxVersion=%d share=%u)",
+              rcConfigIndex, s_display.getNumConfigs(), rcMajorVersion, rcEnc->getGLESMaxVersion(), rcShareCtx);
         setErrorReturn(EGL_BAD_ALLOC, EGL_NO_CONTEXT);
     }
 

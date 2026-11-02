@@ -75,6 +75,8 @@ $native = [ordered]@{
     # host-devices comes from build-host-hal.sh; prepare-a15.py requires it.
     "bridges/bin/host-devices"                  = "bridges\build-host-hal.sh"
     "bridges/graphics/lib/libGLESv2_emulation.so" = "bridges\build-graphics-a15.sh"
+    # Legacy audio HAL that replaces the image's silent stub (routes to audio.sock).
+    "bridges/lib/audio.primary.default.so" = "bridges\build-audio-hal.sh"
 }
 # Pinned host GPU endpoint (prebuilt/arm64/desktop-gpu-host, sha256-checked).
 # The sources and the fetch/build scripts are vendored under third_party/graphics;

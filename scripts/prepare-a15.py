@@ -738,6 +738,20 @@ def main():
         add_native(path, logical, "liba15vm-guest-" + name, "project-a15", name, guest_path)
         if guest_path and guest_path.startswith("/vendor/lib64/hw/"):
             real_files.append({"logical": logical, "guestPath": guest_path})
+    # Project audio HAL (r135): replaces the image's silent stub. Built against
+    # the API 35 HAL headers so audio_hw_device_t/audio_stream_out match the A15
+    # audio HAL service (the A10-header build crashed that service, r133).
+    audio_hal = BRIDGES / "lib" / "audio.primary.default.so"
+    if audio_hal.is_file():
+        add_native(audio_hal, "audio.primary.default.so",
+                   "liba15vm-guest-audio.primary.default.so", "project-a15",
+                   None, "/vendor/lib64/hw/audio.primary.default.so")
+        real_files.append({"logical": "audio.primary.default.so",
+                           "guestPath": "/vendor/lib64/hw/audio.primary.default.so"})
+        used_guest_paths.add("vendor/lib64/hw/audio.primary.default.so")
+    else:
+        print("prepare-a15: audio HAL not built yet, keeping the image stub",
+              file=sys.stderr)
     # Round 75: same realpath() gate, but for a HAL module that belongs to the
     # *image* instead of the project. The audio HAL service opens the legacy
     # module through hw_get_module("audio.primary"), and the only module in the
@@ -748,9 +762,9 @@ def main():
     # rootfs (realFiles). nativeLinks for the same path is skipped on purpose:
     # the host creates nativeLinks *after* realFiles, so a symlink there would
     # overwrite the real file again.
-    image_hal_modules = {
-        "audio.primary.default.so": "/vendor/lib64/hw/audio.primary.default.so",
-    }
+    # audio.primary.default.so is the project module above; the image copy is
+    # skipped through used_guest_paths instead of being installed.
+    image_hal_modules = {}
     if graphics_missing:
         print("prepare-a15: graphics modules not built yet, skipped: "
               + ", ".join(sorted(graphics_missing)), file=sys.stderr)

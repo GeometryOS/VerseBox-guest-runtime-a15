@@ -168,6 +168,11 @@ apply_patch "$MODULE/bridges/patches/drawelements-null-indices.patch"
 # exists, and answer GL_SHADING_LANGUAGE_VERSION instead of INVALID_ENUM.
 apply_patch "$MODULE/bridges/patches/gl-version-string.patch"
 apply_patch "$SRC/desktop/config-handles.patch"
+# AIDA64 asks GLSurfaceView for a context and the endpoint answered
+# rcCreateContext=0 -> EGL_BAD_ALLOC -> GLThread FATAL. The desktop host accepts
+# exactly version 2 (GpuBackend::context), so retry non-2 requests as ES2 and
+# report the config/version numbers that used to be invisible.
+apply_patch "$MODULE/bridges/patches/egl-context-version-fallback.patch"
 apply_patch "$SRC/desktop/texture-contexts.patch"
 apply_patch "$SRC/desktop/format-conversions.patch"
 apply_patch "$SRC/desktop/yuv-rgb-rows.patch"

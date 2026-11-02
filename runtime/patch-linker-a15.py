@@ -339,6 +339,7 @@ LINKER_MAIN_CPP = [
     (
         '#include <bionic/libc_init_common.h>\n',
         '#include <bionic/libc_init_common.h>\n'
+        '#include <string.h>\n'
         '// A10VM guest patch: this linker also runs embedded (see below).\n'
         'extern "C" const char* __progname;\n',
     ),
@@ -391,7 +392,21 @@ LINKER_MAIN_CPP = [
         "      __libc_shared_globals()->initial_linker_arg_count = 1;\n"
         "      // A10VM guest patch: argv[0] is the caller's string, not the\n"
         "      // physical executable path (see patch-linker-a15.py).\n"
-        "      const char* guest_argv0 = getenv(\"A10VM_EXEC_ARGV0\");\n"
+        "      //\n"
+        "      // getenv() must not be used here: the linker only initialises\n"
+        "      // __environ in linker_main() -> __libc_init_AT_SECURE(args.envp),\n"
+        "      // which runs after this point, so getenv() always returned null\n"
+        "      // and this patch silently did nothing (r123/r125: MT still got\n"
+        "      // basename \"toybox\" and ran the first argument as an applet:\n"
+        "      //   toybox: Unknown command -u).  Scan envp directly.\n"
+        "      const char* guest_argv0 = nullptr;\n"
+        "      for (char** entry = args.envp; entry != nullptr && *entry != nullptr;\n"
+        "              ++entry) {\n"
+        "        if (!strncmp(*entry, \"A10VM_EXEC_ARGV0=\", 17)) {\n"
+        "          guest_argv0 = *entry + 17;\n"
+        "          break;\n"
+        "        }\n"
+        "      }\n"
         "      if (guest_argv0 != nullptr && guest_argv0[0] != '\\0') {\n"
         "        args.argv[__libc_shared_globals()->initial_linker_arg_count] =\n"
         "            const_cast<char*>(guest_argv0);\n"

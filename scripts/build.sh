@@ -121,9 +121,11 @@ bridge_product() {
         jni-register)  printf '%s' bridges/lib/liba15vm-jni-register.so ;;
         host-hal)      printf '%s' bridges/bin/host-devices ;;
         graphics-a15)  printf '%s' bridges/graphics/lib/libGLESv2_emulation.so ;;
+        # The project's legacy audio HAL replaces the image's silent stub.
+        audio-hal)     printf '%s' bridges/lib/audio.primary.default.so ;;
     esac
 }
-for bridge in property binder devices guest-log jni-register host-hal graphics-a15; do
+for bridge in property binder devices guest-log jni-register host-hal graphics-a15 audio-hal; do
     product=$(bridge_product "$bridge")
     if [ "$FORCE" = 1 ] || [ ! -f "$product" ]; then
         if [ "$bridge" = graphics-a15 ] && [ ! -d third_party/graphics/a9/upstream/goldfish ]; then

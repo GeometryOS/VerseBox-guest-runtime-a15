@@ -28,7 +28,7 @@ static bool skipDex2oat(const char* path) {
     return !strcmp(base, "dex2oat") || !strcmp(base, "dex2oatd");
 }
 
-static void traceExec(const char* path, bool skipped) {
+static void traceExec(const char* path, const char* argv0, bool skipped) {
     // stderr is useless for this probe: installd's dex2oat child redirects fd
     // 1/2 to liblogwrap's log pipe, so a write(2) marker never reaches
     // framework-installer.log.  Appending to $A10VM_STATE_ROOT/a9exec.log
@@ -44,7 +44,7 @@ static void traceExec(const char* path, bool skipped) {
     int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, log,
             O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600));
     if (fd < 0) return;
-    char line[PATH_MAX + 16];
+    char line[2 * PATH_MAX + 32];
     size_t length = 0;
     if (skipped) { memcpy(line, "skip ", 5); length = 5; }
     else { memcpy(line, "enter ", 6); length = 6; }
@@ -52,6 +52,14 @@ static void traceExec(const char* path, bool skipped) {
     if (pathLength > PATH_MAX) pathLength = PATH_MAX;
     memcpy(line + length, path, pathLength);
     length += pathLength;
+    if (argv0 && argv0[0]) {
+        memcpy(line + length, " argv0=", 8);
+        length += 8;
+        size_t argv0Length = strlen(argv0);
+        if (argv0Length > PATH_MAX) argv0Length = PATH_MAX;
+        memcpy(line + length, argv0, argv0Length);
+        length += argv0Length;
+    }
     line[length++] = '\n';
     syscall(__NR_write, fd, line, length);
     syscall(__NR_close, fd);
@@ -85,10 +93,39 @@ static int ensureExecutable(const char* path) {
     return 0;
 }
 
+static bool sameBaseName(const char* first, const char* second) {
+    const char* a = strrchr(first, '/');
+    const char* b = strrchr(second, '/');
+    return !strcmp(a ? a + 1 : first, b ? b + 1 : second);
+}
+
+/**
+ * Names the applet a multi-call binary should run.
+ *
+ * <p>guestPath() resolves /system/bin/id, sh, getprop... into the physical
+ * .../system/bin/toybox, and toybox dispatches on basename(argv[0]).  A caller
+ * that hands us the resolved name (MT Manager's shell helper does exactly
+ * that) therefore becomes "toybox -u":
+ *
+ * <pre>
+ *   java.io.IOException: Get shell's uid failed:
+ *     Result{lines=[], error='toybox: Unknown command -u'}
+ * </pre>
+ *
+ * <p>Real device 2026-11-02, instance 1793525278509,
+ * vm/application-11738-51.log:185.  Only the requested path still carries the
+ * applet name, so when the physical target has a different basename that is
+ * what the child must see as argv[0].
+ */
+static const char* appletArgv0(const char* path, const char* mapped, const char* requested) {
+    if (!sameBaseName(path, mapped)) return path;
+    return requested && requested[0] ? requested : path;
+}
+
 static int guestExec(const char* path, char* const argv[], char* const env[], unsigned depth) {
     if (depth > 4) { errno = ELOOP; return -1; }
     bool skipped = skipDex2oat(path);
-    traceExec(path, skipped);
+    traceExec(path, (argv && argv[0]) ? argv[0] : nullptr, skipped);
     if (skipped) _exit(0);
     char buffer[PATH_MAX];
     const char* mapped = guestPath(AT_FDCWD, path, buffer);
@@ -170,7 +207,7 @@ static int guestExec(const char* path, char* const argv[], char* const env[], un
         environment[count++] = entry;
         used += length;
     }
-    const char* argv0 = argc ? argv[0] : path;
+    const char* argv0 = appletArgv0(path, mapped, argc ? argv[0] : nullptr);
     size_t length = strlen(argv0) + sizeof("A10VM_EXEC_ARGV0=");
     if (length > sizeof(settings) - used) { errno = E2BIG; return -1; }
     char* entry = settings + used;

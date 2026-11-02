@@ -1,6 +1,83 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
-## 当前状态（2026-11-02 10:18，r127 回滚后）
+## 当前状态（2026-11-02 12:0x，r135：音频出声，真机已验证）
+
+- **音频主链路已打通（用户实测“有声音了”）**：镜像的静音 stub
+  `vendor/lib64/hw/audio.primary.default.so` 已替换为项目自己的
+  `HostAudioHal`（与 A9/A10 同一份源码），PCM 走 `<state>/audio.sock`。
+  - 新脚本 `bridges/build-audio-hal.sh`；HAL 头用 **API 35**
+    （`vendor/audio/include`，android-15.0.0_r36；`audio_common-base.h` 取自
+    android15-release，因为 r36 tag 不带这个生成文件；哈希在
+    `vendor/audio/sources.sha256`）。
+  - prepare 以 **realFiles** 落到 `/vendor/lib64/hw/audio.primary.default.so`
+    （nativeLink 会覆盖真实文件，必须跳过）。
+  - 判据（实例 1793525278509，11:56 启动）：
+    `framework-audioserver.log:65 loadHwModule() Loaded primary audio interface`、
+    `:66 openOutput() … AUDIO_DEVICE_OUT_SPEAKER`、
+    `framework-audio-hal.log` 的 `A9VM bdev crash` **0 行**、
+    `session-state.log: state=RUNNING`，用户实测有声。
+- **r133 的失败（已回退，勿重试）**：同一份源码用 **A10 头**编译时，
+  `audio_hw_device_t`/`audio_stream_out` 比 A15 服务预期的小，
+  `Loaded primary audio interface` 之后 audio HAL 服务立刻 SIGSEGV
+  （`fault=0x30000ac44` 这种跳飞指针），audioserver 重启循环 → **卡开机动画**。
+  r134 退回镜像 stub 恢复开机；r135 用 A15 头重编后才既出声又不崩。
+  **教训：跨 API 移植 HAL 必须用目标 API 的头，legacy 结构体虽然 append-only，
+  但服务会读到这里之外。**
+- 产物：APK 1,979,819,845 B / `3B78CBCC…`（11:54 构建，11:55 装机 Success）。
+- 仍红：传感器 0、设备信息 `134/139`、AIDA64（GLES1，见下）、GPU 端点对未知
+  opcode 会整机退出（`Unsupported desktop GPU opcode`）。
+
+## 当前状态（2026-11-02 11:4x，r132：图库绿、AIDA64 回退到“只诊断”）
+
+- **图库已绿（r130，用户实测“图库 MT 正常”）**：`PrivateVolumes` 的
+  `setupAppDir/fixupAppDir` 按实机参数 `(String path, int appId)` 直接
+  `Files.createDirectories(path)`；r125 那版把 `args[1]=10051` 当 user、
+  把 `args[0]` 当包名，才拼出 `/storage/emulated/10051/...`。
+- **AIDA64：方向被否掉，r132 已回退行为改动（只留诊断日志）**：
+  - AIDA64 是 **GLES1 应用**：r131 让它拿到 ES2 context 后，它的第一个 GL 调用就是
+    GLESv1 编码器的 `glClearColor`（`OP_glClearColor = 1025`），而桌面 GPU 端点只
+    实现 GLES2 解码 → `DesktopDecoder` 抛
+    `Unsupported desktop GPU opcode 1025` → GPU 端点退出 →
+    `session-state.log: state=ERROR`，**整台虚拟机被带走**（11:33）。
+  - host 的 `GpuBackend::context()` 只接受 `version == 2`；AIDA64 请求的是 ES1，
+    所以原来那个 `EGL_BAD_ALLOC` 只是它自己 FATAL，**VM 是安全的**。
+  - **结论：不要再做“ES2 回退”**。要在 AIDA64 上继续，只有两条路：
+    ① host 实现 GLES1 解码（goldfish GLESv1_dec 在 A10 的 DesktopDecoder 里没有接线）；
+    ② guest 侧做 ES1→ES2 兼容层。都不是一两行的事，另开轨。
+  - r132 保留的诊断行（下次 AIDA64 崩时会打印真实参数）：
+    `rcCreateContext returned 0 (config=… numConfigs=… version=… maxVersion=… share=…)`。
+- **副产品（建议单独修）**：`DesktopDecoder` 在未知 opcode 时直接 throw，即使协议是
+  长度前缀、完全可以跳过该包继续跑。改成“记一次日志 + 跳过”能让任何单个未知 GL 调用
+  不再杀死整台 VM。需要重建 `desktop-gpu-host`（当前是 pinned prebuilt）。
+
+## 当前状态（2026-11-02 11:2x，r129：MT 内部存储已修，真机已验证）
+
+- **MT 内部存储已闭环（r129，用户单选 + 同一份日志）**：
+  - 修的是 linker 读取 `A10VM_EXEC_ARGV0` 的**时机**，不是 toybox：补丁在
+    `__linker_init()`（linker_main.cpp:815 附近）调用 `getenv()`，而 `__environ`
+    直到 `linker_main()` 第 290 行 `__libc_init_AT_SECURE(args.envp)` 才被设置，
+    所以 `getenv` 永远返回 NULL，`args.argv[1]` 保持实体路径
+    `.../system/bin/toybox`；toybox 按 `argv[0]` 分派 applet，于是把第一个参数
+    当子命令：`toybox: Unknown command -u`。
+  - r128 先证伪了“调用者传错名字”：新 `traceExec` 打印 `argv0`，实机是
+    `enter /system/bin/id argv0= id`（调用者本来就对），MT 仍报同一个错 ⇒ 问题在
+    loader 消费端。r128 同时保留了 exec 侧的 `appletArgv0()`（alias 时用请求路径），
+    它是防御性保留，不是本次判据。
+  - r129 改为直接扫 `args.envp` 前缀 `A10VM_EXEC_ARGV0=`；linker 5,919,064 B /
+    `C3FAD4FB…`，libc 1,194,080 B，APK 1,979,819,844 B / `E583C213…`（11:1x 装机 Success）。
+  - 真机判据（实例 1793525278509，11:15 启动，server pid 26265）：用户实测
+    **MT 能进内部存储、能看到文件**；同一会话 `application-26265-*.log` 共 48 个，
+    `toybox` **0 行**、MT 日志 `Get shell` **0 行**。
+- **下一步唯一动作 = 图库 per-app 目录（S 轨）**：只改
+  `vendor/framework/PrivateVolumes.java` 的 `setupAppDir/fixupAppDir`，按实际
+  `(String path, int appId)` 创建 `path` 本身（实机日志里
+  `args[0]=storage/emulated/0/Android/data/com.android.gallery3d/cache`、
+  `args[1]=10051`）。判据：`imgcache.idx: ENOENT` 消失且图库显示图片内容。
+  不要和 linker/audio 同轮。
+- 仍红的轨：图库内容、音频无声、传感器 0、AIDA64 EGL_BAD_ALLOC、设备信息闪退
+  （134/139，未拿到栈）。
+
+## 当前状态（历史，2026-11-02 10:25，r127 回滚后 + MT 报错页截图）
 
 - **r127 只做回滚**：撤掉 r125 的 linker `__progname`、vold
   `setupAppDir/fixupAppDir`、extractor 目录链；保留 r124 的 `LD_DEBUG` 删除 /
@@ -9,9 +86,12 @@
 - **r124 仍有效**：A15 电池可见（`battery-sysfs` 的 capacity/status/current 有值）；
   `mediaextractor`/`mediametrics` 已启动，媒体不卡死但**无声**
   （`HostAudioHal.cpp` 未编进任何 .so）。
-- **MT 未修**：r127 用户看到的是 MT 自己的报错页面，不是 5 s ANR；
-  r127 的 `application-11738-52.log` 没有 `Get shell's uid` / `toybox` 行，
-  报错页原文尚未抓到。**下一步先让用户给报错页文字/截图，不先改代码。**
+- **MT 未修**：10:25 用户截图（`docs/android15-port/日用修复/05-音量与媒体/logs/05-mt-error-page.png`）
+  明确显示 `Get shell's uid failed: Result{lines=[], error='toybox: Unknown command -u
+  (see "toybox --help")'}'`。所以当前报错页就是 **toybox applet 名丢失**，不是
+  `setupAppDir`/存储挂载；r127 的 `application-11738-52.log` 没抓到该行只是样本不完整。
+  r123 只改 `args.argv[1]`，r125 补 `__progname` 的方向对但导致清云/音量回退、已回滚。
+  **下一步只做 toybox applet 的最小隔离修法，不再整包改 linker。**
 - **图库未修**：`imgcache.idx` 仍 `ENOENT`；r125 的 `setupAppDir` 把
   `(String path, int appId)` 误当 `(package,user)`，生成
   `/storage/emulated/10051/Android/data/storage/...`，已回滚。正确修法见第 127 轮
@@ -125,6 +205,12 @@ argv[0] 是调用者的，路径只用来找镜像。
 ⇒ **guest exec 的 argv[0] 关闭。** 这一条不是推演，修前修后是同两份日志的同一类行。
 
 ━━ 5. **MT 没有修好**：窗口能显示，但主线程不应答输入，随后被 AMS 杀掉 ━━
+
+> **2026-11-02 10:25 纠正（截图）**：MT 当前报错页仍明确写着
+> `Get shell's uid failed: Result{lines=[], error='toybox: Unknown command -u
+> (see "toybox --help")'}'`。所以本节 §4 的“`Get shell's uid failed` 0 行”
+> 只对那一次 09:24 启动/那份日志成立，**不是稳定修复**；toybox 仍从
+> `getprogname()/__progname` 拿到实体名。r123 只改 `args.argv[1]` 不够。
 
 > 用户实测（09:34）：**MT 仍然卡在主页**。本节只证明"\`id -u\` 那条错误消失了"，
 > **不等于 MT 可用**。任何人都不要把这轮写成"MT 已修"。

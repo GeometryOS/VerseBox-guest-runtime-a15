@@ -112,6 +112,38 @@ final class PrivateVolumes implements InvocationHandler {
                     throw new IllegalArgumentException("Unknown guest external storage path: " + path);
                 Files.createDirectories(path);
                 return null;
+            // Android 15's StorageManagerService asks vold to create the per-app
+            // external directory it is about to hand to the app (Gallery's cache,
+            // DocumentsUI's files, ...).  Real arguments, captured on device
+            // (instance 1793525278509, r126 log line 61216):
+            //
+            //   a15_vold_app_dir=/storage/emulated/10051/Android/data/
+            //       storage/emulated/0/Android/data/com.android.gallery3d/cache
+            //
+            // That is this endpoint's old generic branch treating args[0] as a
+            // package name and args[1]=10051 as a user id.  The real signature is
+            // setupAppDir(String path, int appId): args[0] is already the complete
+            // directory to create (here the *cache* dir of the app) and args[1] is
+            // the appId, not a user.  r125 built the wrong tree and the target
+            // stayed absent, so Gallery failed with
+            //   java.io.FileNotFoundException:
+            //     /storage/emulated/0/Android/data/com.android.gallery3d/cache/
+            //       imgcache.idx: open failed: ENOENT
+            // (application-28715-25.log:158).
+            //
+            // Creating exactly the requested path is what vold does for the leaf;
+            // the parent chain already exists from prepare().
+            case "setupAppDir":
+            case "fixupAppDir": {
+                String requested = (String) args[0];
+                Path appDir = Paths.get(requested.startsWith("/") ? requested : "/" + requested).normalize();
+                if (!appDir.startsWith("/storage/emulated/0") && !appDir.startsWith("/storage/self/primary") &&
+                        !appDir.startsWith("/mnt/runtime") && !appDir.startsWith("/mnt/user/0/primary"))
+                    throw new IllegalArgumentException("Unknown guest external storage path: " + appDir);
+                Files.createDirectories(appDir);
+                System.out.println("a15_vold_app_dir=" + appDir + " ok=true");
+                return null;
+            }
             case "reset":
                 prepare(0);
                 announce();
