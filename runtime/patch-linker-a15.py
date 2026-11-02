@@ -356,6 +356,47 @@ LINKER_MAIN_CPP = [
         "  // died at __strlen_aarch64+0x10 with x0=0, fault=0x0.\n"
         "  if (__progname == nullptr) __progname = g_argv[0];\n",
     ),
+    # A10VM guest patch: restore the caller's argv[0] for every guest exec.
+    #
+    # GuestExec.cpp hands the child's original argv[0] over in
+    # A10VM_EXEC_ARGV0 precisely so a multi-call binary keeps its applet name,
+    # but this script never applied that half of the contract (platform.patch
+    # has it; patch-linker-a15.py did not), so the built linker contained no
+    # A10VM_EXEC_ARGV0 string at all:
+    #
+    #   python -c "print(b'A10VM_EXEC_ARGV0' in
+    #       open('runtime/build/bin/source-linker64','rb').read())"
+    #   -> False        (state before round 123)
+    #
+    # The guest therefore ran /system/bin/id with argv[0] = the physical
+    # executable path, whose basename is "toybox"; toybox reads that as "no
+    # applet name" and takes the first real argument as its command:
+    #
+    #   toybox: Unknown command -u (see "toybox --help")
+    #   java.lang.RuntimeException: ... Get shell's uid failed
+    #   ANR in bin.mt.plus ... code=137
+    #
+    # (instance 1793525278509, vm/application-27156-47.log:46966/67546/67550).
+    # /system/bin/id, sh, cmd, getprop and dumpsys are all toybox applets, so
+    # this one missing half breaks every shell command a third-party app runs.
+    #
+    # Kernel semantics: execve() keeps the caller's argv[0]; the path merely
+    # locates the image. exe_to_load was captured before this point, so
+    # overwriting the slot keeps the executable for the loader while making
+    # g_argv[0] the caller's string, exactly like a device execve().
+    (
+        "      exe_to_load = args.argv[1];\n"
+        "      __libc_shared_globals()->initial_linker_arg_count = 1;\n",
+        "      exe_to_load = args.argv[1];\n"
+        "      __libc_shared_globals()->initial_linker_arg_count = 1;\n"
+        "      // A10VM guest patch: argv[0] is the caller's string, not the\n"
+        "      // physical executable path (see patch-linker-a15.py).\n"
+        "      const char* guest_argv0 = getenv(\"A10VM_EXEC_ARGV0\");\n"
+        "      if (guest_argv0 != nullptr && guest_argv0[0] != '\\0') {\n"
+        "        args.argv[__libc_shared_globals()->initial_linker_arg_count] =\n"
+        "            const_cast<char*>(guest_argv0);\n"
+        "      }\n",
+    ),
 ]
 
 EDITS = {

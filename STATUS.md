@@ -1,19 +1,183 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
-## 当前状态（2026-11-02 08:16）
+## 当前状态（2026-11-02 10:18，r127 回滚后）
 
-- **W WebView：已验证关闭。** Via 页面/网页内容正常显示；`mark.via` 不 `code=139`、
-  VM 保持 `RUNNING`。三层修法：r120 空索引守卫（726→1 条）、r120 host
-  `Truncated GL stream` 隔离、r121 `GL_VERSION` 按真实 context 版本上报
-  （ES2 不再冒充 ES3，`Requested version is not supported` 0 行）。
-- **新卡点：第三方 `com.liuzh.deviceinfo` 的 Bugly `sig=6`（SIGABRT）** ——
-  `SuspendThreadByPeer timed out: BuglyThread-1` → `Aborting culprit thread`，
-  与 WebView 空索引无关，另开轨。
-- 产物：APK **1,978,159,229 B** / `C379212E3020E1E53E629FABE467FFB5B8E034E534A255822FFC965FB2D708DC`
-  （2026-11-02 08:13:07），实例 `1793525278509`。
-- **htmlviewer 已验证（08:19）**：`a15_application_launch=17144:com.android.htmlviewer` +
-  `Displayed … +604ms/+436ms`，`a15_application_exit=…:htmlviewer` **0 行**，日志中
-  `Requested version` / 守卫行 / `A9VM bdev crash` 均 **0 行**。W 轨双入口关闭。
+- **r127 只做回滚**：撤掉 r125 的 linker `__progname`、vold
+  `setupAppDir/fixupAppDir`、extractor 目录链；保留 r124 的 `LD_DEBUG` 删除 /
+  `batterySysfs` / `mediaextractor` 启动。用户单选实测：**清云音乐向导页视频恢复、
+  音量设置页恢复**；**MT 仍是报错页面，图库仍无图**。
+- **r124 仍有效**：A15 电池可见（`battery-sysfs` 的 capacity/status/current 有值）；
+  `mediaextractor`/`mediametrics` 已启动，媒体不卡死但**无声**
+  （`HostAudioHal.cpp` 未编进任何 .so）。
+- **MT 未修**：r127 用户看到的是 MT 自己的报错页面，不是 5 s ANR；
+  r127 的 `application-11738-52.log` 没有 `Get shell's uid` / `toybox` 行，
+  报错页原文尚未抓到。**下一步先让用户给报错页文字/截图，不先改代码。**
+- **图库未修**：`imgcache.idx` 仍 `ENOENT`；r125 的 `setupAppDir` 把
+  `(String path, int appId)` 误当 `(package,user)`，生成
+  `/storage/emulated/10051/Android/data/storage/...`，已回滚。正确修法见第 127 轮
+  检讨，不在本轮实施。
+- 产物：APK **1,979,819,787 B** /
+  `A636BADEBFE199944A2AF1994E825B42810B0D7F85BFE0978A2A8803F6C4B1B2`
+  （10:15:42），10:1x 装机 Success；r127 实例 `1793525278509`（host pid 11738，
+  10:18 启动，`RUNNING`）。
+- **W WebView：已验证关闭**（Via/htmlviewer，见第 120–122 轮）。
+- **音量链路的底层缺陷仍在**：AudioPolicy 启动期曲线 `-1/-1`；r127 只恢复了
+  r124 的 UI 行为，不等于 policy 已修。
+
+## 第 127 轮（2026-11-02 10:15–10:25）· 回滚 r125：恢复清云/音量，MT 与图库仍未修
+
+**只撤 r125 三处，不动 r124：**
+
+1. `runtime/patch-linker-a15.py`：删除 `__progname` / `init_progname` 同步，
+   只保留 r123 的 `args.argv[1]` 覆盖；
+2. `vendor/framework/PrivateVolumes.java`：删除 `prepareAppDir` 与
+   `setupAppDir/fixupAppDir` case；
+3. `scripts/prepare-a15.py`：删除
+   `/apex/com.android.media/lib64/extractors -> /system/lib64/extractors` 的 native_link。
+
+**保留（r124 已验证/已交付）：**
+
+- `A15AppLaunch` 删除 `LD_DEBUG=dynamic`（MT 启动从 8.6 s 降到 ~0.5 s，日志从 10+ MB 降到 ~50 KB）；
+- A15 也启动 `batterySysfs`（电池可见）；
+- `mediaextractor`/`mediametrics` 启动（媒体不卡死，但 extractor 插件目录缺、且无声）。
+
+**r125 的实证错误（不是推测）：**
+
+- `setupAppDir` 实际日志：
+  `a15_vold_app_dir=/storage/emulated/10051/Android/data/storage/emulated/0/Android/data/com.android.gallery3d/cache`
+  —— `args[0]` 是路径、`args[1]=10051` 是 appId，不是 `(package,user)`；
+- 真正的 `/storage/emulated/0/Android/data/com.android.gallery3d/cache` 仍不存在，
+  Gallery 仍报 `imgcache.idx: ENOENT`；
+- 同轮改 linker/vold/prepare，没有独立判据，导致清云视频与音量页回退。
+
+**产物/验证：**
+
+- linker：5,919,000 B / `4E6F47F1…`（与 r123/r124 同哈希，证明 r125 的 `__progname` 已撤干净）；
+- APK 1,979,819,787 B / `A636BADE…`，10:15:42 构建，10:1x `adb install -r -d` Success；
+- 用户单选：清云视频 + 音量页恢复；MT 报错页；图库无图；
+- 三个检讨：
+  `_audit/coding-log/2026-11-02-CL-A15-第127轮-检讨-把r125未验证改动盖到r124已验证状态.md`、
+  `…-不认真读日志把setupAppDir参数顺序写反.md`、
+  `…-一轮并发三轨没有一条闭环.md`。
+
+**下一步（先取证，不改代码）：**
+
+1. MT：让用户提供报错页文字/截图；抓 r127 的 `application-11738-*` 与
+   `a9exec.log`，确认是否还有 `id -u`/toybox 失败；
+2. 图库：只读 Gallery 的 `imgcache.idx` 与 `setupAppDir` 实际 args；
+   下一次只改 `PrivateVolumes` 一条轨，并按 `(String path, int appId)` 处理；
+3. 音量/清云：当前已验证恢复，不再用 linker/vold 改动碰它们。
+
+## 第 123 轮（2026-11-02 09:0x–09:2x）· guest exec 的 argv[0]：A15 linker 从来没有这一半（真机已验证）
+
+**只改一处**：`runtime/patch-linker-a15.py`（`LINKER_MAIN_CPP` 新增一条编辑）。
+
+━━ 1. 取证：不是 toybox，是 linker 没读 A10VM_EXEC_ARGV0 ━━
+
+`GuestExec.cpp` 把子进程的原始 argv[0] 放进 `A10VM_EXEC_ARGV0`（这是本项目让
+多调用二进制保留 applet 名的契约）。`vendor/runtime/dynamic/platform.patch` 里确实有
+消费端，但**那个文件不被构建使用**：A15 的 linker 由 `runtime/patch-linker-a15.py`
+生成，而它只打了 `__progname` 那一半。修前构建产物自证：
+
+```text
+python -c "print(b'A10VM_EXEC_ARGV0' in open('runtime/build/bin/source-linker64','rb').read())"
+-> False        （A10VM_LD_CONFIG / A10VM_ROOTFS 都是 True）
+```
+
+于是 `/system/bin/id`（→ toybox 的符号链接）被执行时 argv[0] 是实体路径，basename
+变成 `toybox`；toybox 把它当作"没有 applet 名"，拿第一个参数当子命令：
+
+```text
+vm/application-27156-47.log:46966  linker: [ Linking executable "/system/bin/toybox" ]
+vm/application-27156-47.log:67550  toybox: Unknown command -u (see "toybox --help")
+vm/application-27156-47.log:26386  java.lang.RuntimeException: ... Get shell's uid failed
+```
+
+`/system/bin/id`、`sh`、`cmd`、`getprop`、`dumpsys` 全是 toybox applet，所以任何第三方
+应用 shell 出去的命令都会踩这一条。
+
+━━ 2. 修法 ━━
+
+在 `__linker_init()` 里 `initial_linker_arg_count = 1` 之后读 `A10VM_EXEC_ARGV0`，
+覆盖 `args.argv[1]`。`exe_to_load` 在这一行之前已经取走指针，所以加载的可执行文件不变；
+`g_argv[0]`（= `args.argv[1]` 槽）变成调用者的字符串，与内核 `execve()` 语义一致：
+argv[0] 是调用者的，路径只用来找镜像。
+
+━━ 3. 产物 ━━
+
+| 项 | 值 |
+| --- | --- |
+| `runtime/build/bin/source-linker64` | 5,919,000 B / `4E6F47F1253C7E228D60A608F7703AE80A591DEE1E6A477C53B3994DFDD75352`（含 `A10VM_EXEC_ARGV0`） |
+| prepared 两份副本 | `liba15vm-source-linker.so` / `liba15vm-guest-ld-android.so` 同哈希 4E6F47F1… |
+| APK | 1,979,819,819 B / `BE5ED26B…`（09:21:17），09:22 `adb install -r -d` Success |
+| 构建日志 | `_bin/a15/logs/build-r123-linker.log` / `prepare-r123.log` / `gradle-r123.log` |
+
+━━ 4. 真机已验证（实例 1793525278509，host pid 22443，09:24 启动）━━
+
+- 运行中的实例确实用了新 linker：`vm/lib/ld-android.so ->` 新 APK 的
+  `lib/arm64/liba15vm-guest-ld-android.so`，`grep -c A10VM_EXEC_ARGV0` = **1**；
+- `a9exec.log`：`enter /system/bin/id`（MT 的 uid 探测确实执行）；
+- 全部 `application-22443-*.log`：`Get shell's uid failed` **0 行**、
+  `toybox: Unknown command` **0 行**（修前 `application-27156-47.log` 各 3 次）；
+- 第三方 `com.ldyc.clearcalculator` 09:2x 启动后**没有 exit 行**（进程仍在），
+  这是"第三方应用能起来并活着"的第一个本轮样本。
+
+⇒ **guest exec 的 argv[0] 关闭。** 这一条不是推演，修前修后是同两份日志的同一类行。
+
+━━ 5. **MT 没有修好**：窗口能显示，但主线程不应答输入，随后被 AMS 杀掉 ━━
+
+> 用户实测（09:34）：**MT 仍然卡在主页**。本节只证明"\`id -u\` 那条错误消失了"，
+> **不等于 MT 可用**。任何人都不要把这轮写成"MT 已修"。
+
+```text
+ActivityTaskManager: Displayed bin.mt.plus/l.⋯ for user 0: +8s616ms   ← 窗口其实显示出来了（8.6 s）
+InputDispatcher: Window 482514f bin.mt.plus/l.⋯ is unresponsive:
+  Waited 5000ms for FocusEvent(hasFocus=true)
+InputDispatcher: Canceling events for 482514f bin.mt.plus/l.⋯ because it is unresponsive
+WindowManager: ANR in Window{482514f u0 bin.mt.plus/l.⋯} ...
+ActivityManager: ANR in bin.mt.plus (bin.mt.plus/l.⋯)
+ActivityManager: Killing 24782:bin.mt.plus/u0a93 (adj 200): user request after error
+a15_application_exit=24782:bin.mt.plus code=137
+CPU usage ...: 99% <pid>/liba15vm-guest-ld-android.so: 43% user + 55% kernel
+  / faults: 2709019 minor
+```
+
+**为什么日志里没有 MT 的 Java 栈（本轮新取证，真因已拿到）**：
+guest `/data/anr/anr_2026-11-02-01-25-29-736` 里，MT 段只有
+
+```text
+----- dumping pid: 24782 at 297592503
+libdebuggerd_client: failed to connect to tombstoned: No such file or directory
+----- Waiting Channels: pid 24782 ...
+sysTid=24782     0        ← 主线程 wchan=0：不是在等内核，是在用户态空转
+```
+
+即 **guest 里没有 `tombstoned` 在跑**，debuggerd 拿不到进程、ART 的 Java backtrace
+写不出来。镜像里两个二进制都在（`system/bin/tombstoned`、`system/bin/debuggerd`），
+而 `A15_PROGRAMS`/`services` 里没有它们。
+
+**下一步唯一动作（先修"能拿到栈"，再修 MT）**：把镜像的 `tombstoned`
+作为 profile 服务启动（`/system/bin/tombstoned`，`user/group` 见镜像 rc），
+判据：MT 的 ANR 段出现 `Cmd line: … bin.mt.plus` 之后的 Java 栈（`"main" prio=…`
++ `at …` 帧）。**在这条判据出现前不改 MT 相关的任何逻辑。**
+
+## 第 122 轮（2026-11-02 08:28–08:40）· 日用问题集中取证（只文档，未改代码）
+
+实例 `1793525278509`，host pid `27156`；原始日志 `_bin/a15/logs/r122-user-1793525278509/`。
+用户操作：音量页卡住、MT 读不出内部存储后闪退、图库只出列表不出内容、文件 App 正常、
+设备信息卡、AIDA64 闪退。
+
+| 现象 | 直接原因（证据） | 文档 |
+| --- | --- | --- |
+| 音量页卡住 | AudioPolicy 音量曲线 `min=-1 max=-1` ×612，`setStreamVolumeIndex: -22` ×76；`getAudioPolicyConfig ... Failed` | [05/01](../docs/android15-port/日用修复/05-音量与媒体/01-音量页卡住.md) |
+| 图库无内容 | `MediaExtractorFactory: extractor service not running`；A15 只启动 media/media-codec，没启动 mediaextractor | [05/02](../docs/android15-port/日用修复/05-音量与媒体/02-图库与mediaextractor.md) |
+| MT 读不出存储 | `toybox: Unknown command -u` → `Get shell's uid failed`；exec 丢 applet 名，不是挂载 | [05/03](../docs/android15-port/日用修复/05-音量与媒体/03-MT管理器与内部存储.md) |
+| 传感器 0 个 | A15 AIDL `NoSensors` 返回空；`getSensorsList count=0`；A10 的真实 HIDL 没编进 A15 | [06](../docs/android15-port/日用修复/06-传感器/README.md) |
+| AIDA64 闪退 | `eglCreateContext(1647): error 0x3003 (EGL_BAD_ALLOC)` → GLSurfaceView FATAL | [07](../docs/android15-port/日用修复/07-第三方应用启动/README.md) |
+| 电池不同步 | A15 BatteryService 走 AIDL health（镜像 example）；项目 HIDL 未编入；`batterySysfs` 只在 api<=28 启动，实例无 `battery-sysfs/` | [08](../docs/android15-port/日用修复/08-电池/README.md) |
+
+**结论：只取证、未改代码、未验证修复。** 顺序与判据见
+[`docs/android15-port/日用修复/09-2026-11-02-日用问题取证总览.md`](../docs/android15-port/日用修复/09-2026-11-02-日用问题取证总览.md)。
 
 ## 第 120 轮（2026-11-02 07:5x–08:0x）· 更正符号化：崩点是 glDrawElements 的空索引，不是 m_shared；VM 被 "Truncated GL stream" 整机带走
 

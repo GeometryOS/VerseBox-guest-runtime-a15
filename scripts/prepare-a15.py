@@ -266,6 +266,15 @@ A15_PROGRAMS = {
     # app fails to load" symptom. A10 has always launched this binary
     # (guest-runtime/media_bundle.py "media"); A15 never did.
     "media": "system/bin/mediaserver",
+    # r124: MediaExtractor is a separate service (media.extractor), not part of
+    # mediaserver. A15 only started media/media-codec, so Gallery/MediaProvider
+    # full-content paths logged "MediaExtractorFactory: extractor service not
+    # running" (instance 1793525278509, 08:28-08:40). A10 has always launched
+    # these two (guest-runtime/media_bundle.py: media-extractor/media-metrics).
+    # rc: user mediaex (AID_MEDIA_EX 1040), group drmrpc mediadrm; metrics is
+    # user/group media (AID_MEDIA 1013).
+    "media-extractor": "system/bin/mediaextractor",
+    "media-metrics": "system/bin/mediametrics",
     # Round 75: audioserver alone is not enough -- AudioFlinger reaches the HAL
     # through libaudiohal, whose HIDL provider asks hwservicemanager for
     # android.hardware.audio@7.0::IDevicesFactory/default. The image declares
@@ -1516,6 +1525,14 @@ def main():
             # The codec2 software store itself (mediaswcodec). It asks mediaserver
             # for media.resource_manager, hence the order above.
             {"role": "media-codec", "logical": "media-codec", "uid": "1013", "gid": "1005",
+             "preload": "liba15vm-binder-devices.so"},
+            # r124: media.extractor / media.metrics. The image rc uses
+            # "user mediaex / group drmrpc mediadrm" and "user/group media".
+            # Only one supplementary group is supported here; drmrpc is the
+            # one mediaextractor needs for its binder calls.
+            {"role": "media-extractor", "logical": "media-extractor", "uid": "1040", "gid": "1026",
+             "preload": "liba15vm-binder-devices.so"},
+            {"role": "media-metrics", "logical": "media-metrics", "uid": "1013", "gid": "1013",
              "preload": "liba15vm-binder-devices.so"},
             {"role": "audioserver", "logical": "audioserver", "uid": "1041", "gid": "1005",
              "preload": "liba15vm-binder-devices.so"},

@@ -108,14 +108,10 @@ final class A15AppLaunch {
         environment.put("CLASSPATH", classPath);
         environment.put("A10VM_APPLICATION_PARENT_PID", Integer.toString(android.os.Process.myPid()));
         environment.put("A10VM_APPLICATION_START_NS", Long.toString(started));
-        // 临时取证（第 110 轮）：WebView 初始化在 cr_WVCFactoryProvider 之后 139，
-        // 但进程日志里既没有 "dlopen failed" 也没有 "Load libwebviewchromium.so ... ok"，
-        // 无法区分"目录里的 .so 加载失败→回退 apk"与"加载成功→native 初始化崩"。
-        // A15 linker 的 init_LD_DEBUG 只从环境变量读（linker_main.cpp:305），
-        // 所以给 app 子进程打开 dynamic 级日志（会打印 any 级的
-        // "[ opening %s from namespace %s ]" 与 "Trying zip file open from path ..."）。
-        // 取证完这一行要删掉。
-        environment.put("LD_DEBUG", "dynamic");
+        // r110 的临时取证开关 `LD_DEBUG=dynamic` 已在 r124 删除：它让 A15 linker
+        // 为每个依赖打印 dynamic entry / soinfo / zip 探测行，MT 启动因此产生 10+ MB
+        // 日志、2.7M minor faults、主线程 8.6s 卡在 linker，随后 ANR/137。
+        // WebView 取证已结束（W 轨关闭），这里必须保持安静。
         environment.remove("A10VM_DEX_CACHE");
         if (!"0".equals(System.getenv("A10VM_DEX_CACHE_ENABLED"))) {
             try {
