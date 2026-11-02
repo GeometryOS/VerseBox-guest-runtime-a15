@@ -112,6 +112,34 @@ final class A15AppLaunch {
         // 为每个依赖打印 dynamic entry / soinfo / zip 探测行，MT 启动因此产生 10+ MB
         // 日志、2.7M minor faults、主线程 8.6s 卡在 linker，随后 ANR/137。
         // WebView 取证已结束（W 轨关闭），这里必须保持安静。
+        //
+        // r157: children an app execs (pinduoduo runs `logcat` during its startup) used
+        // to inherit the framework preload and re-link ~233 libraries; the app's main
+        // thread then sat in the native wait long enough for ART's suspend timeout
+        // (SuspendThreadByPeer … state&flags: 0x9 → Aborting culprit thread → 134).
+        // Only the children are slimmed: this process keeps its full LD_PRELOAD, because
+        // the A15 classloader namespaces and ART's own odex loading resolve through it
+        // (r157: removing it from the app process made every app process die with 139).
+        // The linker applies this in linker_main() only when argv has no "-Ximage:".
+        String inheritedPreload = environment.get("LD_PRELOAD");
+        if (inheritedPreload != null && !inheritedPreload.isEmpty()) {
+            StringBuilder slim = new StringBuilder();
+            int slimEntries = 0;
+            for (String preload : inheritedPreload.split(":")) {
+                if (preload.isEmpty()) continue;
+                String base = new File(preload).getName();
+                boolean shim = base.contains("property-client") || base.contains("guest-devices")
+                        || base.contains("binder-devices") || base.contains("guest-log")
+                        || base.contains("hal-modules");
+                boolean runtimeSoname = !preload.contains("/")
+                        && (preload.equals("libc.so") || preload.equals("libm.so") || preload.equals("libdl.so"));
+                if (!shim && !runtimeSoname) continue;
+                if (slimEntries++ > 0) slim.append(':');
+                slim.append(preload);
+            }
+            environment.put("A15VM_CHILD_PRELOAD", slim.toString());
+            System.out.println("a15_child_preload=" + name + " kept=" + slimEntries);
+        }
         environment.remove("A10VM_DEX_CACHE");
         if (!"0".equals(System.getenv("A10VM_DEX_CACHE_ENABLED"))) {
             try {

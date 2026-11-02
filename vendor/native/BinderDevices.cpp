@@ -102,7 +102,16 @@ static bool parseMapsLine(const char* line, uintptr_t* start, uintptr_t* end,
     return true;
 }
 
+// Scudo stores a random tag in the top byte of every heap pointer on arm64
+// (top-byte-ignore), so registers that hold objects look like 0xb400006f....
+// /proc/self/maps never contains tagged addresses, so comparing them directly
+// made every heap/stack value fall through to "?0x..." -- the maps lookup was
+// effectively dead for anything but code addresses. Strip the tag before any
+// lookup; the raw value is still printed by the caller.
+static uintptr_t untag(uintptr_t value) { return value & 0x00FFFFFFFFFFFFFFull; }
+
 static const char* mapsLineFor(uintptr_t value) {
+    value = untag(value);
     for (const char* line = mapsText; line != nullptr && *line != 0;) {
         const char* next = strchr(line, '\n');
         uintptr_t start = 0, end = 0, offset = 0;
@@ -116,6 +125,7 @@ static const char* mapsLineFor(uintptr_t value) {
 }
 
 static void formatAddress(char* out, size_t outSize, uintptr_t value) {
+    value = untag(value);
     for (const char* line = mapsText; line != nullptr && *line != 0;) {
         const char* next = strchr(line, '\n');
         uintptr_t start = 0, end = 0, offset = 0;
@@ -246,6 +256,55 @@ static void crashHandler(int sig, siginfo_t* info, void* context) {
     for (int index = 0; index < 31; ++index) {
         written = snprintf(cursor, remaining(cursor, end), " x%d=0x%lx", index,
                            static_cast<unsigned long>(uc->uc_mcontext.regs[index]));
+        if (written > 0) {
+            if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
+            else { cursor = end; break; }
+        }
+    }
+    written = snprintf(cursor, remaining(cursor, end), "\n");
+    if (written > 0) {
+        if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
+        else cursor = end;
+    }
+    write(2, buffer, static_cast<size_t>(cursor - buffer));
+
+    // What did the null jump read? When pc=0 the faulting instruction was a
+    // branch through a zero pointer, so the only facts that identify the call
+    // site are the object register and the slot the target came from. Print one
+    // level of that chain for x0 and x19 (the usual object register): the
+    // object, its vptr ([obj]), and the virtual slot at [vptr + 0x28] that the
+    // libc++/AIDL proxy dispatch uses first. Every address is checked against
+    // the maps snapshot before it is read, so a bad register ends the chain
+    // instead of faulting inside the handler.
+    cursor = buffer;
+    written = snprintf(cursor, remaining(cursor, end), "A9VM bdev deref");
+    if (written > 0) {
+        if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
+        else cursor = end;
+    }
+    for (int index = 0; index < 2; ++index) {
+        const char* name = index == 0 ? "x0" : "x19";
+        uintptr_t object = uc->uc_mcontext.regs[index == 0 ? 0 : 19];
+        const char* objectLine = mapsLineFor(object);
+        if (objectLine == nullptr || strchr(objectLine, 'r') == nullptr) continue;
+        uintptr_t vptr = 0;
+        memcpy(&vptr, reinterpret_cast<void*>(object), sizeof(vptr));
+        char resolved[192];
+        formatAddress(resolved, sizeof(resolved), vptr);
+        written = snprintf(cursor, remaining(cursor, end), " %s=0x%lx vptr=%s",
+                           name, static_cast<unsigned long>(object), resolved);
+        if (written > 0) {
+            if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
+            else { cursor = end; break; }
+        }
+        const char* slotLine = mapsLineFor(vptr + 0x28);
+        if (slotLine == nullptr || strchr(slotLine, 'r') == nullptr) continue;
+        uintptr_t slot = 0;
+        memcpy(&slot, reinterpret_cast<void*>(vptr + 0x28), sizeof(slot));
+        char slotResolved[192];
+        formatAddress(slotResolved, sizeof(slotResolved), slot);
+        written = snprintf(cursor, remaining(cursor, end), " slot28=0x%lx(%s)",
+                           static_cast<unsigned long>(slot), slotResolved);
         if (written > 0) {
             if (static_cast<size_t>(written) < remaining(cursor, end)) cursor += written;
             else { cursor = end; break; }

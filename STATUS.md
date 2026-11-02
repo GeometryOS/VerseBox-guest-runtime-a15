@@ -1,5 +1,337 @@
 # Android 15 客体移植 · 真实进度（开发日志）
 
+> ## 换会话前先读这 12 行（r163 交接）
+>
+> - **已修复（真机验证）**：AIDA64 能打开。原因是 desktop 渲染器（`liba15vm-desktop-window.so`）现在**由 A15 仓库源码编出**
+>   （`third_party/graphics/container/desktop/*`，即 `90cb89e` 的 GLES1 修复），并经 `scripts/build-desktop-window.sh` 接进
+>   `build-a15.ps1` / `build.sh`；desktop 协议 codec 由 `codec_id_from(bridges/bin/desktop-gpu-host)` 推导（`0c8b4b13…`）。
+>   产物：APK `09D43FC1…`、渲染器 6,350,912 B / `0f9be155…`。判据：`Displayed com.finalwire.aida64` ×2、`aida64 exit 0`、
+>   `native-window/gpu-host.log` 无 `codec mismatch`。
+> - **这个修复的用处**：① 让 A15 上需要 ES1 上下文的 app 不再 `EGL_BAD_ALLOC → 137`；
+>   ② 把「渲染器由谁编」这件事接进了构建链，GLES1 修复不会再被静默丢掉；③ 主客两侧 codec 单点推导，不会再漂移。
+> - **仍未修复（下一会话第一件事）**：**传感器**。仍 `NoSensors`（`getSensorsList count=0`）。已定位到
+>   libunwind 的异常 resume 跳 0（`unwind_phase2 +0xc6c88` / `unwind_phase2_forced +0xc6da8`，`x8=__libunwind_cet_get_jump_target()`）。
+>   判据：sensorservice 不再 `pc=0`，而是打出真实错误行。**在它可用之前不要再改 `HostSensors` 的列表内容。**
+> - **不要重试**：塞二进制进仓库 / 写死 codec / 给渲染器加回退 / 改 `native-display/build.gradle.kts`。
+> - 详细：`_audit/coding-log/2026-11-03-重大事故-AIDA64与传感器-源码不入链与产物糊弄/README.md`（50 篇 + 三条红线），
+>   `_audit/00-总纲与红线.md` §4.4/§4.5。
+
+
+## r163（2026-11-03 02:0x，真机已验证）：AIDA64 真正修复 —— 渲染器从源码编，且 codec 与客体同源
+
+- **真因（渲染器自己的日志）**：`native-window/gpu-host.log` 里
+  `desktop_gpu_client_error pid=… reason=Desktop GPU codec mismatch`。客体每个 EGL 客户端都被
+  codec 不匹配踢掉 ⇒ 进程全起、`bootanim` 也起，就是**不出帧（黑屏）**，AIDA64 拿不到上下文 ⇒
+  `EGL_BAD_ALLOC` ⇒ `code=137`。
+- **codec 规则（本来就有，是我违反了）**：`bridges/build-graphics-a15.sh:96-110` 规定
+  desktop 协议 codec 必须取自随包发布的 `bridges/bin/desktop-gpu-host`（`grep -aoE '[0-9a-f]{64}'`）。
+  我之前把它写死成 A10 清单里的 `b861c5cb…`，实际应为 `0c8b4b13…`。
+- **修法（全部在 A15 仓库、源码级、无入库二进制）**：
+  1. 新增 `scripts/build-desktop-window.sh`：用 `third_party/graphics/container/{window,desktop,native}`
+     （即 `90cb89e` 打过 GLES1 补丁的那份源码）编出 `liba15vm-desktop-window.so`，输出到
+     `artifacts/native-display/`（gitignore），并生成清单（bytes/sha256/codec 自洽）；
+  2. codec 不写死：与官方脚本同源——`codec_id_from(bridges/bin/desktop-gpu-host)`，再退回
+     `third_party/graphics/codec-id.txt`；缺一即 fail；
+  3. 链接行补上遗漏的 `$EMU/android/base/files/Stream.cpp`（否则 dlopen 报
+     `cannot locate symbol _ZN7android4base6Stream7putByteEh`）；
+  4. `scripts/build-a15.ps1` 与 `scripts/build.sh` 接入这一步，并以
+     `-PnativeDisplayPrepared=guest-runtime-a15/artifacts/native-display` 交给 Gradle；
+  5. **删除**之前塞进 `prebuilt/arm64/` 的渲染器二进制与清单，**删除** pinned 回退分支
+     （现在缺 bash/NDK 或编译失败直接 throw，不再静默退回旧渲染器）。
+- **判据（真机，实例 1793525278509）**：`Displayed com.finalwire.aida64` **2**、
+  `a15_application_exit=…:com.finalwire.aida64` **0**、`QuickstepLauncher` 已 Displayed；
+  `gpu-host.log` 末尾只有 `desktop_gpu_skip`/`desktop_gpu_es1_query`，无新的 codec mismatch；
+  用户实测：**有开机动画、进桌面、AIDA64 能打开**。
+- **产物**：APK 1,981,671,385 B / `09D43FC1…`；渲染器 6,350,912 B / `0f9be155…`（源码编译）。
+- **不要重试**：① 不要把渲染器二进制塞回仓库；② 不要写死 codec；③ 不要给渲染器加回退——
+  缺编译条件就失败，让问题暴露；④ 渲染器与客体图形库必须同一 codec、同一次构建。
+
+## r162（2026-11-03 00:4x）：把 AIDA64 修复**钉进仓库**（不再依赖被 gitignore 的构建产物）
+
+- **问题**：r161 的修复依赖 `native-display/build/prepared/`，而 `.gitignore` 里同时有 `**/build/`
+  和 `runtime-inputs/`。也就是说换台机器 clone 下来（或 `gradlew clean` 之后）拿到的仍是 A10 渲染器，
+  AIDA64 会再坏一次 —— 这对开源仓库是不可接受的。
+- **修法（新增 tracked 产物 + 校验 + 优先级）**：
+  1. 新增 `prebuilt/native-display/`（**入库**）：`jniLibs/arm64-v8a/liba10vm-desktop-window.so`
+     （6,812,176 B / `d605dcb3…`，含 skip + ES1 应答）+ 同名 `.sha256` + `liba10vm-p1-client.so`
+     + `assets/native-display-inputs.json`（codec `b861c5cb…`、bytes/sha 与该 .so 自洽）；
+     与仓库既有的 `prebuilt/arm64/desktop-gpu-host` + `.sha256` 同一惯例。
+  2. `native-display/build.gradle.kts` 优先级改为：`-PnativeDisplayPrepared` →
+     **`prebuilt/native-display`（tracked）** → `native-display/build/prepared` → `runtime-inputs`（回退，带 WARNING）；
+     并对 pinned 那份做 **sha256 强校验**（不符直接 fail，不允许“拷个文件盖过去”）。
+  3. 构建日志每次打印来源：`native-display: packaging renderer from prebuilt/native-display (tracked A15 renderer)`。
+- **判据（模拟干净 clone）**：把 `native-display/build/prepared` 改名隐藏后跑
+  `gradlew :app:assembleDebug` → 日志显示从 `prebuilt/native-display` 取、打包渲染器 **6,812,176 B**、
+  `BUILD SUCCESSFUL`。恢复原名后再跑一次仍正常。
+- **含义**：`gradlew clean` 现在安全；新 clone 也能直接构建出修好 AIDA64 的包，不需要任何手工拷文件。
+- 细节：`_audit/coding-log/2026-11-03-CL-A15-AIDA64回归真因-打包了A10渲染器.md` §8。
+
+## r161（2026-11-03 00:0x，真机已验证）：AIDA64 回归真因＝**打包了 A10 的渲染器**，已修
+
+- **回归不是代码被回滚，而是构建吃了错的产物**：`native-display/build.gradle.kts` 默认只用
+  `runtime-inputs/native-display`（6,806,024 B，A10 捆绑那份），它的 `DesktopDecoder::next()`
+  对任何解不了的包直接 `throw`；AIDA64 首条 GLES1 调用 `glClearColor`(1025) 就 throw →
+  客户端被踢 → `rcCreateContext` 返回 0 → `EGL_BAD_ALLOC` → GLThread 抛 → 我们自己的 handler
+  `killProcess` → `code=137`（无 `Displayed`、无 tombstone）。
+- **修法（源码级）**：`native-display/build.gradle.kts` 改为 `-PnativeDisplayPrepared` →
+  `native-display/build/prepared`（A15 产物 6,812,176 B，含 skip/ES1 应答）→ `runtime-inputs` 三级优先。
+  清单 `native-display-inputs.json`（codec `b861c5cb…`、bytes 6,812,176、sha `d605dcb3…`）与该 .so 自洽。
+- **判据（实例 1793525278509，同一实例前后对比）**：`a15_application_exit=…:com.finalwire.aida64`
+  **9 → 0**；`Displayed com.finalwire.aida64` **0 → 2**；`HHPageDetailActivity` **0 → 7**；
+  应用日志 `EGL_BAD_ALLOC` **4/条 → 0**（506 行正常输出）。
+- **产物**：APK 1,981,671,218 B / `1F6F46FF…`，`adb install -r -d` Success。
+- **不要重试**：① 换 `liba10vm-desktop-window.so` 必须同步 `native-display-inputs.json` 的 bytes/sha256，
+  否则停在 `VERIFY Checking display`；② 清单里的 codec 必须编进渲染器；③
+  `.../desktop-gpu-host` 不在运行时路径（`ps -A` 无此进程），改它不影响 AIDA64。
+
+## r160（2026-11-02 22:0x–23:0x，真机三次取证）：传感器 `pc=0` 钉到「C++ 异常展开 resume」
+
+- **已验证（真机，实例 1793525278509）**：
+  1. **socket 翻译假设证伪**：三份 `HostSensorsHal.cpp` sha256 相同（`CE3A69F2…`）；
+     A10 reader / A15 `load()` / 宿主 `HostSensorBridge.serve()` 逐字段同序同类型；
+     真机 `a15_sensors_item` 打出 23 条合法 `SensorInfo`。
+  2. **列表内容不是变量**：只返回加速度计（1 个）仍然卡开机动画，
+     `framework-sensorservice.log` 尾部与 23 个时**逐行相同**（同样 `pc=0 fault=0x0 x8=0`）。
+  3. **崩溃点**：`bt` 符号化 = `async_safe_fatal_va_list` / `async_safe_format_log` /
+     两帧 `cxa_personality.cpp`。linker 只有两处 `br x8`，都是 libunwind
+     （`unwind_phase2 +0xc6c88`、`unwind_phase2_forced +0xc6da8`），
+     `x8 = __libunwind_cet_get_jump_target()`，`jumpto` 尾部 `chkfeat/gcspushm/Lnogcs: ret`
+     用的是恢复出来的 `x30`。⇒ **进行中的 C++ 异常在 phase2 resume 时跳到 0**，
+     框架本该打出的错误行因此永远丢失。
+  4. **RELR 假设已查并否定**：`apply_relr_reloc`/`relocate_relr` 与上游一致（bitmap、`+= load_bias`、
+     在 RELRO 之前），`should_tag_memtag_globals()==false`；若 RELR 整体失效，A15 所有
+     vtable/typeinfo 都会停在文件加数上，系统根本起不来。A9/A10 无 `DT_RELR` 属实。
+- **顺带修掉（已验证生效，通用）**：崩溃处理查 maps 没剥 scudo 顶字节标记（`0xb400006f…`），
+  导致所有归属退化成 `dladdr`；新增 `untag()` 与 `A9VM bdev deref` 行。
+  判据：修前 `A9VM bdev deref` 是空行，修后打出 `x0=… vptr=… slot28=…`。
+- **产物**：诊断版 APK 1,979,859,528 B / `6CB769A7…`；**当前装机**恢复版同名大小 /
+  `16164FB8…`（`HostSensors` 代码保留但未注册，可正常开机）。`host-devices` 79,376 B。
+- **当前唯一卡点**：libunwind 的异常 resume 路径（系统级）。修好之前**不要**再改 `HostSensors` 的
+  列表内容；判据是 sensorservice 不再 `pc=0`，改成打出真实错误行。
+- 细节：`_audit/coding-log/2026-11-03-CL-A15-传感器崩溃-异常展开恢复跳0.md`、
+  `docs/android15-port/日用修复/06-传感器/README.md` §0c。
+
+## r159（2026-11-02 21:0x–21:2x，只读取证，未改代码）：PDD 第一现场是 boot.oat 的 AOT 代码 SIGSEGV
+
+- **本轮没有改任何产品代码**，只新增两个取证脚本（`_bin/a15/scratch/r159-sample.sh`、
+  `r159-maps.sh`）；装机版本仍是 r157（APK 1,979,880,380 B），设备未重装。
+- **PDD 的真实崩溃点在启动 29 ms 内**：PDD 自带的 xcrash 写出了 tombstone：
+  `signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0`，`pid=tid=main`。
+  四次启动（26808 / 28694 / 31927 / 11561）的 `pc` 低 12 位恒为 `0x1a8`、
+  `lr` 恒为 `0xc20`、`lr-pc` 恒为 `0x1a78` ⇒ 同一个方法的同一条指令（ASLR 只改基址）。
+- **定位到 boot.oat**：pid 11561 崩溃后进程仍存活，抓 `/proc/11561/maps`：
+  `720f7000-72333000 r-xp 00098000 …/arm64/boot.oat`；`pc=0x722461a8`
+  ⇒ `vaddr = 0x1e71a8`。不是 JIT（`/memfd:jit-cache` 在 `0x45e42000`/`0x7a3a556000`），
+  不是 linker（`0x7d90550000`），不是 libc（`0x7d7b46a000`）。
+  boot.oat 在本地 rootfs / prepared / 设备三处 sha256 同为
+  `793de2f999488979dc27ee939e5db8077fb988b3527f5157c25ff8153a7655af`（3,095,512 B）
+  ⇒ **不是 prepare 损坏**。
+- **ART 的 abort 是果，不是因**：崩溃之后 main 在
+  `futex(uaddr=0x70e8b89710, op=FUTEX_WAIT, val=0x7cd2=31954, timeout=NULL)` 等
+  `Papm#xcrash_cra`（tid 31954）；后者在
+  `futex(uaddr=0x70e8b88cd4, op=FUTEX_WAIT_PRIVATE, val=1, timeout=…)` 等 main 的
+  suspend barrier（ART 原文 `barriers: 0x70e8b88cd0, barrier value: 1`，相差 4 字节）。
+  main 在 native 不返回 Java ⇒ 4.002 s ⇒ `Aborting culprit thread` ⇒ `code=134`。
+  另一路 pid 4142 的 abort 目标是 `RV#Core-1`，形状相同（**目标线程不固定**）。
+- **已排除**：① GL/EGL（崩在 ART 初始化 29 ms 内，早于 EGL）；② maps 假名（r158）；
+  ③ `xlogger_Level` 缺失（A10 同版本 `application-3766-134.log:235` 同样缺，A10 正常）；
+  ④ binder spare 池（`spare used left=0` 后 ioctl 返回错误码，不阻塞）。
+- **下一步唯一动作**：把 `boot.oat+0x1e71a8` 反查到具体 Java 方法。boot.oat 只有
+  `.dynsym` 10 个符号、没有 `.symtab`，需要按 oat 格式解析 `OatDexFile`/`OatMethodOffsets`，
+  或从镜像里取 `oatdump` 跑一次。**拿到方法名之前，不要再改 GL/安装/权限/maps。**
+- 原文：[docs/android15-port/日用修复/07-第三方应用启动/logs/03-pdd-boot-oat-crash.txt](../../docs/android15-port/日用修复/07-第三方应用启动/logs/03-pdd-boot-oat-crash.txt)
+
+- **同一轮里违反传感器纪律，已回滚（2026-11-02 21:3x）**：把 `HostDevicesA15` 的
+  `NoSensors` 换成 `HostSensors`（只返回 23 个 `SensorInfo`、`initialize` **不启动事件线程**），
+  想绕过 r136 的"事件线程崩"。实测**仍然卡开机画面**（用户复现）⇒ 新结论：
+  **列表 + initialize 本身就会带崩 sensorservice**，r136 的 `pc=0x0` 不在"推事件"这一段。
+  源码按字节回滚（`1C7A6C4D…`，28,639 B），`bridges/bin/host-devices` 重编回 49,344 B，
+  APK **1,979,880,380 B / `3E76F453…`**（21:41:29）已装机 Success。
+  检讨：`_audit/coding-log/2026-11-02-CL-A15-r159-传感器列表违反先拿栈纪律导致卡开机.md`。
+  **下次动传感器前必须先有 `framework-sensorservice.log` 的 tombstone/栈。**
+
+## r158（只读取证，未改代码）：交接文档 §四「maps 假名」已证伪，勿按它改预加载
+
+- 上一会话的结论「A15 app 进程所有系统库都以 `liba15vm-image-<hash>.so` 假名映射（969 条，真实路径 0 条）
+  → 加固 app 误判 → 进收尾分支」**只成立于宿主视角，且不是 A15 与 A10 的差异**。三条原文：
+  1. `rootfs/system/lib64/*.so` 是软链，指向 APK 的 nativeLibraryDir
+     （`libart.so -> …/lib/arm64/liba15vm-image-63026210135c73a56bf8.so`）。内核 mmap 记录解析后的文件，
+     所以 maps 里必然出现 image 名；把预加载反查成 rootfs 真实路径**改不了 maps**。
+  2. guest 自视（`ProcessEvidence.report` 在 guest 内读 `/proc/self/maps` 打的 `DESKTOP_MAP`）：
+     292 条可执行映射里 **271 条仍是 liba15vm-image-*.so，0 条 /system/lib64**；
+     只有 21 条 boot.oat 被改写成 `/system/framework/arm64/boot.oat`。
+     `GuestProcMaps` 的 alias 分支对系统库全部失配（bionic 的 `dlpi_name` 是 realpath=APK 路径，
+     `guestPath()` 原样返回 → `strcmp` 相等 → 不进 alias 表）。
+  3. **A10 没有 image 方案**：实例 `1793609584491`（rom=android10）是
+     `libz.so -> …/lib/arm64/liba10vm-guest-libz.so`（每库真实 basename，无 hash），
+     app 在 maps 里同样看不到 `/system/lib64/…`，而 PDD/B站/酷安 在 A10 正常。
+     ⇒ maps 里的假名被加固 app 容忍，§四 的因果链不成立。
+- 因此：`A15AppLaunch` 的预加载反查**不做**（最多影响 4~10 条，达不到「969→个位数」）。
+  要真让 maps 显示真实路径只有硬链接可行，但收益已被 3 否掉，不做。
+- `SuspendThreadByPeer timed out → Aborting culprit thread` 是 ART **设计行为**（目标线程 4s 不响应挂起），
+  是“主线程确实卡住”的报警器，不是要修的 bug；不要读/patch libart。
+- 下一步单条（未做）：启动 PDD 后 0.5s 采 `/proc/<hostpid>/task/*/syscall` + `wchan` + `comm`
+  （同 uid，`run-as` 可读，无需编译装机），判据是 main 的 syscall 是否推进、被哪个 tid 持有。
+- 详见 `docs/android15-port/日用修复/10-2026-11-02-r157-交接-已修与未修.md` §七。
+
+## r156（已试 → 真机黑屏 → 整轮回滚，勿重试）
+
+- 假设：A10 的 `AppLaunch` 会把 app 子进程继承的 `LD_PRELOAD` 过滤成容器 shim，
+  A15 一直原样继承整份 framework preload（4 shim + `libandroid_runtime.so` +
+  `libutils.so` + `libbinder.so` + `libhidlbase.so` + `libc.so:libm.so:libdl.so`）。
+  以为"framework 库霸占全局符号作用域"会干扰第三方壳的 `dlopen`/JNI 注册。
+- 做法：`FrameworkSession`（仅 `frameworkSdk()>=35`）写 `A15VM_APP_PRELOAD` =
+  4 shim + `libandroid_runtime.so` + `libc/libm/libdl`；`A15AppLaunch` 用它替换
+  `LD_PRELOAD`，并删掉 r150 的 `A10VM_LD_DEBUG_APP` 诊断开关。
+- 真机结果（用户实测）：**开机动画结束后无画面直接卡住**。
+- 机制（用已有日志即可定死，不需要新证据）：`application-30718-50.log` 里
+  `Configuring clns-1 … library_path=<实例>/vm/lib, permitted_path=/data:/mnt/expand`
+  —— **classloader namespace 看不到 `/system/lib64`**，所以
+  `libandroid_runtime.so` 的 `DT_NEEDED`（libutils/libbinder/libhidlbase）只能从
+  **全局组**（= LD_PRELOAD 成员）解析。把那三个挪出 preload → `libandroid_runtime.so`
+  在 clns-N 内加载失败 → `JniRegister` 的 `startReg` 拿不到 → 每个 app 进程 JNI 表为空
+  → SystemUI/Launcher 一起死。**A10 的过滤名单不能移植到 A15。**
+- 回滚（字节级已核对）：两个源文件从 `_bin/a15/scratch/backup-20261102-r156-*.java`
+  原样恢复（`FrameworkSession.java` 74,550 B / `34f32f9b…`；`A15AppLaunch.java`
+  11,066 B / `d069342b…`），重跑 `prepare-a15.py` 重建 `framework-check.dex`
+  （`A15VM_APP_PRELOAD` 0 处、`LD_DEBUG` 恢复），按
+  `-PnativeDisplayPrepared=native-display/build/prepared` 重打 APK 1,979,880,380 B 并装机
+  （设备 `lastUpdateTime=2026-11-02 19:14:54`）。用户确认**桌面已恢复**。
+- 检讨：`_audit/coding-log/2026-11-02-r156-过滤app-preload-黑屏回滚.md`
+- **不要重试**：再删 app 子进程 preload 里的 `libutils/libbinder/libhidlbase`；
+  或把 `libandroid_runtime.so` 从 preload 拿掉后"按 soname 加载一份"。
+  动 app 子进程环境前必须先回答：这个库在 clns-N 里还能不能按 soname 解析到。
+
+## 当前状态（2026-11-02 16:1x，r151–r154：logd 起来了（cap_set_proc 兜底），但 PDD 仍 SuspendThreadByPeer）
+
+- r151（回滚过）：把镜像的 `logd` 加进客体服务表 → 整台会话在开机画面前失败。
+  `startup-events.log` 给出原因：`WARN logd: Missing runtime input: logd`（`A15_PROGRAMS` 缺映射），
+  而当时服务表里任何一条失败都会把整段启动带走。
+- r153（稳健性修复，已验证）：`FrameworkSession` 的逐服务启动改成 try/catch，失败只记
+  `WARN <role>: …` 并继续。对 A9/A10/A15 都成立，是 r151 事故的直接教训；VM 正常启动（用户确认桌面在）。
+- r154（logd 真正跑起来，已验证）：补上 `A15_PROGRAMS["logd"] = system/bin/logd` 映射；又在
+  `liba15vm-guest-log` 里补了 libcap 入口（13 个符号）。原因原文：
+  `framework-logd.log`: `GUEST_LOG 7 : cap_set_proc() failed: Operation not permitted` → `A9VM abort` → sig=6。
+  容器没有 capabilities，logd 启动时「丢弃 capability」必然失败；兜底后它不再 abort。
+  证据：`<实例>/vm/sock/` 出现 `logd`/`logdr`/`logdw` 三个 socket（15:58），`framework-logd.log` 为 0 字节。
+- 但 PDD 仍然失败：`ANR in com.xunmeng.pinduoduo`、`Reason: … failed to complete startup`、
+  `a15_application_exit=12820:com.xunmeng.pinduoduo code=137`；应用日志尾部仍是
+  `SuspendThreadByPeer timed out: main: state&flags: 0xb … Final wait time: 4.001s` → `Aborting culprit thread`。
+  即 r149 的 logd.ready 与 r154 的真 logd 只消掉了「等 5 秒属性」这一层，4 秒挂起超时依旧。
+- 副产品问题：`logcat` 现在能找到 socket 但仍失败：`logcat: Logcat read failure: Connection refused`
+  （之前是 No such file or directory）——logd 的读端没有服务（只完成了监听）。
+- 下一步（单条）：先把 logcat 读通（logdr 为什么 refused），因为 ART 的 SIGQUIT 线程转储现在正好可以
+  试着落到 logcat——有了 Java 栈，SuspendThreadByPeer 才能从「猜状态位」变成「看栈」。
+
+## 当前状态（2026-11-02 16:4x，r150：PDD 卡死前的最后动作 = 启动 `/system/bin/logcat` 子进程）
+
+- **r150 只加了一个定位开关**：对 `com.xunmeng.pinduoduo` / `tv.danmaku.bili` 打开 linker 的
+  `LD_DEBUG=dynamic`（其它包保持安静，避免 r110 那种 10+ MB 日志把启动拖成 ANR）。
+  产物 APK `f911271c…`，装机 Success；`a15_application_ld_debug=` 行确认开关生效。
+- **真机 trace（实例 1793525278509，15:33:35 启动，PDD 日志 149,155 行）最后几行**：
+  ```text
+  linker: [ finished linking …/liba15vm-image-7619de060d84e55fd2d3.so ]
+  linker: [ Ready to execute "/system/bin/logcat" @ 0x74c5e53000 ]
+  linker: [ Jumping to _start (0x74c5e53000)... ]
+  logcat: Logcat read failure: No such file or directory
+  : SuspendThreadByPeer timed out: RV#Core-1: state&flags: 0xb … Final wait time: 4.003s
+  : Aborting culprit thread
+  ```
+  也就是：**PDD 在卡死前 fork/exec 了 `/system/bin/logcat`**（它自己的日志采集），logcat 失败，
+  随后 ART 在 `RV#Core-1` 上挂起超时并 abort。`a15_application_exit=…pinduoduo code=134`。
+- **本轮没有修任何东西**（这是定位版，不是修复版）。结论：PDD 的卡点从「等 JNI_OnLoad」
+  收敛到「**spawn 子进程 + 等它**这条路径**」，而客体没有 logd/logcat 可用。
+- **下一步（单条）**：让客体有可用的 `/dev/socket/logd`（或给 `/system/bin/logcat` 一个立刻退出的替身），
+  判据：PDD 日志里不再出现 `Logcat read failure`，且 `SuspendThreadByPeer timed out` 归零。
+  这一条同时会改善 ART 的线程转储（现在 SIGQUIT dump 也因为没有 logd 落不下来）。
+- **仍未动**：B站 `code=139`（libc `__srefill`，参数是 ASCII 字符串，发生在它自己的 crash SDK 回调里）。
+## 当前状态（2026-11-02 16:2x，r149 结果：logd.ready 生效但没修好 PDD —— 阻塞点从 0xb 变成 0x9）
+
+- **真机结果（实例 1793525278509，15:23:17 启动）**：PDD 仍然 `a15_application_exit=19485:com.xunmeng.pinduoduo code=134`。
+  `logcat: Failed to wait for logd.ready` **消失**（属性生效），但：
+  ```text
+  GUEST_LOG 4 MMKVLogs: dlsym xlogger_Level failed, error:undefined symbol: xlogger_Level, filename:libmarsxlog.so
+  logcat: Logcat read failure: No such file or directory   ×3     ← PDD 自己读 logcat
+  a10binder spare used left=0                                     ← binder 备用 socket 池用尽
+  : SuspendThreadByPeer timed out: main: state&flags: 0x9 … Final wait time: 4.006s
+  : Aborting culprit thread → Runtime aborting --- recursively
+  #07 … art::ThreadList::SuspendThread+3496
+  #08 … art::ThreadList::SuspendThreadByPeer+288
+  ```
+  `0x9` = ART `kWaitingForJniOnLoad`：主线程在等某个 native 库的 `JNI_OnLoad` 完成，
+  而那一侧很可能卡在 binder（同一时刻 `a10binder spare used left=0`）。
+- **结论**：r149 是**部分有效**（消掉一个 5 秒级阻塞），但 PDD 仍不可用；根因已缩小到
+  「主线程等 JNI_OnLoad + binder 备用池耗尽」这一段，**不是 GL/安装权限**。
+- **下一步（单条）**：查 `a10binder` 备用 socket 池的补充逻辑（`spare used left=0` 之后线程怎么初始化），
+  以及 PDD 的哪个 `.so` 的 `JNI_OnLoad` 没有返回（日志里最后一个成功的是 `libmmkv.so` / `libmarsxlog.so` 的 dlsym 失败）。
+- **B站 仍未动**：`code=139`，崩在 libc `__srefill`（参数是 ASCII 字符串），且发生在它自己的 crash SDK 回调里。
+## 当前状态（2026-11-02 16:0x，r149：`logd.ready=true` —— 消掉 5 秒阻塞，但 PDD 仍未通过）
+
+- **判据与根因（原文）**：PDD 与 `com.liuzh.deviceinfo` 是**同一个形状**，不是 GL/安装问题：
+  ```text
+  ANR in com.xunmeng.pinduoduo
+  Reason: Process … failed to complete startup
+  application-…-60.log:
+    logcat: Failed to wait for logd.ready to become true. logd not running?
+    : SuspendThreadByPeer timed out: main: state&flags: 0xb … Final wait time: 4.004s
+    : Aborting culprit thread
+  ```
+  `state&flags: 0xb` = ART `kWaitingInMainSignalCatcherLoop`：主线程被信号捕获线程占用，
+  而它正卡在 **liblog 等 `logd.ready` 属性**（本客体没有 logd，每次最多等 5 秒）——
+  所以 `SuspendAll` 4 秒等不到响应，ART 直接 `Aborting culprit thread`。
+- **修法（一行属性，不改代码）**：`guest-a15.prop` 加 `logd.ready=true`。liblog 于是立刻
+  发现 socket 不存在并失败返回，不再阻塞信号捕获线程。客人属性文件 6,454 → 6,470 B。
+- **产物**：APK **1,979,819,845 B** / `56d66ef72c4de357d8972e60c5ff555af8c7a31b904cbc1d30885592c1c150dd`，
+  装机 Success（window 库仍是 r148 的 6,812,176 B / `d605dcb3…`，AIDA64 能力不受影响）。
+- **判据（待真机）**：PDD / 设备信息 的 `SuspendThreadByPeer timed out` **0 行**、
+  `Failed to wait for logd.ready` **0 行**、进程 `code=134` 归零；VM `state=RUNNING`。
+- **B站（`tv.danmaku.bili`, code=139）不在本轮**：它崩在 libc `__srefill`（参数是 ASCII 字符串，不是 FILE*），
+  而且发生在它自己的 crash SDK 回调里（`blcrash … NativeHandler.crashCallback`）——另有根因，单列。
+## 当前状态（2026-11-02 15:2x 追加：B站/拼多多 的实测失败原文 + GLESv1 绘制边界）
+
+### 1) GLESv1 绘制：明确未实现（AIDA64 能开、3D 页空白就是这个）
+
+- 宿主端点现在**只回包** GLESv1 的请求-应答类调用（29 个 opcode），**绘制类全部丢弃**：
+  `glClear`/`glClearColor`/`glViewport`/`glMatrixMode`/`glVertexPointer`/`glDrawArrays`/
+  `glTexImage2D`/`glBlendFunc` 等一律不执行（宿主 trace 的 `desktop_gpu_skip opcode=1025`
+  就是 `glClearColor` 被丢弃的原文）。
+- 因此 **GLESv1 应用能启动、能交互，但它的 GL 画面永远不更新**：AIDA64 主界面是普通 View，
+  所以能看能点；它的 3D 图形页是空的。
+- 要真正渲染，必须实现宿主侧 GLESv1 **绘制解码**（294 个入口，按 `GLESv1_enc/gl_enc.cpp` 的线格式
+  镜像为宿主 GL 调用，客户端数组还要按 goldfish 的 pointer 机制重建）。独立一轨，**尚未开始**。
+
+### 2) 哔哩哔哩（`tv.danmaku.bili`）：SIGSEGV，崩在它自己的崩溃处理器里
+
+```text
+a15_application_launch=13709:tv.danmaku.bili uid=10101 readonly=0
+a15_application_exit=13709:tv.danmaku.bili code=139        ← SIGSEGV
+application-…-59.log: A9VM bdev crash sig=11 code=1 fault=0x7265702e64697f
+  pc=liba15vm-guest-ld-android.so+0x86050（map 落在 liba15vm-guest-libc.so）
+  x0=0x6d7265702e64696f   ← 参数是 ASCII（oid.per…），不是 FILE*
+  符号化 = libc __srefill（stdio 读缓冲）
+```
+
+崩溃前最后几行是它自己的崩溃 SDK 在跑（`blcrash: parse crash_tribe_bundles error`、
+`com.bilibili.lib.blcrash.NativeHandler.crashCallback`）——也就是**先有一次崩溃，处理器再崩**。
+`__srefill` 拿到一个字符串当 `FILE*` ⇒ 参数/结构对不上。**本轮没有定论，不写「已修」。**
+
+### 3) 拼多多（`com.xunmeng.pinduoduo`）：AMS 判 failed to complete startup，ART 随后自己 abort
+
+```text
+ANR in com.xunmeng.pinduoduo
+Reason: Process … failed to complete startup
+application-…-60.log 末尾：
+  MMKVLogs: dlsym xlogger_Level failed
+  : SuspendThreadByPeer timed out: main: state&flags: 0xb … Final wait time: 4.004s
+  : Aborting culprit thread
+```
+
+这条与 **`com.liuzh.deviceinfo`（Bugly）同源**：ART `SuspendAll` 时主线程 4 秒没响应挂起请求，
+于是 `Aborting culprit thread` → SIGABRT。**不是 GL、也不是安装权限**，是 ART 的挂起/信号路径。
+本轮同样没有定论。
+
+- **不要重试**：① 不要把 B站/拼多多 归到「Writable dex」或 GL 上（都不在那条链上）；
+  ② 不要用「加长 AMS 超时」掩盖 PDD 的 `SuspendThreadByPeer`；③ 不要把三者混在一版里改。
 ## 当前状态（2026-11-02 15:0x，r148：AIDA64 可进主界面并交互 —— 真机已验证，3D 页仍空白）
 
 - **判据（实例 1793525278509，14:59:18 启动，用户操作 + 日志双证）**：

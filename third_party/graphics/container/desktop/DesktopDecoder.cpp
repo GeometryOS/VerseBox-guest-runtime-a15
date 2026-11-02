@@ -376,9 +376,21 @@ bool DesktopDecoder::es1Query(uint32_t opcode, uint32_t bytes, SocketStream& str
     // (instance 1793525278509, round 147):
     //   desktop_gpu_es1_query opcode=1185 size=4
     //   desktop_gpu_client_error ... OP_rcSetWindowColorBuffer: GL checksumCalculator failure
+    // A packet this endpoint answers itself still carries a checksum, and it has to be
+    // consumed exactly the way a generated decoder consumes one: protocol v1 stores
+    // [bit-reversed body length][read counter] in the LAST checksumSize bytes, and
+    // addBuffer() must accumulate the same length the encoder accumulated (everything
+    // before the checksum). The previous code validated at packet+8 and never called
+    // addBuffer, which is only correct for a zero-argument packet such as 1185; for a
+    // packet with arguments it compared the wrong bytes and left the length at 0, so
+    // the NEXT decoded packet failed with "GL checksumCalculator failure"
+    // (OP_rcSetWindowColorBuffer) and the client was dropped.
     const size_t requestChecksum = checksum_.checksumByteSize();
-    if (requestChecksum && packet_.size() >= 8 + requestChecksum)
-        checksum_.validate(packet_.data() + 8, requestChecksum);
+    if (requestChecksum && packet_.size() >= 8 + requestChecksum) {
+        const size_t body = packet_.size() - requestChecksum;
+        checksum_.addBuffer(packet_.data(), body);
+        checksum_.validate(packet_.data() + body, requestChecksum);
+    }
     if (answered_.insert(opcode).second)
         desktop_gpu_trace("desktop_gpu_es1_query opcode=%u size=%zu\n", opcode, result.size());
     reply(stream, result.data(), result.size());
@@ -439,8 +451,11 @@ bool DesktopDecoder::next(SocketStream& stream) {
         // The result is deliberately ignored here: this call advances the counter and
         // resets the per-packet length, which is all the next packet needs.
         const size_t checksumSize = checksum_.checksumByteSize();
-        if (decoded == 0 && checksumSize && packet.size() >= 8 + checksumSize)
-            checksum_.validate(packet.data() + 8, checksumSize);
+        if (decoded == 0 && checksumSize && packet.size() >= 8 + checksumSize) {
+            const size_t body = packet.size() - checksumSize;
+            checksum_.addBuffer(packet.data(), body);
+            checksum_.validate(packet.data() + body, checksumSize);
+        }
         if (skipped_.insert(header[0]).second)
             desktop_gpu_trace("desktop_gpu_skip opcode=%u bytes=%u decoded=%zu\n", header[0], header[1], decoded);
         previousOpcode_ = header[0];

@@ -159,9 +159,31 @@ if ($SkipApk) {
     Step "SkipApk: stopping before Gradle"
     exit 0
 }
+# 5b. desktop window renderer, built FROM SOURCE ----------------------------------
+# Sources: third_party/graphics/container/{window,desktop,native} in THIS repository
+# (the same tree commit 90cb89e patched for the GLES1 crash). There is no pinned
+# fallback on purpose: when no build step compiled this source, the packaged renderer
+# silently stayed at the old one and every ES1 app died with
+# "createContext failed: EGL_BAD_ALLOC" (AIDA64, code=137).
+Step "desktop window renderer (from source)"
+$rendererShell = $null
+foreach ($candidate in @((Get-Command bash -ErrorAction SilentlyContinue | Select-Object -First 1).Source) + @(
+        "$env:ProgramFiles\Git\bin\bash.exe",
+        "D:\Program\Git\bin\bash.exe", "/usr/bin/bash", "/bin/bash")) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) { $rendererShell = $candidate; break }
+}
+if (-not $rendererShell) { throw "desktop window renderer needs bash in PATH (it is compiled from source)" }
+& $rendererShell "scripts/build-desktop-window.sh"
+if ($LASTEXITCODE -ne 0) { throw "scripts/build-desktop-window.sh failed" }
+$rendererRoot = "guest-runtime-a15/artifacts/native-display"
+if (-not (Test-Path (Join-Path $module "artifacts/native-display/jniLibs/arm64-v8a/liba15vm-desktop-window.so"))) {
+    throw "desktop renderer was not produced under $rendererRoot"
+}
+Write-Host "  renderer: $rendererRoot (compiled from source)"
+
 Step "APK (app-debug.apk)"
 Set-Location $root
-& (Join-Path $root "gradlew.bat") ":app:assembleDebug"
+& (Join-Path $root "gradlew.bat") ":app:assembleDebug" "-PnativeDisplayPrepared=$rendererRoot"
 if ($LASTEXITCODE -ne 0) { throw "gradle :app:assembleDebug failed" }
 Write-Host ""
 Write-Host "A15 pipeline complete: $root\app\build\outputs\apk\debug\app-debug.apk" -ForegroundColor Green

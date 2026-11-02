@@ -344,6 +344,29 @@ class HostSensors final : public BnSensors {
             info.flags = flags & ~1;  // SENSOR_FLAG_WAKE_UP
             info.fifoReservedEventCount = 0;
             info.fifoMaxEventCount = 0;
+            // Read-only dump of the exact SensorInfo the framework is about to
+            // receive. sensorservice aborts with pc=0 as soon as the list is
+            // non-empty, so the field values are part of the measurement: a
+            // min/max delay pair that violates the HAL contract, a bogus type or
+            // a stray flag bit is visible here without another build. This line
+            // never changes what is sent over the socket or the binder.
+            std::printf("a15_sensors_item handle=%d type=%d flags=0x%x min=%d max=%d range=%g res=%g power=%g string=%s name=%s\n",
+                        info.sensorHandle, static_cast<int>(info.type), static_cast<unsigned>(info.flags),
+                        info.minDelayUs, info.maxDelayUs, info.maxRange, info.resolution, info.power,
+                        info.typeAsString.c_str(), info.name.c_str());
+            // A15 only exposes the accelerometer for now. Rationale: the
+            // framework aborts (pc=0, x8=0 -> a virtual call through a zero
+            // slot) as soon as getSensorsList returns the whole 23-sensor host
+            // list, while an empty list boots. The event/socket translation is
+            // byte-for-byte the A10 one (the item dump above proves the field
+            // order matches HostSensorBridge), so the failure is on the
+            // framework side of the AIDL contract, not in this parser.
+            // Bisection: one sensor, the only one auto-rotate needs. If this
+            // boots, the trigger is some entry of the full list; if it still
+            // aborts, the trigger is "any non-empty list" and the AIDL/FMQ
+            // contract is next.
+            constexpr int32_t kAccelerometer = 1;  // SENSOR_TYPE_ACCELEROMETER
+            if (static_cast<int32_t>(info.type) != kAccelerometer) continue;
             sensors_.push_back(std::move(info));
         }
         std::printf("a15_sensors_list=count=%zu\n", sensors_.size());

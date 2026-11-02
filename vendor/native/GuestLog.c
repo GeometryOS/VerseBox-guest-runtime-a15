@@ -1,11 +1,64 @@
 #include <android/log.h>
 #include <errno.h>
 #include <execinfo.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ucontext.h>
 #include <unistd.h>
+
+/*
+ * The host applies its own seccomp policy to every process of this app, and guest
+ * services call syscalls that policy does not allow: logd was killed by SIGSYS
+ * (exit code 159) right after it bound /dev/socket/logd*, which left the three
+ * sockets on disk with no listener and made every logcat fail with ECONNREFUSED.
+ * Android expects a denied syscall to fail with ENOSYS, so emulate exactly that:
+ * skip the trapped instruction and return -ENOSYS. Only a process that would
+ * otherwise be killed by the signal is affected.
+ */
+static void sigsys_note(const char* text, unsigned long value) {
+    char line[80];
+    size_t length = 0;
+    while (text[length] != '\0' && length < sizeof(line) - 24) {
+        line[length] = text[length];
+        ++length;
+    }
+    char digits[24];
+    size_t count = 0;
+    if (value == 0) digits[count++] = '0';
+    while (value > 0) {
+        digits[count++] = (char)('0' + (int)(value % 10));
+        value /= 10;
+    }
+    while (count > 0) line[length++] = digits[--count];
+    line[length++] = '\n';
+    ssize_t ignored;
+    do { ignored = write(STDERR_FILENO, line, length); } while (ignored < 0 && errno == EINTR);
+}
+
+static void sigsys_handler(int signal, siginfo_t* info, void* context) {
+    (void)signal;
+    if (info != NULL) sigsys_note("A15VM seccomp blocked syscall ", (unsigned long)info->si_syscall);
+#if defined(__aarch64__)
+    ucontext_t* uc = (ucontext_t*)context;
+    /* x0 carries the syscall return value; pc has to skip the trapped svc. */
+    uc->uc_mcontext.regs[0] = (unsigned long)(-ENOSYS);
+    uc->uc_mcontext.pc += 4;
+#else
+    (void)context;
+#endif
+}
+
+__attribute__((constructor)) static void install_sigsys_handler(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = sigsys_handler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSYS, &action, NULL);
+}
 
 static int emit(int priority, const char* tag, const char* text) {
     int saved = errno;
@@ -220,3 +273,43 @@ void __stack_chk_fail(void) {
         }
     }
 }
+
+/*
+ * Round 154: logd aborts before it can serve anyone because this container has no
+ * capabilities at all (it runs as an app uid):
+ *   GUEST_LOG 7 : cap_set_proc() failed: Operation not permitted
+ *   A9VM abort caller=liba15vm-image-…so+0xaa6f8   (then sig=6)
+ * logd's init path drops capabilities through libcap; the call can never succeed
+ * here, and failing it is what kills the daemon. Answer the libcap entry points
+ * locally so the "drop everything" step becomes a no-op. libcap's cap_t is opaque,
+ * so a static dummy is enough for the only pattern used here (get, set flag, set
+ * proc, free).
+ */
+typedef void* guest_cap_t;
+static char guest_cap_dummy[64];
+
+guest_cap_t cap_get_proc(void) { return guest_cap_dummy; }
+guest_cap_t cap_get_file(const char* path) { (void) path; return guest_cap_dummy; }
+guest_cap_t cap_get_pid(int pid) { (void) pid; return guest_cap_dummy; }
+guest_cap_t cap_from_text(const char* text) { (void) text; return guest_cap_dummy; }
+guest_cap_t cap_dup(guest_cap_t caps) { (void) caps; return guest_cap_dummy; }
+int cap_set_proc(guest_cap_t caps) { (void) caps; return 0; }
+int cap_set_file(const char* path, guest_cap_t caps) { (void) path; (void) caps; return 0; }
+int cap_set_flag(guest_cap_t caps, int type, int count, const int* values, int flag) {
+    (void) caps; (void) type; (void) count; (void) values; (void) flag;
+    return 0;
+}
+int cap_clear(guest_cap_t caps) { (void) caps; return 0; }
+int cap_clear_flag(guest_cap_t caps, int type) { (void) caps; (void) type; return 0; }
+int cap_free(void* caps) { (void) caps; return 0; }
+int cap_get_flag(guest_cap_t caps, int value, int type, int* result) {
+    (void) caps; (void) value; (void) type;
+    if (result) *result = 0;
+    return 0;
+}
+char* cap_to_text(guest_cap_t caps, long* length) {
+    (void) caps;
+    if (length) *length = 0;
+    return (char*) "";
+}
+

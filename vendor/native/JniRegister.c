@@ -212,6 +212,34 @@ static void* no_load(const char* path) {
     return dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
 }
 
+static const char* g_runtime_via = "rtld_default";
+
+/*
+ * Returns the one libandroid_runtime.so this process uses, loading it if needed.
+ *
+ * Framework processes still find the already-preloaded copy (RTLD_NOLOAD), but an
+ * app child no longer preloads the framework: A15AppLaunch keeps only the container
+ * shims so that every process the app itself spawns does not have to re-link the
+ * whole framework dependency graph (round 157). The guest rootfs symlinks
+ * /system/lib64/libandroid_runtime.so to the very APK image file that used to be
+ * preloaded, so this dlopen yields that same single copy: AndroidRuntime::mJavaVM
+ * and the JNI table stay inside it, which is the app_process arrangement.
+ */
+static void* open_runtime(void) {
+    void* runtime = no_load(getenv("A15VM_ANDROID_RUNTIME"));
+    if (runtime != NULL) {
+        g_runtime_via = "configured_path";
+        return runtime;
+    }
+    runtime = no_load("libandroid_runtime.so");
+    if (runtime != NULL) {
+        g_runtime_via = "soname";
+        return runtime;
+    }
+    g_runtime_via = "soname_loaded";
+    return dlopen("libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL);
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     (void)reserved;
     g_vm = vm;
@@ -228,18 +256,12 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 
     StartReg startReg = (StartReg)dlsym(RTLD_DEFAULT, START_REG);
     const char* via = "rtld_default";
+    void* runtime = NULL;
     if (startReg == NULL) {
-        void* runtime = no_load(getenv("A15VM_ANDROID_RUNTIME"));
+        runtime = open_runtime();
         if (runtime != NULL) {
             startReg = (StartReg)dlsym(runtime, START_REG);
-            via = "configured_path";
-        }
-    }
-    if (startReg == NULL) {
-        void* runtime = no_load("libandroid_runtime.so");
-        if (runtime != NULL) {
-            startReg = (StartReg)dlsym(runtime, START_REG);
-            via = "soname";
+            via = g_runtime_via;
         }
     }
     if (startReg == NULL) {
@@ -248,23 +270,16 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
     // Publish this VM as AndroidRuntime::mJavaVM, exactly as app_process does in
-    // AndroidRuntime::startVm(). Same resolution ladder: never load a second copy
-    // of libandroid_runtime.so (it is in LD_PRELOAD; a second copy would have its
-    // own mJavaVM and the framework's threads would keep dying).
+    // AndroidRuntime::startVm(). Same library instance as startReg above: publishing
+    // into a different copy would give the framework a second mJavaVM and its threads
+    // would keep dying.
     JavaVM** slot = (JavaVM**)dlsym(RTLD_DEFAULT, JAVA_VM_SLOT);
     const char* slotVia = "rtld_default";
     if (slot == NULL) {
-        void* runtime = no_load(getenv("A15VM_ANDROID_RUNTIME"));
+        if (runtime == NULL) runtime = open_runtime();
         if (runtime != NULL) {
             slot = (JavaVM**)dlsym(runtime, JAVA_VM_SLOT);
-            slotVia = "configured_path";
-        }
-    }
-    if (slot == NULL) {
-        void* runtime = no_load("libandroid_runtime.so");
-        if (runtime != NULL) {
-            slot = (JavaVM**)dlsym(runtime, JAVA_VM_SLOT);
-            slotVia = "soname";
+            slotVia = g_runtime_via;
         }
     }
     int published = 0;

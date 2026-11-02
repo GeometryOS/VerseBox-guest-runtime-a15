@@ -141,6 +141,9 @@ done
 step "boot animation asset"
 "$PY" scripts/make-bootanimation.py
 
+# The desktop window renderer is pinned under prebuilt/native-display (unified binary
+# dir) and consumed through -PnativeDisplayPrepared; see build-a15.ps1 for why the
+# bundled A10 renderer must not be packaged.
 step "prepared (manifest + assets + jniLibs)"
 "$PY" scripts/prepare-a15.py
 

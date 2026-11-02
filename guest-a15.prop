@@ -52,6 +52,16 @@ ro.product.first_api_level=35
 ro.crypto.state=unencrypted
 ro.lockscreen.disable.default=true
 sys.use_memfd=true
+# Round 149: this guest has no logd (no /dev/socket/logd), and liblog's writer
+# waits up to 5 s for the "logd.ready" property before every write:
+#   logcat: Failed to wait for logd.ready to become true. logd not running?
+# ART's signal catcher writes through Slog, so a thread sitting in that wait
+# cannot answer SuspendAll: measured on com.xunmeng.pinduoduo (round 149)
+#   : SuspendThreadByPeer timed out: main: state&flags: 0xb  (kWaitingInMainSignalCatcherLoop)
+#   Final wait time: 4.004s -> Aborting culprit thread
+# same shape as com.liuzh.deviceinfo (Bugly). Seeding the property makes liblog
+# fail fast on the missing socket instead of blocking the catcher.
+logd.ready=true
 ro.product.locale=zh-CN
 persist.sys.timezone=Asia/Shanghai
 # Android 15's ART defaults to a 16KB-aligned image when the device reports it.

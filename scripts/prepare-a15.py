@@ -198,6 +198,13 @@ A15_PROGRAMS = {
     # scripts/make-bootanimation.py generates the asset that is staged below.
     "bootanimation": "system/bin/bootanimation",
     "installd": "system/bin/installd",
+    # Round 153: the image's own logging daemon. Nothing started it, so every liblog
+    # client waited up to 5 s for "logd.ready" and logcat failed:
+    #   logcat: Logcat read failure: No such file or directory
+    # ART's SIGQUIT dump goes through liblog too, so without logd we had no Java stacks
+    # at all. The service table entry (role "logd") needs this mapping or the launch
+    # fails with "Missing runtime input: logd" (measured, instance 1793525278509 r153).
+    "logd": "system/bin/logd",
     # Round 78: LockSettingsService.onThirdPartyAppsStarted() runs near the end
     # of startOtherServices (SystemServer.java:3440) and migrates user 0 to an
     # SP-based credential. That path calls
@@ -1466,6 +1473,16 @@ def main():
         # same uid 0, only the binder-devices preload so /dev/binder is the
         # project endpoint.
         "services": [
+            # Round 153 (retry of r151): the image ships a real /system/bin/logd (668,728 B);
+            # without it every liblog client waits up to 5 s on "logd.ready" and logcat fails
+            #   logcat: Logcat read failure: No such file or directory
+            # which also costs us ART's SIGQUIT thread dump. r151 added this entry while a
+            # failing service still aborted the whole session (no boot animation), so r153
+            # first made per-service failures non-fatal in FrameworkSession, then re-added it.
+            # Guest /dev/socket is a symlink to <instance>/vm/sock; its own logging goes to
+            # stderr through liba15vm-guest-log, so it cannot recurse into itself.
+            {"role": "logd", "logical": "logd", "uid": "0", "gid": "0",
+             "preload": "liba15vm-guest-log.so"},
             {"role": "power", "logical": "power", "uid": "0", "gid": "0",
              "preload": "liba15vm-binder-devices.so"},
             # init's rc for this one is `user system / group system wakelock /
