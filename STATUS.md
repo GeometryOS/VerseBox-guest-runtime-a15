@@ -9,12 +9,60 @@
 >   `native-window/gpu-host.log` 无 `codec mismatch`。
 > - **这个修复的用处**：① 让 A15 上需要 ES1 上下文的 app 不再 `EGL_BAD_ALLOC → 137`；
 >   ② 把「渲染器由谁编」这件事接进了构建链，GLES1 修复不会再被静默丢掉；③ 主客两侧 codec 单点推导，不会再漂移。
+> - **r164：构建入口已统一**——`Android Studio` 的 Build / 裸 `gradlew :app:assembleDebug` 现在也会
+>   **自动编出并校验渲染器**（`-PnativeDisplayAutoBuild`），不再依赖谁记得传 `-PnativeDisplayPrepared`；
+>   打包到 A10 渲染器就直接**构建失败**（`-PnativeDisplayAllowA10Renderer=true` 才降级成告警）。
 > - **仍未修复（下一会话第一件事）**：**传感器**。仍 `NoSensors`（`getSensorsList count=0`）。已定位到
 >   libunwind 的异常 resume 跳 0（`unwind_phase2 +0xc6c88` / `unwind_phase2_forced +0xc6da8`，`x8=__libunwind_cet_get_jump_target()`）。
 >   判据：sensorservice 不再 `pc=0`，而是打出真实错误行。**在它可用之前不要再改 `HostSensors` 的列表内容。**
-> - **不要重试**：塞二进制进仓库 / 写死 codec / 给渲染器加回退 / 改 `native-display/build.gradle.kts`。
+> - **不要重试**：塞二进制进仓库 / 写死 codec / 把 A10 渲染器做成默认或静默回退 / 删掉 `native-display` 的渲染器校验。
 > - 详细：`_audit/coding-log/2026-11-03-重大事故-AIDA64与传感器-源码不入链与产物糊弄/README.md`（50 篇 + 三条红线），
 >   `_audit/00-总纲与红线.md` §4.4/§4.5。
+
+
+## r165（宿主侧 · ROM 包落地第一批）：共享 Java 层新增 `romRoot`，默认分支不变
+
+- 本轮做事：`docs/rom-package/` 阶段 1–5 的第一批（打包器 / 运行时读 ROM / ROM 管理数据层 /
+  两分支 UI / 构建期轻校验）。契约与判据见 [`docs/rom-package/10-实现记录.md`](../docs/rom-package/10-实现记录.md)。
+- **动到了 A15 也用的共享层**：`guest-runtime/.../RuntimeFiles.java` 与 `GuestRuntime.java`
+  新增可选参数 `romRoot`。**`romRoot == null` 时清单来源、payload 来源、客体 .so 来源
+  与改造前完全一致**（旧路径的失败行仍是 `Runtime input mismatch: <name>`）。
+- **本轮没有重编 A15 域的 prepared / 渲染器，也没有验证 A15 启动**：本轮改的是
+  `app` 与共享 Java 层，A15 的 `prepared/` 与 `prepared/sources.json` 未动。
+  下一次开 A15 的会话，**第一件事仍是传感器那条轨**（见顶部 r164 的"仍未修复"），
+  不是 ROM。
+- 如果要验"ROM 包形态的 A15 实例能不能开机"：`tools/pack-rom.py` 产出的包是
+  `libMode=apk`（客体 .so 仍来自 APK），payload 与 `prepared/assets/guest-runtime-a15` 逐条同哈希，
+  所以判据与普通 A15 实例相同：`READY Android framework accepting input` 那一行出现。
+
+## r164（构建链一致性）：Android Studio 直接构建也走 GLES1 渲染器，不再只有 A15 脚本才对
+
+- **用户报的问题**：`scripts\build-a15.cmd`（包装 `build-a15.ps1`）产出的 APK 是对的；但**用 Android Studio
+  打开工程直接 Build、或裸跑 `gradlew :app:assembleDebug`，打包的仍是 A10 那套渲染器**（没有 GLES1）。
+- **真因（不是代码回滚，是构建入口没接上）**：`native-display/build.gradle.kts` 只有两级来源——
+  `-PnativeDisplayPrepared`（只有 A15 脚本传）→ `runtime-inputs/native-display`（从 `_bin/A10VM.apk` 解包的
+  A10 渲染器，6,806,024 B，`DesktopDecoder::next()` 遇 GLES1 opcode 直接 throw）。**IDE 构建不传参数**，
+  于是每次都悄悄回到 r161 之前那个死法：ES1 应用 `EGL_BAD_ALLOC → 137`。
+  r163 把渲染器做成"只有脚本才编"，但没解决"IDE 不会跑脚本"这件事。
+- **修法（`native-display/build.gradle.kts`，选择逻辑收成一处）**：
+  1. 优先级：`-PnativeDisplayPrepared` → `guest-runtime-a15/artifacts/native-display`（源码产物）→
+     `native-display/build/prepared` → `runtime-inputs`（A10，最后兜底）；
+  2. 新增 `:native-display:buildDesktopWindowRenderer`：在 Gradle 里跑 `scripts/build-desktop-window.sh`
+     （Git Bash / NDK 29 自动探测，`ANDROID_NDK_HOME` 由 Gradle 传入），`preBuild` 依赖它，
+     **IDE 构建即源码构建**；输入是 `container`/`a9/{generated,definitions,upstream}`/`compat` + codec，
+     源不变则 UP-TO-DATE（实测二次构建 2 s）；
+  3. `verifyRenderer` 现在会：读 `.so` 里的 `desktop_gpu_es1_query` 标记判断「认不认 GLES1」、
+     按清单逐条核对 `bytes`/`sha256`（运行时的 `files.verifyInputs()` 就是这么查的）、
+     核对清单 `codec` 真的编进了 `.so`；不认 GLES1 就**构建失败**并给出修法；
+  4. 每次构建打印一行来源：`renderer: <dir> -> liba15vm-desktop-window.so 6350912 B (GLES1-aware, built from source), codec ok`。
+- **判据（本机实测）**：`gradlew :native-display:verifyRenderer` 打印 GLES1-aware；`buildDesktopWindowRenderer`
+  45 s 编出 6,350,912 B / `0f9be155…`（与 r163 真机验证那份逐字节一致，可复现）；
+  `gradlew :app:mergeDebugNativeLibs` 后 `app/build/intermediates/merged_native_libs/debug/.../liba15vm-desktop-window.so`
+  = `0f9be155…`（A10 那份 `41a723…` 不再出现）；把 `-PnativeDisplayPrepared` 指向 A10 目录会**失败**，
+  加 `-PnativeDisplayAllowA10Renderer=true` 才降级为告警。
+- **不要重试**：不要为了"能构建"把 A10 渲染器做成默认（那正是这个 bug）；不要在 IDE 里手动传参当解法——
+  参数只是显式锁定同一目录，默认路径必须自己是对的。
+
 
 
 ## r163（2026-11-03 02:0x，真机已验证）：AIDA64 真正修复 —— 渲染器从源码编，且 codec 与客体同源

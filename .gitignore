@@ -40,3 +40,9 @@ bridges/graphics/obj/
 *.rsp
 *.elf.txt
 *.dex.json
+
+# ROM 包产物（每个 0.5–1.6 GB，由 rom/pack-rom.py 产出；进了仓库就是灾难）
+dist/
+
+# 构建失败日志（*.log 已覆盖；显式留一行说明它是本地证据，不是源码）
+scripts/build-logs/

@@ -17,7 +17,7 @@
 
 > **目前的状态：可以启动并操作。**
 > 触摸可用，开机动画由客体自己的 `bootanimation.zip` 绘制。
-> **wifi，音频，相机，传感器爆炸（但wifi的宿主网络注入已修复）这些问题会在后续修复。**
+> **wifi，音频均已修正常使用，相机，传感器爆炸，这些问题会在后续修复。**
 > overlay/idmap2d 与 networkstack 健康检查尚未处理，详见 [STATUS.md](STATUS.md)。
 
 ![Android 15 桌面与全部应用](assets/screenshot.jpg)
@@ -91,20 +91,14 @@ rootfs/      解包后的 Redroid 15 根文件系统（不入库）
 - **镜像文件不在本仓库。** Redroid 15 的 tar 由 `scripts/fetch-redroid15.py` 构建时获取，
   仓库只包含构建它的补丁与应用源码。
 
-- **图形源分两部分。** `third_party/graphics/` 里的补丁、生成物与 HAL 头随仓库分发；
-  被固定的 goldfish/qemu 源码（255 个文件，6.2 MB）**随仓库提交**，
-`scripts/fetch-graphics-sources.sh` 只作为被裁剪 checkout 的补救。
+## ROM 自动打包
 
-- **`prebuilt/arm64/desktop-gpu-host` 是 pinned 的宿主 GPU 端点**（附 sha256）。
-  默认直接用；`sh scripts/build-desktop-host.sh` 可以只用本仓库源码重编
-  （NDK 29 + `fetch-graphics-sources.sh`，不需要 A10 流水线）。
-
-- **判定依据为来源与哈希，而非文件名**：清单中每条 native 均记录 `source` 与
-  `sha256`，`verifyRuntimeA15` 在构建时逐条核对。
+构建链会自动将 `prepared/` 整合并输出为统一格式的 `.zip` ROM 包，默认存放于 `dist/` 目录下，了解更多请参考下方的专门文档。
 
 ## 文档
 
 - 构建、产物验收、排查：[BUILD.md](BUILD.md)
+- 新版 ROM 格式与打包工具：[rom/README.md](rom/README.md)
 - 分阶段状态：[STATUS.md](STATUS.md)
 
 ## 许可证

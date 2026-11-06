@@ -121,6 +121,46 @@ sh scripts/fetch-graphics-sources.sh   # 只在 third_party/graphics/a9/upstream
 
 ---
 
+## 2.2 桌面窗口渲染器（`liba15vm-desktop-window.so`，GLES1 就在这一份里）
+
+宿主 GPU 端点有两半：`desktop-gpu-host`（进程）与 **app 进程里加载的窗口渲染器**
+（`native-display` 模块打包的 `liba15vm-desktop-window.so` / `liba10vm-desktop-window.so`，
+同一个 soname 两个名字）。GLES1 的处理（`90cb89e` 的 skip + 29 个 opcode 的应答、
+`7f217bd` 的构建接入、`7f217bd` 的堆指针诊断）**只存在于源码**
+`third_party/graphics/container/{window,desktop,native}`，只有被编译过才在产物里。
+
+```text
+源码   guest-runtime-a15/third_party/graphics/container（+ a9/{generated,definitions,upstream}、compat）
+        ↓  guest-runtime-a15/scripts/build-desktop-window.sh   （NDK 29，codec 取自 bridges/bin/desktop-gpu-host）
+产物   guest-runtime-a15/artifacts/native-display/{jniLibs/arm64-v8a,assets/native-display-inputs.json}
+        ↓  :native-display 的 jniLibs.srcDir / assets.srcDir
+APK    lib/arm64-v8a/liba15vm-desktop-window.so + assets/native-display-inputs.json
+```
+
+**谁来编**，两个入口等价（`r164` 起 IDE 也会编）：
+
+| 入口 | 行为 |
+| --- | --- |
+| `sh scripts/build-desktop-window.sh` | 直接编，写 `artifacts/native-display/` |
+| `gradlew :native-display:buildDesktopWindowRenderer`（`preBuild` 自动依赖） | 同上，跑的就是这个脚本；`bash` / NDK 29 自动探测，源没变则 UP-TO-DATE |
+| `build-a15.ps1` / `build.sh` | 先跑脚本，再以 `-PnativeDisplayPrepared=guest-runtime-a15/artifacts/native-display` 交给 Gradle |
+
+**`native-display/build.gradle.kts` 的取用顺序**（第一个命中的生效）：
+
+```text
+-PnativeDisplayPrepared=<dir>  →  artifacts/native-display  →  native-display/build/prepared  →  runtime-inputs/native-display
+                                  （源码产物，正常路径）        （旧暂存目录，clean 会清掉）        （A10 捆绑那份＝没有 GLES1）
+```
+
+**没有静默回退**：`verifyRenderer` 会读 `.so` 里的 `desktop_gpu_es1_query` 标记判断它认不认
+GLES1，并核对清单的 `bytes`/`sha256`（运行时的 `files.verifyInputs()` 就是这么查的）与
+`codec` 是否真的编进了 `.so`。最后落到 A10 那份就**构建失败**并打印修法；
+只做 A9/A10 的场合才用 `-PnativeDisplayAllowA10Renderer=true` 降级成告警。
+判定依据是内容标记，不是文件名、大小或 mtime（两者同名同 soname：A10 6,806,024 B，
+源码产物 6,350,912 B / `0f9be155…`）。
+
+---
+
 ## 3. 构建顺序（有依赖，不能并行乱序）
 
 ```text
@@ -157,6 +197,7 @@ Linux/Git Bash `sh guest-runtime-a15/scripts/build.sh`；已有产物的阶段�
 | 图形源（已入库，仅补救） | `sh scripts/fetch-graphics-sources.sh` | `third_party/graphics/a9/upstream/`（已提交；脚本会校验 sources.sha256 与必需文件） |
 | 宿主 GPU 端点（默认） | `sh scripts/install-desktop-host.sh` | `bridges/bin/desktop-gpu-host`（pinned，sha256 校验） |
 | 宿主 GPU 端点（源码重编） | `sh scripts/build-desktop-host.sh` | 同上；需 NDK 29 + 已拉取的图形源，不需要 A10 流水线 |
+| 桌面窗口渲染器（必需） | `sh scripts/build-desktop-window.sh`（`gradlew :native-display:buildDesktopWindowRenderer` 等价） | `artifacts/native-display/{jniLibs/arm64-v8a,assets}`；见 §2.2 |
 | 图形层 | `sh bridges/build-graphics-a15.sh` | `bridges/graphics/lib/*`（EGL/GLES/gralloc/HWC） |
 | HAL 程序（必需） | `sh bridges/build-host-hal.sh` | `bridges/bin/host-devices`（vibrator/sensors/thermal）；`liba15vm-hal-modules.so` 目前未产出，prepare 会跳过 |
 | 开机动画素材 | `python scripts/make-bootanimation.py` | `bootanim/bootanimation.zip` |
@@ -184,6 +225,7 @@ Linux/Git Bash `sh guest-runtime-a15/scripts/build.sh`；已有产物的阶段�
 | libc | `runtime/build/lib/libc.so` | 含 `A10VM_ROOTFS` 等映射逻辑、属性区补丁 |
 | libm | `runtime/build/lib/libm.so` | 无未定义符号，依赖 `libc.so` |
 | 闭包审计 | `runtime/libart-closure.json` | A15 `libart.so` 的未定义符号全部由 API 35 域解析 |
+| 桌面渲染器 | `artifacts/native-display/jniLibs/arm64-v8a/liba15vm-desktop-window.so` | 含 `desktop_gpu_es1_query`（＝认 GLES1）；清单 `bytes`/`sha256` 与文件一致；`codec` 编进 `.so` |
 
 符号闸门（阶段 1 退出条件）与 A9 相同：**A15 `libart.so` 的每个未定义符号
 都必须能在 API 35 域的 libc/libdl/libm/ART 闭包里找到定义**，不允许用 shim 掩盖。
@@ -222,4 +264,7 @@ APK 不在本仓库构建（需要宿主工程的 `:app`）；等 Gradle 外壳�
 2. `liba15vm-*` 与 `liba9vm-*`、`liba10vm-*` 不交叉；
 3. 路径/属性/身份映射只由源码 libc/linker 提供；
 4. 任何 helper 进程不得把自己的库预加载进客体进程；
-5. ART 自检不过，不启动系统服务。
+5. ART 自检不过，不启动系统服务；
+6. 桌面渲染器只允许来自源码构建（`artifacts/native-display`）；`runtime-inputs` 那份 A10 渲染器
+   不得成为默认或静默回退——它没有 GLES1，ES1 应用会以 `EGL_BAD_ALLOC → code=137` 死。
+   判定用内容标记 `desktop_gpu_es1_query`，不要用文件名/大小/mtime。

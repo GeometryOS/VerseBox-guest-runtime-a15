@@ -1,14 +1,16 @@
-# 完整构建 Android 15 运行时载荷（prepared/），用于 CI 与发布。
+# Full build of the Android 15 runtime payload (prepared/) **and the new-format ROM package** for CI and releases.
 #
-# 这个仓库只负责 A15 客体运行时：镜像 -> rootfs/APEX -> API 35 运行时 ->
-# 桥接/图形 -> prepared（assets + jniLibs + 清单）。APK 由宿主工程打包，
-# 不在本仓库构建；以后补上 Gradle 外壳（settings.gradle.kts + gradlew）时，
-# 末尾的 AAR 步骤会自动生效。
+# This repository only handles the A15 guest runtime: image -> rootfs/APEX -> API 35 runtime ->
+# bridges/graphics -> prepared (assets + jniLibs + manifest) -> dist/versebox-android15-<ver>.zip.
+# The two product chains meet here but are independent: ROM only reads prepared; APK belongs to the host project,
+# not built in this repo (no app source in the runner, scripts/build.sh will stop at the ROM package automatically).
 #
-# 触发：
-#   * push 任意分支 / PR   -> 完整构建（缓存后增量）
-#   * push tag v*          -> 构建并创建 GitHub Release
-#   * workflow_dispatch    -> 手动构建（可选从源码重编 desktop-gpu-host）
+# Artifacts for commits/PRs: a15-runtime-<ref>.tar.gz (prepared) + versebox-*.zip (ROM package) + SHA256SUMS.
+#
+# Triggers:
+#   * push any branch / PR -> Full build (incremental after cache)
+#   * push tag v*          -> Build and create GitHub Release
+#   * workflow_dispatch    -> Manual build (optionally rebuild desktop-gpu-host from source)
 name: Build A15 runtime
 
 on:
@@ -19,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       rebuild_desktop:
-        description: "从源码重编 desktop-gpu-host（默认用 pinned 版本）"
+        description: "Rebuild desktop-gpu-host from source (defaults to pinned version)"
         type: boolean
         default: false
 
@@ -50,9 +52,9 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # 直接用 runner 预装的 Android SDK 里的 sdkmanager。
-      # 不用 android-actions/setup-android：它内部会执行 sdkmanager "tools"，
-      # 新版 cmdline-tools 已经没有这个包，会让整个 job 在安装阶段就失败。
+      # Use sdkmanager from the runner's pre-installed Android SDK directly.
+      # Do not use android-actions/setup-android: it internally runs sdkmanager "tools",
+      # which is no longer available in newer cmdline-tools and will make the whole job fail during installation.
       - name: Install platform / build-tools / NDK 29
         run: |
           set -e
@@ -76,10 +78,10 @@ jobs:
       - name: Install patchelf
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends patchelf
 
-      # 三层缓存，key 各自只覆盖会影响该层的输入：
-      #   镜像 tar    <- fetch 脚本
-      #   解包 rootfs <- extract 脚本（改 APEX 解析不会重下 700 MB 镜像）
-      #   原生产物    <- 运行时/桥/图形源与脚本
+      # Three layers of cache, each key only covers inputs affecting that layer:
+      #   image tar      <- fetch scripts
+      #   rootfs         <- extract scripts (changing APEX parsing won't re-download the 700 MB image)
+      #   native outputs <- runtime/bridges/graphics sources and scripts
       - name: Cache image tarball
         uses: actions/cache@v4
         with:
@@ -104,7 +106,10 @@ jobs:
             bridges/graphics
           key: a15-native-${{ runner.os }}-${{ hashFiles('runtime/*.sh', 'runtime/*.py', 'runtime/fetch-a15-sources.sh', 'bridges/**', 'vendor/native/**', 'third_party/graphics/**', 'vendor/graphics/sources.txt') }}
 
-      - name: Build (image -> rootfs -> APEX -> runtime -> bridges -> prepared)
+      # Default order of sh scripts/build.sh: image -> rootfs -> APEX -> runtime -> bridges
+      # -> prepared -> **ROM package (dist/)** -> (build APK only if app project exists).
+      # Here A15_SKIP_APK=1, and there is no app project in the runner, so it will definitely stop after the ROM package.
+      - name: Build (image -> rootfs -> APEX -> runtime -> bridges -> prepared -> ROM)
         run: sh scripts/build.sh
 
       - name: Verify prepared manifest
@@ -124,15 +129,38 @@ jobs:
           print("prepared ok: %d native, %d data" % (len(files), len(m["data"])))
           PY
 
+      # Run the ROM package self-check again: do not use "the packing script said success" as proof (docs/rom-package/05 §6).
+      - name: Verify ROM package
+        run: |
+          set -e
+          ls -l dist/
+          shopt -s nullglob
+          zips=(dist/versebox-*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "no ROM package produced under dist/ (pack-rom step did not run?)" >&2
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            python3 rom/pack-rom.py --verify-only "$zip"
+          done
+
       - name: Gradle AAR (only when the Gradle shell exists)
         if: hashFiles('settings.gradle.kts') != '' && hashFiles('gradlew') != ''
         run: ./gradlew --no-daemon assembleDebug
 
       - name: Package
         run: |
+          set -e
           name="a15-runtime-${GITHUB_REF_NAME:-dev}"
           tar -czf "${name}.tar.gz" prepared
           sha256sum "${name}.tar.gz" > SHA256SUMS
+          # Put the ROM package and its packing report into the artifact: the report contains payloadSha256 / entry count,
+          # so you don't need to rerun the packer to trace "how this package was created".
+          shopt -s nullglob
+          for f in dist/versebox-*.zip dist/pack-*.json; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" >> SHA256SUMS
+          done
           cat SHA256SUMS
 
       - name: Upload artifact
@@ -141,6 +169,8 @@ jobs:
           name: a15-runtime
           path: |
             a15-runtime-*.tar.gz
+            dist/versebox-*.zip
+            dist/pack-*.json
             SHA256SUMS
           if-no-files-found: error
 
@@ -150,4 +180,6 @@ jobs:
         with:
           files: |
             a15-runtime-*.tar.gz
+            dist/versebox-*.zip
+            dist/pack-*.json
             SHA256SUMS

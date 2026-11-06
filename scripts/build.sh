@@ -12,8 +12,17 @@
 #取消注释下边这行来全量构建
 #   A15_FORCE=1     force the native stages
 
-#   A15_SKIP_APK=1  stop after prepared (no Gradle)
+#   A15_SKIP_APK=1  stop after the ROM package (no Gradle)
+#   A15_SKIP_ROM=1  only produce the runtime directory (prepared), no ROM zip
+#   A15_ROM_VERSION override the ROM version (default: rom/rom.properties.yaml)
+#   A15_LIB_MODE    apk | rom | both   (default: whatever the properties file says)
+#   A15_ROM_OUT     explicit output zip path (default: <runtime>/dist/...)
 #   REDROID_TAG     pin a non-rolling redroid tag (see BUILD.md section 2)
+#
+# Flags are also accepted: --skip-rom --skip-apk --rom-version=X --lib-mode=Y --rom-out=Z
+#
+# Two product chains, do not mix them: the **ROM package** only depends on prepared
+# (rom/pack-rom.py), the **APK** is produced by Gradle.
 #
 # Requirements: Python 3 (stdlib only), JDK + Android SDK for the APK, and for a
 # native rebuild the Android NDK 29 plus a POSIX shell (this script itself).
@@ -31,7 +40,64 @@ if [ -z "$PY" ]; then
 fi
 
 FORCE=${A15_FORCE:-0}
+SKIP_ROM=${A15_SKIP_ROM:-0}
+SKIP_APK=${A15_SKIP_APK:-0}
+ROM_VERSION=${A15_ROM_VERSION:-}
+LIB_MODE=${A15_LIB_MODE:-}
+ROM_OUT=${A15_ROM_OUT:-}
+PLAN_ONLY=${A15_PLAN_ONLY:-0}
 step() { printf '\n== %s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --skip-rom)      SKIP_ROM=1 ;;
+        --skip-apk)      SKIP_APK=1 ;;
+        --rom-version=*) ROM_VERSION=${1#*=} ;;
+        --lib-mode=*)    LIB_MODE=${1#*=} ;;
+        --rom-out=*)     ROM_OUT=${1#*=} ;;
+        --plan-only)     PLAN_ONLY=1 ;;
+        -h|--help)       sed -n '2,30p' "$0"; exit 0 ;;
+        *) echo "build.sh: unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+
+# ROM 包的展示路径（尊重 --rom-out）
+if [ -n "$ROM_OUT" ]; then ROM_SHOWN="$ROM_OUT"; else ROM_SHOWN="$(pwd)/dist"; fi
+
+# APK（与宿主桌面渲染器）属于 **app 仓库**：只 clone 本仓库时必须干净地停在 ROM 包，
+# 而不是跑到最后抛一个 "gradlew: not found"。判据是"app 工程的两个标志文件都在"。
+has_app_repo=0
+if { [ -f "$ROOT/gradlew" ] || [ -f "$ROOT/gradlew.bat" ]; } && [ -f "$ROOT/settings.gradle.kts" ]; then
+    has_app_repo=1
+fi
+
+# --plan-only / A15_PLAN_ONLY=1：只打印计划，不跑任何重活（第三方排障用）
+if [ "$PLAN_ONLY" = 1 ]; then
+    step "plan-only"
+    printf '  module        : %s\n' "$MODULE"
+    printf '  root          : %s\n' "$ROOT"
+    if [ "$has_app_repo" = 1 ]; then
+        printf '  app repo      : found (%s/gradlew)\n' "$ROOT"
+    else
+        printf '  app repo      : not found -> will stop after the ROM package\n'
+    fi
+    if [ "$SKIP_ROM" = 1 ]; then
+        printf '  ROM package   : skip (--skip-rom)\n'
+    else
+        printf '  ROM package   : %s\n' "$ROM_SHOWN"
+    fi
+    if [ "$has_app_repo" = 0 ]; then
+        printf '  APK           : skip (no app repo)\n'
+    elif [ "$SKIP_APK" = 1 ]; then
+        printf '  APK           : skip (--skip-apk)\n'
+    else
+        printf '  APK           : %s\n' "$ROOT/app/build/outputs/apk/debug/app-debug.apk"
+    fi
+    printf '  nothing was executed (plan-only).\n'
+    exit 0
+fi
 
 # ---------------------------------------------------------------- 1. image ----
 if [ "$FORCE" = 1 ] || [ ! -f downloads/manifest.json ]; then
@@ -137,26 +203,63 @@ for bridge in property binder devices guest-log jni-register host-hal graphics-a
     fi
 done
 
+# ------------------------------------------------ 7. desktop window renderer ---
+# The host-side renderer (liba15vm-desktop-window.so) decodes the EGL/GLES stream the
+# guest sends, and GLES1 support only exists in third_party/graphics/container
+# (90cb89e's skip/ES1 replies, wired into the build by 7f217bd). Its canonical output is
+# artifacts/native-display, produced by scripts/build-desktop-window.sh — never a
+# pinned binary and never the copy unpacked from _bin/A10VM.apk.
+# Gradle owns the same decision (:native-display:buildDesktopWindowRenderer) so that an
+# Android Studio build cannot silently package the A10 renderer either; the explicit
+# -PnativeDisplayPrepared below only pins this directory.
+step "desktop window renderer (from source)"
+sh scripts/build-desktop-window.sh
+
 # ---------------------------------------------------- 7. assets + prepared -----
 step "boot animation asset"
 "$PY" scripts/make-bootanimation.py
 
-# The desktop window renderer is pinned under prebuilt/native-display (unified binary
-# dir) and consumed through -PnativeDisplayPrepared; see build-a15.ps1 for why the
-# bundled A10 renderer must not be packaged.
 step "prepared (manifest + assets + jniLibs)"
 "$PY" scripts/prepare-a15.py
 
-# ----------------------------------------------------------------- 8. APK -----
-if [ "${A15_SKIP_APK:-0}" = 1 ]; then
-    step "A15_SKIP_APK=1: stopping before Gradle"
+# --------------------------------------------------------- 8. ROM package ------
+# The ROM package is this repository's own product (rom/pack-rom.py -> dist/).
+# It only depends on prepared: no Gradle, no APK, no app sources. Third-party
+# ROM authors stop here (--skip-apk) and never need the app repository.
+if [ "$SKIP_ROM" = 1 ]; then
+    step "skip-rom: runtime directory only (prepared), no ROM zip"
+else
+    step "ROM package (rom/pack-rom.py -> dist/)"
+    set -- --prepared prepared
+    if [ -n "$ROM_VERSION" ]; then set -- "$@" --rom-version "$ROM_VERSION"; fi
+    if [ -n "$LIB_MODE" ]; then set -- "$@" --lib-mode "$LIB_MODE"; fi
+    if [ -n "$ROM_OUT" ]; then set -- "$@" --out "$ROM_OUT"; fi
+    "$PY" rom/pack-rom.py "$@"
+fi
+
+# ----------------------------------------------------------------- 9. APK -----
+# The APK (and the host desktop renderer) belong to the **app repository**.
+# A third-party clone of THIS repository alone must stop cleanly after the ROM
+# package instead of failing later with "gradlew: not found".
+if [ "$has_app_repo" = 0 ]; then
+    step "no app repository found at $ROOT"
+    echo "  ROM-only build: this repository produces the runtime tree and the ROM package."
+    echo "  Missing $ROOT/gradlew[.bat] or $ROOT/settings.gradle.kts"
+    echo "  APK + host renderer live in the app repository (docs/rom-package/11 §2)."
+    if [ "$SKIP_ROM" = 0 ]; then echo "  ROM package: $ROM_SHOWN"; else echo "  Runtime tree: $(pwd)/prepared (--skip-rom)"; fi
+    echo "  Done (no APK)."
+    exit 0
+fi
+if [ "$SKIP_APK" = 1 ]; then
+    step "skip-apk: stopping before Gradle"
+    if [ "$SKIP_ROM" = 0 ]; then echo "  ROM package: $ROM_SHOWN"; else echo "  Runtime tree: $(pwd)/prepared (--skip-rom)"; fi
     exit 0
 fi
 step "APK (app-debug.apk)"
 cd "$ROOT"
 if [ -x ./gradlew ]; then
-    ./gradlew :app:assembleDebug
+    ./gradlew :app:assembleDebug -PnativeDisplayPrepared=guest-runtime-a15/artifacts/native-display
 else
-    sh ./gradlew :app:assembleDebug
+    sh ./gradlew :app:assembleDebug -PnativeDisplayPrepared=guest-runtime-a15/artifacts/native-display
 fi
 printf '\nA15 pipeline complete: %s\n' "$ROOT/app/build/outputs/apk/debug/app-debug.apk"

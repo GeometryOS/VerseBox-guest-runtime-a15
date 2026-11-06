@@ -20,16 +20,15 @@ val runtimeRoot = preparedRoot ?: bundledRoot
 
 android {
     namespace = "io.a10vm.guestruntime.a15"
-    compileSdk = 35
+    compileSdk = 37
+    compileSdkMinor = 0
     defaultConfig { minSdk = 28 }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    sourceSets.getByName("main") {
-        jniLibs.srcDir(runtimeRoot.resolve("jniLibs"))
-        assets.srcDir(runtimeRoot.resolve("assets"))
-    }
+    // 目录注入移到下面的 androidComponents 块（AGP 9 的 sourceSets 库路径会抛
+    // ClassCastException: DefaultAndroidLibrarySourceSet -> AndroidLibrarySourceSet）。
 }
 
 fun sha256(file: File): String {
@@ -51,9 +50,9 @@ val verifyRuntimeA15 = tasks.register("verifyRuntimeA15") {
         val manifest = runtimeRoot.resolve("assets/guest-runtime-a15-inputs.json")
         check(manifest.isFile) {
             "missing Android 15 runtime inputs: $manifest\n" +
-                "run: python guest-runtime-a15/scripts/prepare-a15.py\n" +
-                "or:  ./gradlew :guest-runtime-a15:prepareA15Runtime\n" +
-                "or:  -PguestRuntimeA15Prepared=<prepared dir>"
+                    "run: python guest-runtime-a15/scripts/prepare-a15.py\n" +
+                    "or:  ./gradlew :guest-runtime-a15:prepareA15Runtime\n" +
+                    "or:  -PguestRuntimeA15Prepared=<prepared dir>"
         }
         val json = JsonSlurper().parse(manifest) as Map<*, *>
         check((json["guestSdk"] as Number).toInt() == 35) { "guestSdk must be 35" }
@@ -61,7 +60,7 @@ val verifyRuntimeA15 = tasks.register("verifyRuntimeA15") {
         val roles = json["platformLibraries"] as? Map<*, *>
         check(roles != null) { "platformLibraries is required" }
         for (role in listOf("propertyClient", "guestDevices", "binderDevices",
-                           "guestLog", "managerPolicy", "binderCore", "halModules")) {
+            "guestLog", "managerPolicy", "binderCore", "halModules")) {
             check(roles!![role] is String) { "platformLibraries.$role is required" }
         }
         val files = json["files"] as List<*>
@@ -102,3 +101,12 @@ val prepareA15Runtime = tasks.register<Exec>("prepareA15Runtime") {
 }
 
 tasks.withType<org.gradle.api.tasks.bundling.Zip>().configureEach { isZip64 = true }
+
+// AGP 9 的官方目录注入点：按 variant 添加"静态源码目录"，等价于旧 sourceSets 的
+// jniLibs.srcDir / assets.srcDir，且不经过已废弃的 com.android.build.gradle.api.* 类型。
+androidComponents {
+    onVariants { variant ->
+        variant.sources.jniLibs?.addStaticSourceDirectory(runtimeRoot.resolve("jniLibs").absolutePath)
+        variant.sources.assets?.addStaticSourceDirectory(runtimeRoot.resolve("assets").absolutePath)
+    }
+}

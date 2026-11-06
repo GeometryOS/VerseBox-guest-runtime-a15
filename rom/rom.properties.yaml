@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------- ROM 自述（输入）
+#
+# 这个文件属于**运行时仓库**（guest-runtime-a15），不属于 app。
+# 它保存 ROM 的「身份」：id / 名字 / 默认版本。改 ROM 定制的人在这里改。
+#
+# 打包器（rom/pack-rom.py）会把它扩展成 zip 根里的 versebox_properties.yaml
+# （schema: versebox-rom/2），其中 apiLevel 来自准备的清单（prepare-a15.py 的产物），
+# payloadBytes / payloadSha256 由打包器按实际内容算出来。
+#
+# 规范见 app 仓库的 docs/rom-package/02-ROM包结构与命名.md
+schema: versebox-rom-properties/1
+id: android15
+name: Android 15
+androidVersion: "15"
+description: 独立 API 35 用户空间（Redroid 15 64bit-only + AOSP 15 自建运行时）
+defaultRomVersion: 1.0.0
+
+# 客体 .so 的承载方式：
+#   apk  —— 客体 .so 仍由 APK 的 lib/arm64-v8a 提供，ROM 只带数据（默认、最安全）
+#   rom  —— 客体 .so 下沉到 ROM 的 payload/lib（需要 /data 可执行性实验通过）
+#   both —— 两边都有，运行时优先 ROM、缺了回落 APK（灰度用）
+libMode: apk
