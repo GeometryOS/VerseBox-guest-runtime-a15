@@ -83,7 +83,20 @@ final class DesktopProcesses {
                         synchronized (this) {
                             checkIdentity(arguments);
                             children.removeIf(child -> !child.isAlive());
-                            Process child = AppLaunch.start(arguments, ++sequence);
+                            // Round 166: renderers that arrive through the child
+                            // zygote must start exactly like the ones that arrive
+                            // through the main zygote, or they die silently right
+                            // after AssetManager configuration (no Java trace, no
+                            // A9VM crash line, no tombstone). Real device
+                            // 2026-11-08, instance 1794133452551 (2201123C): every
+                            // renderer went through AppLaunch (A9-era shape)
+                            //   desktop_application_launch=23123:...sandboxed_process0
+                            // and died in 4 ms, while the same APK on PKX110 takes
+                            // the A15AppLaunch path
+                            //   a15_application_launch=32239:...sandboxed_process0 uid=99000
+                            // and paints the page. Same payload, same SDK; the only
+                            // difference is which launcher owned the request.
+                            Process child = A15AppLaunch.start(arguments, ++sequence);
                             children.add(child);
                             pid = AppLaunch.pid(child);
                         }
