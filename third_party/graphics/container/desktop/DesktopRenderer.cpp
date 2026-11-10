@@ -4,8 +4,12 @@
 #include <chrono>
 #include <unistd.h>
 
-DesktopRenderer::DesktopRenderer(const std::string& directory)
-    : gpu_(directory + "/gpu.sock"), input_(directory + "/desktop-input.sock") {
+DesktopRenderer::DesktopRenderer(const std::string& directory, const desktopdisplay::Mode& mode)
+    // 先合法化，再把同一组宽高交给 GPU 服务与输入通道：三者必须一致，
+    // 否则画面尺寸与触摸换算会对不上。
+    : mode_(desktopdisplay::sanitize(mode)),
+      gpu_(directory + "/gpu.sock", mode_),
+      input_(directory + "/desktop-input.sock", mode_.width, mode_.height) {
     description_ = "Android 10 GLES / host GPU";
 }
 uint32_t DesktopRenderer::tap(int x, int y) {
@@ -14,8 +18,8 @@ uint32_t DesktopRenderer::tap(int x, int y) {
     event.count = 1;
     event.timeNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    event.pointers[0] = {0, std::clamp(x, 0, desktopdisplay::width - 1),
-                        std::clamp(y, 0, desktopdisplay::height - 1), 1.f};
+    event.pointers[0] = {0, std::clamp(x, 0, mode_.width - 1),
+                        std::clamp(y, 0, mode_.height - 1), 1.f};
     touch(event);
     event.action = touchwire::Up;
     return touch(event);

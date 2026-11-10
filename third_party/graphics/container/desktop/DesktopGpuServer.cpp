@@ -46,7 +46,8 @@ void desktop_gpu_trace(const char* format, ...) {
     }
 }
 
-DesktopGpuServer::DesktopGpuServer(const std::string& path) : path_(path) {
+DesktopGpuServer::DesktopGpuServer(const std::string& path, const desktopdisplay::Mode& display)
+    : path_(path), backend_(display.width, display.height, true, display.density, display.refreshHz) {
     listener_ = listenLocal(path_);
     desktop_gpu_trace_path(path_.c_str());
     if (chmod(path_.c_str(), 0600) < 0) {

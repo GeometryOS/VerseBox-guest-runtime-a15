@@ -13,10 +13,17 @@
 #include "SharedTextureSync.h"
 #include "ColorPixels.h"
 #include "GuestGpuSync.h"
+#include "DesktopDisplay.h"
+#include "DesktopDisplay.h"
 
 class GpuBackend {
 public:
-    GpuBackend(int width, int height, bool directCopy = true);
+    /**
+     * @param display 本次运行的显示几何（宽/高/DPI/刷新率）。
+     *                缺省 = DesktopDisplay.h 的编译期默认值（旧调用点行为不变）。
+     */
+    GpuBackend(int width, int height, bool directCopy = true,
+               int density = desktopdisplay::density, int refreshHz = desktopdisplay::refreshHz);
     ~GpuBackend();
     EGLDisplay display() const { return display_; }
     GuestGpuSync& syncs() { return *syncs_; }
@@ -57,6 +64,9 @@ public:
     Presentation presentation();
     int width() const { return width_; }
     int height() const { return height_; }
+    /** 上报给客体的 DPI（rcGetFBParam 3/4）与刷新率（5）：每会话不同。 */
+    int density() const { return density_; }
+    int refreshHz() const { return refreshHz_; }
     struct CopyStats { uint64_t direct, legacy; };
     CopyStats copyStats();
     struct ResourceCounts { size_t contexts, surfaces, images; };
@@ -121,6 +131,8 @@ private:
     PFNEGLWAITSYNCKHRPROC waitSync_ = nullptr;
     PFNEGLDESTROYSYNCKHRPROC destroySync_ = nullptr;
     int width_, height_;
+    int density_ = desktopdisplay::density;
+    int refreshHz_ = desktopdisplay::refreshHz;
     int hostVersion_ = 2;
     bool directCopy_;
     uint64_t frames_ = 0, flushes_ = 0;

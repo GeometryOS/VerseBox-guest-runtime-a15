@@ -878,6 +878,19 @@ def main():
             asset = normal
         destination = stage_copy(TREE / path, "assets", asset)
         mode = stat.S_IMODE(record["mode"])
+        # Windows cannot carry the executable bit, so every binary in the
+        # tree is recorded as 0666. installData then applies 0666 and artd
+        # cannot exec art_boot/art_exec: rom-package instances ended up with
+        #   apex/com.android.art/bin/art_exec  -rw-rw-rw-
+        # while the legacy assets path had 0755 (it was rescued by the
+        # GuestExec fchmodat retry). Result on 2026-11-08, instance
+        # 1794141857127: artd never ran dex2oat (0 lines vs 102), every
+        # process stayed verified/interp, and the control-centre toggles
+        # painted as empty outlines for seconds. Restore 0755 for the
+        # binary directories so the manifest carries the real mode.
+        guest_path = "/" + path
+        if mode & 0o111 == 0 and ("/bin/" in guest_path or "/xbin/" in guest_path):
+            mode = 0o755
         # Android 14+ refuses to load a dex file that the calling process can write:
         #   SecurityException: Writable dex file
         #   '/system/system_ext/priv-app/Provision/Provision.apk' is not allowed

@@ -11,7 +11,8 @@
 
 class DesktopGpuServer {
 public:
-    explicit DesktopGpuServer(const std::string& path);
+    /** @param display 本次会话的显示几何：帧缓冲按它建，rcGetFBParam 按它上报。 */
+    explicit DesktopGpuServer(const std::string& path, const desktopdisplay::Mode& display);
     ~DesktopGpuServer();
     GpuBackend& backend() { return backend_; }
     int64_t attach(DesktopPresenter::Window window);
@@ -24,7 +25,9 @@ private:
     void reapDecoders();
     void reapProcesses();
     void fail(const std::exception& error);
-    GpuBackend backend_{desktopdisplay::width, desktopdisplay::height};
+    // 尺寸与 DPI/刷新率来自**本次会话**的显示模式（不是进程全局值：同一进程里可以多台并存）。
+    // 由构造函数初始化——不能用默认成员初始化器：那里拿不到构造参数。
+    GpuBackend backend_;
     std::string path_, error_;
     int listener_ = -1;
     int wake_ = -1;

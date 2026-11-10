@@ -29,16 +29,49 @@ Java_io_a10vm_nativedisplay_WindowBridge_displayMode(JNIEnv* env, jclass) {
     if (result) env->SetIntArrayRegion(result, 0, 4, values);
     return result;
 }
+
+/*
+ * 本次运行真正生效的显示几何：{width, height, density}。
+ *
+ * 与 displayMode()（编译期默认值）不是一回事：displayMode 只给"没有会话时"的
+ * 兜底与刷新率用；这里是每台虚拟机自己的分辨率设置解析出来的值，
+ * NativeSurfaceView 用它的宽高比做 letterbox，触摸也按它换算坐标。
+ */
+extern "C" JNIEXPORT jintArray JNICALL
+Java_io_a10vm_nativedisplay_WindowBridge_mode(JNIEnv* env, jclass, jlong handle) {
+    const auto& mode = renderer(handle).mode();
+    const jint values[] = {mode.width, mode.height, mode.density};
+    jintArray result = env->NewIntArray(3);
+    if (result) env->SetIntArrayRegion(result, 0, 3, values);
+    return result;
+}
 #endif
 
+/*
+ * 创建渲染器。宽/高/DPI 由宿主按**这台虚拟机自己的显示设置**传进来（docs/display-settings/04）：
+ * 传 0 表示"用编译期默认值"，旧调用点（没有显示设置时）行为不变。
+ */
 extern "C" JNIEXPORT jlong JNICALL
-Java_io_a10vm_nativedisplay_WindowBridge_create(JNIEnv* env, jclass, jstring directory) {
+Java_io_a10vm_nativedisplay_WindowBridge_create(JNIEnv* env, jclass, jstring directory,
+        jint width, jint height, jint density) {
     const char* value = env->GetStringUTFChars(directory, nullptr);
     if (!value) return 0;
     std::string path(value);
     env->ReleaseStringUTFChars(directory, value);
+#ifdef A10VM_DESKTOP_WINDOW
+    desktopdisplay::Mode mode;
+    if (width > 0 && height > 0 && density > 0) {
+        mode.width = width;
+        mode.height = height;
+        mode.density = density;
+    }
+    try { return reinterpret_cast<jlong>(new WindowRenderer(path, mode)); }
+    catch (const std::exception& error) { reportError(env, error); return 0; }
+#else
+    (void)width; (void)height; (void)density;
     try { return reinterpret_cast<jlong>(new WindowRenderer(path)); }
     catch (const std::exception& error) { reportError(env, error); return 0; }
+#endif
 }
 
 extern "C" JNIEXPORT jlong JNICALL

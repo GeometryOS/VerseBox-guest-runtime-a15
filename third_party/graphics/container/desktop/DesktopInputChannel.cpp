@@ -7,7 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-DesktopInputChannel::DesktopInputChannel(const std::string& path) : path_(path) {
+DesktopInputChannel::DesktopInputChannel(const std::string& path, int width, int height)
+    : path_(path), width_(width), height_(height) {
     listener_ = listenLocal(path_);
     if (chmod(path_.c_str(), 0600) < 0) {
         close(listener_);
@@ -29,7 +30,7 @@ DesktopInputChannel::~DesktopInputChannel() {
     unlink(path_.c_str());
 }
 uint32_t DesktopInputChannel::submit(touchwire::Event event) {
-    touchwire::validate(event, desktopdisplay::width, desktopdisplay::height);
+    touchwire::validate(event, width_, height_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (finished_ || closing_) return 0;
     event.sequence = ++sequence_;

@@ -33,8 +33,9 @@ private:
     EGLSurface draw_, read_;
 };
 
-GpuBackend::GpuBackend(int width, int height, bool directCopy)
-    : width_(width), height_(height), directCopy_(directCopy) {
+GpuBackend::GpuBackend(int width, int height, bool directCopy, int density, int refreshHz)
+    : width_(width), height_(height), density_(density), refreshHz_(refreshHz),
+      directCopy_(directCopy) {
     display_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     EGLint major, minor, count;
     require(eglInitialize(display_, &major, &minor), "Host EGL initialize");

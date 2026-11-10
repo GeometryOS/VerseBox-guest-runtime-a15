@@ -192,8 +192,9 @@ void DesktopDecoder::initializeRC() {
         switch (name) {
             case 1: return current_->backend_.width();
             case 2: return current_->backend_.height();
-            case 3: case 4: return desktopdisplay::density;
-            case 5: return desktopdisplay::refreshHz;
+            // 密度/刷新率跟着**本次会话**的显示模式走：客体按它换算 dp。
+            case 3: case 4: return current_->backend_.density();
+            case 5: return current_->backend_.refreshHz();
             case 6: return 0;
             case 7: return 1;
             default: return 0;
