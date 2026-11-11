@@ -135,13 +135,47 @@ jobs:
           set -e
           ls -l dist/
           shopt -s nullglob
-          zips=(dist/versebox-*.zip)
-          if [ ${#zips[@]} -eq 0 ]; then
+          full=()
+          minimal=()
+          for zip in dist/versebox-*.zip; do
+            case "$zip" in
+              *-min.zip) minimal+=("$zip") ;;
+              *) full+=("$zip") ;;
+            esac
+          done
+          if [ ${#full[@]} -eq 0 ]; then
             echo "no ROM package produced under dist/ (pack-rom step did not run?)" >&2
             exit 1
           fi
-          for zip in "${zips[@]}"; do
+          # 完整包走打包器自检；最小占位包**不能**走它（根条目只有 yaml，是定义不是缺陷）。
+          for zip in "${full[@]}"; do
             python3 rom/pack-rom.py --verify-only "$zip"
+          done
+          if [ ${#minimal[@]} -eq 0 ]; then
+            echo "missing minimal placeholder zip (-min.zip): apk_artifacts step did not run?" >&2
+            exit 1
+          fi
+          for zip in "${minimal[@]}"; do
+            python3 - "$zip" <<'PY'
+          import sys, zipfile
+          path = sys.argv[1]
+          with zipfile.ZipFile(path) as archive:
+              names = archive.namelist()
+              assert names == ["versebox_properties.yaml"], names
+              text = archive.read("versebox_properties.yaml").decode("utf-8")
+          assert "placeholder: true" in text, "minimal zip lacks placeholder: true"
+          assert "payloadBytes: 0" in text, "minimal zip must declare payloadBytes: 0"
+          print("minimal ok:", path)
+          PY
+          done
+          # resident tar：必须存在，且内容与 rom/resident-native.txt 的条数一致。
+          tars=(dist/apk-resident-libs-*.tar)
+          if [ ${#tars[@]} -eq 0 ]; then
+            echo "missing apk-resident-libs-*.tar (APK 的 lib/ 没有来源，装出来的包开不了机)" >&2
+            exit 1
+          fi
+          for tar in "${tars[@]}"; do
+            tar -tf "$tar"
           done
 
       - name: Gradle AAR (only when the Gradle shell exists)
@@ -157,7 +191,7 @@ jobs:
           # Put the ROM package and its packing report into the artifact: the report contains payloadSha256 / entry count,
           # so you don't need to rerun the packer to trace "how this package was created".
           shopt -s nullglob
-          for f in dist/versebox-*.zip dist/pack-*.json; do
+          for f in dist/versebox-*.zip dist/pack-*.json dist/apk-resident-libs-*.tar; do
             [ -f "$f" ] || continue
             sha256sum "$f" >> SHA256SUMS
           done
@@ -170,6 +204,8 @@ jobs:
           path: |
             a15-runtime-*.tar.gz
             dist/versebox-*.zip
+            dist/*-min.zip
+            dist/apk-resident-libs-*.tar
             dist/pack-*.json
             SHA256SUMS
           if-no-files-found: error
@@ -181,5 +217,7 @@ jobs:
           files: |
             a15-runtime-*.tar.gz
             dist/versebox-*.zip
+            dist/*-min.zip
+            dist/apk-resident-libs-*.tar
             dist/pack-*.json
             SHA256SUMS

@@ -39,6 +39,8 @@ import tempfile
 import time
 import zipfile
 
+from apk_artifacts import build_apk_artifacts
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rom_hash import payload_entries, payload_sha256  # noqa: E402  (共用唯一哈希实现)
@@ -366,6 +368,19 @@ def pack(args):
             "bundledLibs": lib_count,
             "packSeconds": round(took, 1),
         }
+        # ------------------------------------------------------ APK 侧两件产物
+        #
+        # 完整 zip 是"ROM 本体"，安装包还需要另外两样（见 rom/apk_artifacts.py 的说明）：
+        #   -min.zip   最小占位包（只声明"支持这个系统"）
+        #   apk-resident-libs-<id>.tar   APK lib/ 必须带的原生文件
+        # 两者都从这份 zip 反推，失败就让整次打包失败——不能产出"能装不能开机"的组合。
+        apk_artifacts = build_apk_artifacts(out, os.path.dirname(out))
+        report["minimalZip"] = os.path.basename(apk_artifacts["minimal"])
+        report["minimalBytes"] = apk_artifacts["minimalBytes"]
+        report["residentTar"] = (os.path.basename(apk_artifacts["residentTar"])
+                                 if apk_artifacts["residentTar"] else None)
+        report["residentLibs"] = apk_artifacts["residentLibs"]
+
         report_path = os.path.join(os.path.dirname(out),
                                    "pack-%s-%s.json" % (rom_id, rom_version))
         with open(report_path, "w", encoding="utf-8", newline="\n") as handle:

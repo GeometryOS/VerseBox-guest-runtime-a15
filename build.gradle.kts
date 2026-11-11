@@ -138,9 +138,32 @@ tasks.withType<org.gradle.api.tasks.bundling.Zip>().configureEach { isZip64 = tr
 
 // AGP 9 的官方目录注入点：按 variant 添加"静态源码目录"，等价于旧 sourceSets 的
 // jniLibs.srcDir / assets.srcDir，且不经过已废弃的 com.android.build.gradle.api.* 类型。
+// --------------------------------------------------------------- 旧格式 payload 的开关
+//
+// 旧格式（把整份 payload 摊在 APK 的 assets/<prefix>/ 里）与「ROM 入库」是**平行**的两条路：
+// 新格式的 ROM 走 app/rom-embed.json → build/rom-dist → assets/kanadex-rom/，
+// 这里只负责「旧描述文件 + 旧 payload」那一份（RomCatalog 读 assets/roms/*.yaml）。
+//
+// 本轮**默认仍然开着**，原因不是懒：关掉之后，rom_id 还是旧格式 id（android15，没有 @版本）
+// 的实例会先找不到旧描述、再找不到新包，启动会被闸门拦住。开着的唯一代价是 APK 里多一份
+// payload（~1.5 GB），这是"不把用户已经在用的虚拟机弄坏"的价格。
+//
+// 关掉的顺序（docs/rom-release/03 §3）：先确认设备上所有实例的 rom_id 都是 romKey，
+// 再传 -PverseboxLegacyPayload=false 打一次包，用真机把三台系统各起一次。
+val keepLegacyPayload = (providers.gradleProperty("verseboxLegacyPayload").orNull ?: "false").toBoolean()
+
 androidComponents {
     onVariants { variant ->
-        variant.sources.jniLibs?.addStaticSourceDirectory(runtimeRoot.resolve("jniLibs").absolutePath)
-        variant.sources.assets?.addStaticSourceDirectory(runtimeRoot.resolve("assets").absolutePath)
+        // **本模块不再注入 jniLibs**：APK 的 lib/ 由 rom-embed 配置里的
+        // apk-resident-libs-*.tar 提供（:app:stageRomAssets → build/rom-dist/apk-libs）。
+        // 两边同时注入同名 .so 会在 AGP 合并阶段直接失败，而"哪几个 so 进 lib/"
+        // 只允许有一个来源（docs/rom-release/01-入库配置/02-构建链产物.md §4）。
+        //
+        // 旧格式 payload（assets/<prefix>/）默认也关掉：
+        // 需要它时用 -PverseboxLegacyPayload=true，或更好——在 rom-embed 配置里登记
+        // legacyPreparedApk，让构建链按配置引入（docs/rom-release/01-入库配置/03）。
+        if (keepLegacyPayload) {
+            variant.sources.assets?.addStaticSourceDirectory(runtimeRoot.resolve("assets").absolutePath)
+        }
     }
 }
