@@ -1,0 +1,20 @@
+# 必须留在 APK  `lib/arm64-v8a`  的原生文件（"execve 集合"）
+#
+# 为什么有这份清单（2026-11-11 真机实测，别再猜）：
+#   App 进程的 SELinux 域是  `u:r:untrusted_app` ，它对  `app_data_file`  只有
+#   `{ read open map execute }`  而没有  `execute_no_trans` 。于是：
+#     -  `dlopen()` /  `mmap(PROT_EXEC)`  客体 .so        -> 允许（这就是 1135 个库能下沉的原因）
+#     -  `execve()`  一个  `/data/...`  下的 ELF                -> EACCES（error=13）
+#   APK 自带的  `nativeLibraryDir` （`/data/app/.../lib/arm64`）标签不同，execve 允许。
+#
+# 所以"下称下沉"只对  `dlopen`  集合成立；凡是**被  `execve`  的文件**必须留在 APK。
+# 判据：日志里  `Cannot run program ...: error=13, Permission denied`  就是漏了这里的一条。
+#
+# 注意  `run-as`  不能用来做这个实验：本机实测 run-as 的 shell 在  `u:r:shell:s0`  域，
+# 它**能** execve  app_data_file，于是"run-as 能跑"会被误读成"App 也能跑"。
+#
+# 格式：每行一个**逻辑名**（清单  `files[].logical` ），# 之后是注释。
+ld-android.so
+linker64
+seed-properties
+desktop-gpu-host

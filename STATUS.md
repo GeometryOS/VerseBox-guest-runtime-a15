@@ -15,10 +15,235 @@
 > - **仍未修复（下一会话第一件事）**：**传感器**。仍 `NoSensors`（`getSensorsList count=0`）。已定位到
 >   libunwind 的异常 resume 跳 0（`unwind_phase2 +0xc6c88` / `unwind_phase2_forced +0xc6da8`，`x8=__libunwind_cet_get_jump_target()`）。
 >   判据：sensorservice 不再 `pc=0`，而是打出真实错误行。**在它可用之前不要再改 `HostSensors` 的列表内容。**
+> - **r166（2026-11-11）**：客体 .so 不再进 APK 的 `lib/arm64-v8a`。旧格式（打进 APK）在
+>   `assets/guest-runtime-a15/lib/**`，新格式（ROM 包）在 `payload/lib/**`，两种都靠清单 `files[].libPath` 定位；
+>   `/data` 可执行性实验已在真机通过（见下面 r166 §1）。**判据与未验证项**见 r166 §3/§4。
 > - **不要重试**：塞二进制进仓库 / 写死 codec / 把 A10 渲染器做成默认或静默回退 / 删掉 `native-display` 的渲染器校验。
+> - **版本号只由维护者决定（2026-11-11 红线，见 `_audit/00` §4.7）**：AI 不许为了让"这版是哪个"好认去改
+>   `versionCode / versionName / defaultRomVersion`。要区分产物，用 `sha256 + 字节数 + 时间戳`。
+>   当前装机号 `105 / 0.1.5-romlib-bootlog` 是事故留下的现状，**保留、不回滚**。
 > - 详细：`_audit/coding-log/2026-11-03-重大事故-AIDA64与传感器-源码不入链与产物糊弄/README.md`（50 篇 + 三条红线），
 >   `_audit/00-总纲与红线.md` §4.4/§4.5。
 
+
+## r166（2026-11-11 客体 .so 下沉：`libMode=rom` + 旧格式 payload 一起改，两种格式都不进 APK 的 `lib/`）
+
+> 用户原话要求：**"所有的 so 文件都不要放在 apk 的 lib 目录下，而是放在 ROM 包体的对应位置"**，
+> 并且"已经装好的虚拟机也要自动修正为新的正确格式"。本轮就是这条。
+
+### 1. 闸门：`/data` 可执行性实验（`docs/rom-package/04` §3.2）——**先误判、后被真机答案推翻**
+
+> **结论（以真机 App 内日志为准）**：`execve` 一个 `/data/...` 下的 ELF **被拒绝**
+> （`error=13, Permission denied`）；只有 `dlopen()`/`mmap(PROT_EXEC)` 允许。
+> 所以"能被 execve 的文件"只能来自 APK 的 `lib/`（`apk_data_file`），
+> 其余 1135 个客体 .so 才是可以下沉的那一批。判据见 §1.3 的原文。
+
+- 设备：`3B15AV00JCP00000`（OnePlus PKX110 / Android 15 / `ro.build.version.sdk=35` / `getenforce=Enforcing`）。
+- 做法：把 APK 里那份 linker 复制到 `filesDir` 下再直接执行（`run-as` 与 App 同 uid、同 SELinux 域）：
+
+```text
+adb shell run-as me.kanadex.versebox cp <libdir>/liba15vm-source-linker.so files/exec-probe/linker-probe
+adb shell run-as me.kanadex.versebox chmod 755 files/exec-probe/linker-probe
+adb shell run-as me.kanadex.versebox sh -c 'files/exec-probe/linker-probe; echo rc=$?'
+```
+
+- 结果（判据是 §3.2 的第一种输出：打印 usage、`rc != 126/127`）：
+
+```text
+Usage: files/exec-probe/linker-probe [--list] PROGRAM [ARGS-FOR-PROGRAM...]
+...
+rc=0
+```
+
+- **当时的（错误）结论**：以为 `filesDir` 下的 ELF 可以 `execve`。
+  **错在哪**：`run-as` 起来的 shell 在本机是 `u:r:shell:s0` 域（`ps -AZ` 实测），
+  它**能** execve `app_data_file`；而 App 进程是 `u:r:untrusted_app`，**不能**。
+  这条实验当时没验证"执行者是不是同一个域"，属于典型的"跑通了一个域就当产品能跑"。
+
+### 1.3 真机否决（2026-11-11 19:23，两条日志）
+
+```text
+[005.76s] ERROR   属性初始化失败：Cannot run program
+  "/data/data/me.kanadex.versebox/files/roms/android15@1.1.0/payload/lib/liba15vm-seed-properties.so":
+  error=13, Permission denied
+```
+
+同一条 `VERIFY 1139/1139`、`DATA 2434/2434` 都过了 —— 也就是"文件都在、哈希都对、只是执行不了"。
+补测（同一台机、同一份文件）：
+
+| 执行者 | 命令 | 结果 |
+| --- | --- | --- |
+| shell 域 | `run-as … sh -c 'files/roms/…/liba15vm-source-linker.so'` | 打印 usage，`rc=0` |
+| App 域 | `ProcessBuilder(nativeFile("seed-properties"))` | `error=13` |
+
+### 1.4 因此：execve 集合必须留在 APK
+
+按调用点逐条核实（不是照抄名字列表）：`FrameworkSession.launch()`、`GuestRuntime.checkJava()`、
+`GuestDisplayPower`、`vendor/framework/{A15AppLaunch,AppLaunch,ApplicationCodePathsCheck,GuestPackageQueryCheck}.java`、
+`vendor/runtime/filesystem/GuestExec.cpp` 全部是 **`linker <program> args`** —— 真正 `execve` 的只有
+linker 自己，其余程序由 linker `mmap` 后跳转。加上两处直接 `ProcessBuilder`：
+
+| 逻辑名 | 名字 | 为什么 execve |
+| --- | --- | --- |
+| `ld-android.so` | `liba15vm-guest-ld-android.so` | 每次 `launch()` 的 argv[0] |
+| `linker64` | `liba15vm-source-linker.so` | 同一份字节，客体程序把它当 `PT_INTERP` |
+| `seed-properties` | `liba15vm-seed-properties.so` | `GuestRuntime.prepare()` 直接 exec |
+| `desktop-gpu-host` | `liba15vm-desktop-gpu-host.so` | `FrameworkSession.startDesktop()` 直接 exec |
+
+这 4 个由 `rom/resident-native.txt` 唯一声明，两个打包器（`pack-rom.py` / `stage-apk-payload.py`）
+共用它，清单里写成 `files[].resident = true`；其余 1135 个（628.7 − 11.9 ≈ 617 MB）全部下沉。
+运行时 `nativeFile()` 的规则因此变成：**APK 的 `lib/` 里有同名文件就用它**（只有这 4 个会命中），
+否则用实例里那份落地文件（见 §1.5）。
+
+### 1.5 第二刀：`A10VM_HOST_ROOT` 不能跟着 .so 搬（2026-11-11 20:0x，两屏都卡开机动画）
+
+第一次改完（v102）两屏都能起到"开机动画"，但**每个应用进程都起不来**，`framework-server.log` 里是：
+
+```text
+a15_zygote_launch_failed=com.android.networkstack.process: java.io.IOException:
+  Cannot run program "/data/app/…/lib/arm64/liba15vm-guest-ld-android.so"
+  (in directory "…/vm/rootfs"): error=2, No such file or directory
+Caused by: android.os.ZygoteStartFailedEx: fork() failed
+```
+
+文件明明在（`ls -l` 可见、0755、system 属主）。真因是**路径层**：客体进程里的 `execve` 被我们补过丁的
+libc（`vendor/runtime/filesystem/GuestExec.cpp`）接管，它用 `GuestPaths::hostPath()` 判断"这是宿主路径、别套 rootfs"，
+而 `hostPath()` 只认 `A10VM_HOST_ROOT` 与 `A10VM_STATE_ROOT` 两个前缀。
+我把 `A10VM_HOST_ROOT` 从 APK 的 `nativeLibraryDir` 改成了"客体 .so 的物理根"，于是 APK 里的 linker
+不再被认成宿主路径 → 被当成客体路径重写进 `<rootfs>/data/app/…` → `error=2` → zygote 一个应用都起不来。
+
+**两条修正（都已落地）**：
+
+1. `A10VM_HOST_ROOT` **回到 APK 的 `nativeLibraryDir`**（`RuntimeFiles.hostRoot()` 现在直接返回它，
+   注释里写清了为什么不能改）。`payload/lib` 不需要这条：那些库由 linker 用原始 syscall 打开，
+   不进 libc 的路径层；linker 自己的准入靠 `ld.config.txt` 的 `permitted.paths`/`search.paths`（这两处已加上物理根）。
+2. 客体 .so **落到实例里**：`<instance>/vm/libs/<name>`，由 ROM 的 `payload/lib`（或旧格式解包目录）
+   **硬链接**过来（同卷 0 额外字节，跨卷才复制），`chmod 0755`；`nativeFile()` 返回的就是这个路径，
+   于是客体的 `open`/`execve`、`ld.config` 的 search/permitted、以及 `RuntimeIdentity` 拿
+   `/proc/<pid>/maps` 对账的那条路径**三者一致**（否则会报 `Unexpected guest executable mapping`）。
+
+### 2. 这一轮改了什么（两条产物链一起改）
+
+| # | 位置 | 改动 | 判据 |
+| --- | --- | --- | --- |
+| 1 | `rom/rom.properties.yaml` | `libMode: apk` → **`rom`** | `python rom/pack-rom.py` 的 `"libMode"` 输出 |
+| 2 | `rom/stage-apk-payload.py`（**新**） | 把 `prepared/` 变成 APK 侧旧格式 payload：`assets/guest-runtime-a15/lib/<name>` + 清单 `files[].libPath`，`jniLibs/` 留空 | 脚本自检 + `prepared-apk/jniLibs` 里 0 个 `.so` |
+| 3 | `build.gradle.kts`（A15 模块） | 默认消费 `prepared-apk`；`verifyRuntimeA15` 按 `libPath`/`resident` 找文件，并**硬闸门**：`jniLibs/arm64-v8a` 的 `.so` 集合必须**等于**清单里 `resident` 的集合 | `A15 runtime verified: 1139 native files (payload layout)` |
+| 3b | `rom/resident-native.txt`（新）+ `pack-rom.py` | execve 集合的唯一清单；打包器给这 4 条写 `resident: true` | `--verify-only` 通过、清单里 4 条有 `resident` |
+| 4 | `scripts/build-a15.ps1` / `build.sh` | prepared 之后加一步 `rom/stage-apk-payload.py` | 构建日志里的新 step |
+| 5 | `guest-runtime/…/RuntimeFiles.java`（共享层） | `nativeFile()` 三段解析：ROM 的 `payload/lib` → 旧格式 payload 解包目录 `files/romlibs/<prefix>/` → `nativeLibraryDir`（A9/A10 老清单，逐字不变）；`verify()` 先解包再核对 | 见 §3 |
+| 6 | `guest-runtime/…/GuestRuntime.java` + `FrameworkSession.java` | `A10VM_HOST_ROOT` 改成 **.so 的物理根**；`ld.config.txt` 的 `permitted.paths`/`dir.guest`/`search.paths` 增加该根（否则 linker 拒绝映射） | 见 §3 |
+
+**为什么 `A10VM_HOST_ROOT` 必须跟着改**（这条最容易被漏掉）：
+`vendor/runtime/dynamic/platform.patch` 里的 `guest_library_name()` 只对 `A10VM_HOST_ROOT` 下的
+realpath 做"换成客体 ABI 名"的映射（`dlpi_name`/`dli_fname`），`GuestPaths::hostPath()` 也用它判断
+"这是宿主路径、别套 rootfs"。客体 .so 一旦从 APK 的 lib 搬到 `payload/lib`，这两件事都得跟着搬，
+否则 `ProcessIdentity` 上报的 `libc.dli_fname` 与 `GuestProcMaps` 的别名规则会静默换形状。
+**本轮没有重编 linker**（patch 一行没动）：把环境变量指到新的根，语义与改前逐字相同。
+
+### 3. 产物（本机实测，命令 + 末行）
+
+```text
+> python rom/stage-apk-payload.py --prepared prepared --out prepared-apk
+{ "files": 1139, "libBytes": 628731480, "data": 2434, "placed": {"link": 2434, "copy": 0, "skip": 0} }
+
+> python rom/pack-rom.py --prepared prepared --rom-version 1.1.0 --lib-mode rom
+{ "romKey": "android15@1.1.0", "zipBytes": 715493673, "payloadBytes": 1687799938,
+  "payloadSha256": "14b97553e1e258fc7ddfcf8df3d93c70e67cbb1117eddcd95fc7e2cc92b9acdd",
+  "payloadFiles": 3573, "manifestFiles": 1139, "manifestData": 2434,
+  "libMode": "rom", "bundledLibs": 1139 }
+```
+
+- 新格式包：`dist/versebox-android15-1.1.0.zip`（715,493,673 B / sha256 `A7D084D4…`，1.69 GB 解压，
+  含 1139 个客体 .so 在 `payload/lib/`）。
+- 旧格式 APK：`app-debug.apk` 2,055,412,355 B / sha256 `CF01276D…`，`versionCode=101 / 0.1.1-romlib`。
+  **`lib/arm64-v8a` 里 `liba15vm-*` 只剩两个宿主库**（`desktop-window`、`p1-client`），
+  1139 个客体 .so 全在 `assets/guest-runtime-a15/lib/`（628.7 MB）。
+- 装机实测：`adb install -r -d` 成功，install 目录**换成了新的**（`~~H7GP-…`）——
+  这正是 `2026-11-08-…/14` 记的"重装即悬空"场景，也是本轮要消掉它的原因。
+- `payload/lib` 与 `prepared/jniLibs/arm64-v8a` **逐字节相同**（打包器对每条 `files[]` 算了 SHA-256 并自检）。
+
+### 3.5 真机实测（2026-11-11 20:00 与 20:04 两次启动，v104 装机）
+
+用户在真机上把两种格式各启动了一次（v104 / `0.1.4-romlib-bootanim`），下面全部是 `run-as` 只读取到的原文。
+
+| 判据 | 新格式 `android15@1.1.0`（实例 1794396228556，20:04） | 旧格式 `android15`（实例 1793525278509，20:00） |
+| --- | --- | --- |
+| `startup-events.log` | `VERIFY 1139/1139` → `PREPARE` → `DATA 2434/2434` → 各 helper `READY` | 同上（逐条同形） |
+| 框架接受输入 | `[009.10s] READY Android framework accepting input` | `[009.61s]` 同一行 |
+| 实例 .so 落地 | `vm/libs` **1139** 个（硬链接到 ROM 的 `payload/lib`） | `vm/libs` **1139** 个 |
+| zygote 起应用 | `a15_zygote_launch_failed` 计数 **0** | 同上 **0** |
+| guest 进程 | `ps -A` 里 `u0_a446` **127** 个 | 同量级 |
+| 桌面 | `Displayed com.android.internal.app.PlatLogoActivity` / `com.android.settings/.Settings` | `Displayed com.android.launcher3/.uioverrides.QuickstepLauncher` ×7 |
+| 开机动画 | `framework-bootanim.log` 末行 `BootAnimationStopTiming`，**同一分钟内**收掉 | 同样同一分钟内收掉 |
+
+**两条结论**
+
+1. **.so 下沉这条链在真机上是通的**：文件从 ROM 的 `payload/lib` 读、逐条哈希全过、1139 个硬链接进实例、
+   zygote 一个应用都没起不来、客体桌面（Launcher3 / Settings）真的显示出来了。
+2. **旧格式这次没走"assets payload 解包"那条路**：`files/romlibs/` 在设备上**不存在** —— 旧实例 `rom=android15`
+   经三段解析命中了同 id 的 `android15@1.1.0` 目录，客体 .so 直接从 ROM 读。也就是说
+   `assets/guest-runtime-a15/lib/**` 那条自愈解包路径**仍未在真机被走到**（要验它得先删掉同 id 的 ROM）。
+
+### 3.6 顺带修掉的一个"日志骗人"（v105）
+
+两次启动的 `startup-events.log` 都停在 `[009.10s] READY Android framework accepting input` 之后一片空白：
+`SPAWN client`、`READY client: desktop_services_ready=1`、`STOP bootanim: desktop-ready` 一行都没有 ——
+但 `framework-client.log` 明明在同一分钟被写过（78,406 B，含 `desktop_services_ready=1`）。
+
+真因：`NativeGraphicsSession.start()` 在 `finally` 里调 `StartupLog.finish()`，而"桌面确认 / 收开机动画"
+都发生在 start() 返回**之后**的后台线程里，于是 `record()` 被 `if (!active) return;` 直接丢掉。
+**这就是历来"桌面好了没""动画停了没"在日志里查不到的原因**（不是没发生，是没记下来）。
+
+修法（`StartupLog`）：写盘只看 `writable`（`begin()` 置 true，之后永不清），`active` 只留给 UI 的 `snapshot()`。
+
+**已闭合**（2026-11-11 20:15 两次启动，`versionCode=105`）：
+
+```text
+# 新格式 android15@1.1.0（实例 1794396228556）
+[009.51s] SPAWN   client process started
+[012.52s] WAIT    client: waiting for desktop_services_ready=1
+[014.66s] READY   client: desktop_services_ready=1
+[014.77s] STOP    bootanim: desktop-ready（进程已退出）
+
+# 旧格式 android15（实例 1793525278509）
+[011.04s] SPAWN   client process started
+[014.05s] WAIT    client: waiting for desktop_services_ready=1
+[016.95s] READY   client: desktop_services_ready=1
+[017.05s] STOP    bootanim: desktop-ready（进程已退出）
+```
+
+也就是：**开机动画在 15–17 秒被收掉，桌面对话确认在同一秒完成**。`stopBootAnimation` 打的是
+"（进程已退出）"—— 客体自己的 `bootanimation` 先退了，宿主这条只是补记，符合预期。
+
+### 4. 已验证 / 未验证（口径照 `_audit/04` §2）
+
+**已验证（真机，2026-11-11 20:00 / 20:04 两次启动）**
+
+- 新格式 `android15@1.1.0` 与旧格式 `android15` 的 A15 实例都能起到客体桌面：
+  `VERIFY 1139/1139`、`DATA 2434/2434`、框架接受输入、`Displayed …QuickstepLauncher / …Settings`、
+  `a15_zygote_launch_failed=0`、`u0_a446` 名下上百个客体进程、`vm/libs` 1139 个。
+- APK 侧布局（构建期判据，装到机的同一份 APK）：`lib/arm64-v8a` 的 `liba15vm-*` 只剩 2 宿主库 + 4 个 resident；
+  `assets/guest-runtime-a15/lib/` 1135 个 / 610.3 MB。
+
+**未验证（不许写成已完成）**
+
+| 项 | 状态 | 怎么验 |
+| --- | --- | --- |
+| `assets/guest-runtime-a15/lib/**` 的"无 ROM 时自愈解包"路径 | **未走到**（本机旧实例命中了同 id 的 ROM 目录，`files/romlibs/` 不存在） | 删掉 `android15@1.1.0` 这台 ROM，再启动旧格式实例 → 应出现 `LIB payload libs N/1135` 与 `files/romlibs/guest-runtime-a15/` |
+| 宿主侧 `SPAWN client` / `READY client: desktop_services_ready=1` / `STOP bootanim: desktop-ready` | **已验证**（20:15 两次启动，见 §3.6 原文） | 已闭合 |
+| 桌面是否真的可见 | **已验证**：两次会话里 `QuickstepLauncher` 各被 `Displayed` 6 次；`u0_a446` 名下 125 个客体进程；`vm/libs` 1139 | 已闭合 |
+| A9 / A10 | **本轮未测**（他们的清单没有 `libPath`，代码路径逐字不变） | 各启动一台 |
+
+### 5. 不要重试
+
+- 不要把客体 .so 放回 APK 的 `lib/arm64-v8a`：`:guest-runtime-a15` 的 `verifyRuntimeA15` 会直接构建失败（这是故意的）。
+- 不要把 `payload/lib` 里的文件改成指向 APK 的软链：那正是"每次 `adb install -r` 全悬空"的根因。
+- 不要在 `libMode=rom` 下静默回落到 APK：`nativeFile()` 掉到旧格式 payload 时一定会写一行 `WARN`。
+- 不要用"日志里没有 STOP bootanim"推断"动画没人收"：v105 之前这行根本写不进文件（见 §3.6）。
+- 不要把"旧格式"理解成"一定会解包 assets"：旧实例会先按 id 命中已导入的同 id ROM（见 §3.5 第 2 条）。
+- 不要为了"省事"把这 1139 个 .so 全塞进 `rootfs/system/lib64`：它们的落点由清单决定
+  （`guestPath`/`libraryName`/`nativeLinks`），`/vendor/lib64/hw` 与 `/apex/…/bin` 都有各自的条目。
 
 ## r165（宿主侧 · ROM 包落地第一批）：共享 Java 层新增 `romRoot`，默认分支不变
 

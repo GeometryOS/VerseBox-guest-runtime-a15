@@ -58,6 +58,26 @@ MODULE_DIR = os.path.dirname(HERE)
 DEFAULT_DIST = os.path.join(MODULE_DIR, "dist")
 
 
+RESIDENT_FILE = os.path.join(HERE, "resident-native.txt")
+
+
+def read_resident(path=RESIDENT_FILE):
+    """只能从 APK 的 lib/ execve 的逻辑名（与 rom/stage-apk-payload.py 共用这一份清单）。
+
+    它们仍然随包（ROM 要自描述、也要能校验），但运行时**必须**用 APK 里那份去 execve：
+    untrusted_app 对 app_data_file 没有 execute_no_trans（实测 error=13），见 resident-native.txt。
+    """
+    names = set()
+    if not os.path.isfile(path):
+        return names
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.split("#", 1)[0].strip()
+            if line:
+                names.add(line)
+    return names
+
+
 class PackError(Exception):
     pass
 
@@ -132,6 +152,7 @@ def rewrite_manifest(manifest, prefix, lib_mode):
     files = manifest.get("files")
     if not isinstance(files, list):
         raise PackError("清单缺少 files[]")
+    resident = read_resident()
     rewritten_files = []
     for item in files:
         name = item.get("name")
@@ -142,6 +163,8 @@ def rewrite_manifest(manifest, prefix, lib_mode):
             entry.pop("libPath", None)
         else:
             entry["libPath"] = PAYLOAD_ROOT + "lib/" + name
+        if item.get("logical") in resident:
+            entry["resident"] = True
         rewritten_files.append(entry)
 
     result = dict(manifest)
@@ -166,7 +189,7 @@ def assert_rewrite_is_lossless(before, after, lib_mode):
                 raise PackError("data[%d].%s 被改写" % (index, key))
     for index, item in enumerate(before["files"]):
         for key, value in item.items():
-            if key == "libPath":
+            if key in ("libPath", "resident"):
                 continue
             if after["files"][index].get(key) != value:
                 raise PackError("files[%d].%s 被改写" % (index, key))

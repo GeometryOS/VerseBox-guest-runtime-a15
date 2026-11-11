@@ -15,7 +15,10 @@ A15 的运行方式与 A9/A10 相同：宿主 App 扮演 init，项目源码构�
 把客体绝对路径映射到 App 私有目录：
 
 - `A10VM_ROOTFS`：客体根文件系统；
-- `A10VM_HOST_ROOT`：APK 原生库目录；
+- `A10VM_HOST_ROOT`：**客体 .so 的物理根**（2026-11-11 起）。原来是 APK 的
+  `nativeLibraryDir`；.so 下沉后它指向 ROM 的 `payload/lib/`（新格式）或
+  `files/romlibs/<prefix>/`（旧格式 payload 解包目录），A9/A10 的老清单仍是 `nativeLibraryDir`。
+  linker 的 `guest_library_name()`（`dlpi_name` 映射）与 `GuestPaths::hostPath()` 都依赖它；
 - `A10VM_STATE_ROOT`：属性/状态目录；
 - `A10VM_LD_CONFIG`：私有 linker 配置；
 - `A10VM_PROPERTIES`：私有属性区。
@@ -161,6 +164,27 @@ GLES1，并核对清单的 `bytes`/`sha256`（运行时的 `files.verifyInputs()
 
 ---
 
+## 2.3 客体 .so 放在哪里（2026-11-11 起）
+
+**不进 APK 的 `lib/arm64-v8a`。** APK 的 `lib/` 只保留宿主侧那两个库
+（`liba15vm-desktop-window.so`、`liba15vm-p1-client.so`，`System.loadLibrary` 直接加载）。
+1139 个客体 .so 分两种格式承载，位置都由清单 `files[].libPath` 说明：
+
+```text
+新格式（分发的 ROM 包）  zip 根/payload/lib/<name>                 rom/pack-rom.py 产出
+旧格式（打进 APK）      assets/guest-runtime-a15/lib/<name>       rom/stage-apk-payload.py 产出
+                                                ↓ 启动时一次解包、chmod 0755
+                        files/romlibs/guest-runtime-a15/<name>    RuntimeFiles 自愈式解包
+```
+
+- 运行时用**同一个解析器**找它们（`RuntimeFiles.nativeFile()`）：ROM 优先，其次旧格式 payload，
+  最后才是 A9/A10 那种 `nativeLibraryDir`；
+- 落点不是"全塞 `system/lib64`"：每个条目按清单的 `guestPath` / `libraryName` / `nativeLinks`
+  物化到 `rootfs/system/lib64`、`rootfs/vendor/lib64/hw`、`rootfs/apex/.../bin` 等各自的位置；
+- `/data` 可执行性已在真机验证（`STATUS.md` r166 §1），所以 `payload/lib` 里的 linker 能直接 exec。
+
+---
+
 ## 3. 构建顺序（有依赖，不能并行乱序）
 
 ```text
@@ -202,7 +226,9 @@ Linux/Git Bash `sh guest-runtime-a15/scripts/build.sh`；已有产物的阶段�
 | HAL 程序（必需） | `sh bridges/build-host-hal.sh` | `bridges/bin/host-devices`（vibrator/sensors/thermal）；`liba15vm-hal-modules.so` 目前未产出，prepare 会跳过 |
 | 开机动画素材 | `python scripts/make-bootanimation.py` | `bootanim/bootanimation.zip` |
 | prepared | `python scripts/prepare-a15.py` | `prepared/`（含 `system/media/bootanimation.zip`） |
-| APK | `gradlew :app:assembleDebug` | `app/build/outputs/apk/debug/app-debug.apk` |
+| ROM 包（新格式） | `python rom/pack-rom.py --prepared prepared` | `dist/versebox-android15-<ver>.zip`（客体 .so 在 `payload/lib/`） |
+| APK 侧旧格式 payload | `python rom/stage-apk-payload.py --prepared prepared --out prepared-apk` | `prepared-apk/`（客体 .so 在 `assets/guest-runtime-a15/lib/`，`jniLibs/` 为空） |
+| APK | `gradlew :app:assembleDebug`（消费 `prepared-apk`） | `app/build/outputs/apk/debug/app-debug.apk` |
 
 > Windows 上原生阶段用 **Git Bash**（`build-a15.ps1` 自动探测 PATH、
 > `%ProgramFiles%\Git`、`D:\Program\Git`、`C:\msys64`）+ NDK 29。

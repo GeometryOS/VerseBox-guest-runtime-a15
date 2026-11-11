@@ -13,9 +13,14 @@ plugins { id("com.android.library") }
 // This module is deliberately independent of :guest-runtime-a9. The two share a
 // contract (the manifest schema and the host-side launcher), not binaries: an
 // API 28 libc can never load an API 35 libart, and vice versa.
+// 2026-11-11：APK 消费的是 **prepared-apk**（由 rom/stage-apk-payload.py 产出），
+// 不是 prepared/。区别只有一处、但很关键：客体 .so 在 prepared-apk 里是
+// assets/guest-runtime-a15/lib/**（清单 files[].libPath），**不在 jniLibs/**，
+// 所以 APK 的 lib/arm64-v8a 只剩宿主侧那两个库（桌面渲染器 + p1 客户端）。
+// 判据见 docs/rom-package/04 §4：unzip -l app-debug.apk 里不应再有客体 .so。
 val preparedRoot: File? = providers.gradleProperty("guestRuntimeA15Prepared").orNull
     ?.let { file(it) }
-val bundledRoot = projectDir.resolve("prepared")
+val bundledRoot = projectDir.resolve("prepared-apk")
 val runtimeRoot = preparedRoot ?: bundledRoot
 
 android {
@@ -78,15 +83,44 @@ val verifyRuntimeA15 = tasks.register("verifyRuntimeA15") {
                     "Foreign runtime logical name in A15 prepared: $logical"
                 }
             }
-            val file = runtimeRoot.resolve("jniLibs/arm64-v8a/" + entry["name"])
-            check(file.isFile) { "Missing A15 native input: $file" }
+            // 客体 .so 的位置由清单自己说（files[].libPath）：
+            //   旧格式（打进 APK）-> assets/guest-runtime-a15/lib/<name>
+            //   新格式（ROM 包）  -> payload/lib/<name>（那一份不经过 Gradle）
+            // 没有 libPath 的清单就是老行为（APK 的 lib/），只允许历史产物这么写。
+            // resident=true 的是被 execve 的那几个（linker / GPU 端点 / 属性播种器）：
+            // untrusted_app 不能从 app_data_file 执行，它们必须留在 APK 的 lib/ 里。
+            val libPath = entry["libPath"] as? String
+            val isResident = (entry["resident"] as? Boolean) == true
+            val file = if (isResident || libPath == null) runtimeRoot.resolve("jniLibs/arm64-v8a/" + entry["name"])
+                       else runtimeRoot.resolve("assets/" + libPath)
+            check(file.isFile) {
+                "Missing A15 native input: $file\n" +
+                        (if (libPath == null)
+                            "这份 prepared 还是老布局（.so 在 jniLibs/）。跑 " +
+                                    "python guest-runtime-a15/rom/stage-apk-payload.py 生成 prepared-apk。"
+                        else "prepared-apk 不完整，重跑 rom/stage-apk-payload.py。")
+            }
             check(file.length() == (entry["bytes"] as Number).toLong()) {
                 "Size mismatch for $logical"
             }
             check(sha256(file) == entry["sha256"]) { "SHA-256 mismatch for $logical" }
             checked += 1
         }
-        logger.lifecycle("A15 runtime verified: $checked native files")
+        // 硬闸门：APK 的 lib/ 里只允许 resident 那几个客体文件（docs/rom-package/04 §4）。
+        val jniDir = runtimeRoot.resolve("jniLibs/arm64-v8a")
+        val allowed = files.map { (it as Map<*, *>) }
+            .filter { (it["resident"] as? Boolean) == true }
+            .map { it["name"] as String }
+            .toSet()
+        val present = jniDir.listFiles { f -> f.isFile && f.name.endsWith(".so") }
+            ?.map { it.name }?.toSet() ?: emptySet<String>()
+        check(present == allowed) {
+            "APK 的 lib/arm64-v8a 内容与 resident 清单不一致：" +
+                    "\n  多出来（不该在 APK 里）：" + (present - allowed) +
+                    "\n  缺少（必须在 APK 里，execve 只能从这里）：" + (allowed - present) +
+                    "\n修法：重跑 python guest-runtime-a15/rom/stage-apk-payload.py"
+        }
+        logger.lifecycle("A15 runtime verified: $checked native files (payload layout)")
     }
 }
 tasks.named("preBuild").configure { dependsOn(verifyRuntimeA15) }

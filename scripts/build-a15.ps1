@@ -1,4 +1,4 @@
-﻿# One-command Android 15 (API 35) build for Windows.
+# One-command Android 15 (API 35) build for Windows.
 #
 #   .\guest-runtime-a15\scripts\build-a15.ps1
 #   .\guest-runtime-a15\scripts\build-a15.ps1 -Force             # rebuild native stages
@@ -287,6 +287,14 @@ if ($SkipApk) {
     Show-Artifacts -withApk $false -headline "运行时目录与 ROM 包已就绪（未出 APK）"
     exit 0
 }
+# 6a. APK 侧旧格式 payload ----------------------------------------------------
+# 客体 .so 不进 APK 的 lib/arm64-v8a：旧格式（打进 APK）把它们放在
+# assets/guest-runtime-a15/lib/**（清单 files[].libPath），新格式放在 ROM 的
+# payload/lib/**。Gradle 消费的是这里产出的 prepared-apk，不是 prepared。
+Step "APK payload (rom/stage-apk-payload.py -> prepared-apk/)"
+& $python "rom/stage-apk-payload.py" --prepared "prepared" --out "prepared-apk"
+if ($LASTEXITCODE -ne 0) { throw "rom/stage-apk-payload.py failed" }
+
 # 5b. desktop window renderer, built FROM SOURCE ----------------------------------
 # Sources: third_party/graphics/container/{window,desktop,native} in THIS repository
 # (the same tree commit 90cb89e patched for the GLES1 crash). There is no pinned

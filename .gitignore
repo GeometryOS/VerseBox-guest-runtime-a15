@@ -5,6 +5,8 @@
 
 # Generated prepared runtime (assets + jniLibs staged for the APK)
 prepared/
+# APK 侧旧格式 payload（rom/stage-apk-payload.py 产出：assets/$prefix/lib/**）
+prepared-apk/
 
 # Redroid 15 image: layer tarballs, extracted rootfs, and the path index
 downloads/

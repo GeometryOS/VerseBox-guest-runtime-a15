@@ -255,6 +255,10 @@ if [ "$SKIP_APK" = 1 ]; then
     if [ "$SKIP_ROM" = 0 ]; then echo "  ROM package: $ROM_SHOWN"; else echo "  Runtime tree: $(pwd)/prepared (--skip-rom)"; fi
     exit 0
 fi
+# 客体 .so 不进 APK 的 lib/arm64-v8a（docs/rom-package/04 §4）：旧格式 payload 在
+# assets/guest-runtime-a15/lib/**（清单 files[].libPath），Gradle 消费 prepared-apk。
+step "APK payload (rom/stage-apk-payload.py -> prepared-apk/)"
+"$PY" rom/stage-apk-payload.py --prepared prepared --out prepared-apk
 step "APK (app-debug.apk)"
 cd "$ROOT"
 if [ -x ./gradlew ]; then

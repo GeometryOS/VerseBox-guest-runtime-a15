@@ -16,7 +16,13 @@ description: 独立 API 35 用户空间（Redroid 15 64bit-only + AOSP 15 自建
 defaultRomVersion: 1.0.0
 
 # 客体 .so 的承载方式：
-#   apk  —— 客体 .so 仍由 APK 的 lib/arm64-v8a 提供，ROM 只带数据（默认、最安全）
-#   rom  —— 客体 .so 下沉到 ROM 的 payload/lib（需要 /data 可执行性实验通过）
-#   both —— 两边都有，运行时优先 ROM、缺了回落 APK（灰度用）
-libMode: apk
+#   apk  —— 客体 .so 仍由 APK 的 lib/arm64-v8a 提供，ROM 只带数据（旧行为）
+#   rom  —— 客体 .so 下沉到 ROM 的 payload/lib（**默认**）
+#   both —— 两边都有，运行时优先 ROM、缺了回落旧格式 payload（灰度用）
+#
+# 2026-11-11 起默认 rom：docs/rom-package/04 §3.2 的前置实验已在真机通过
+# （3B15AV00JCP00000 / Android 15 / API 35 / SELinux Enforcing）：
+#   run-as me.kanadex.versebox sh -c 'files/exec-probe/linker-probe; echo rc=$?'
+#   -> 打印 linker 的 usage，rc=0（= filesDir 下的 ELF 可以 execve）
+# 结论与判据写在 guest-runtime-a15/STATUS.md 的「/data 可执行性」一节。
+libMode: rom
