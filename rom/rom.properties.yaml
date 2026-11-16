@@ -12,8 +12,8 @@ schema: versebox-rom-properties/1
 id: android15
 name: Android 15
 androidVersion: "15"
-description: 独立 API 35 用户空间（Redroid 15 64bit-only + AOSP 15 自建运行时）
-defaultRomVersion: 1.0.0
+description: AOSP15 虚拟机 ROM
+defaultRomVersion: 1.0.1
 
 # 客体 .so 的承载方式：
 #   apk  —— 客体 .so 仍由 APK 的 lib/arm64-v8a 提供，ROM 只带数据（旧行为）
