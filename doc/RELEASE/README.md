@@ -16,11 +16,11 @@
 | 路径 | 动作 | 字节 | sha256 |
 | --- | --- | --- | --- |
 | `.github/workflows/build.yml` | 修改 | 9624 | `65909cba866475e8653058333b79e3230e6b38af4e390df2d4c01d294bc01cc5` |
-| `.github/workflows/release-publish.yml` | 新增 | 10136 | `4ec3068290f3b36ab2a848e5659259ea4e0533c7974bf63fc7b43f226c06e8f3` |
+| `.github/workflows/release-publish.yml` | 新增 | 10043 | `d8f30dd9ff7f544d8477830da1d3557156dfca7180958bbe0a3728b71c735beb` |
 | `.github/scripts/collect-release-assets.mjs` | 新增 | 1800 | `f5b2b254e092b0ad83752305e7cfb4c08cb9cd560eb6e3ee036b09921273b597` |
-| `.github/scripts/generate-release-notes.mjs` | 新增 | 6678 | `908236fcf664dfc60acf6a53b7039f5e7b38df561eef2402c3ae49a7e1795bdd` |
-| `.github/scripts/update-release-index.mjs` | 新增 | 5138 | `7991c96ceb39f857f4ec8196c869611892c920814e829815d56bc21277cc3729` |
-| `.github/scripts/lib/release-facts.mjs` | 新增 | 2301 | `efe3be50909a4650e084172433d4489ceb1c31b09aa0e81576a92ec545416e53` |
+| `.github/scripts/generate-release-notes.mjs` | 新增 | 6151 | `e392920feab621252077872721c0e54db69f64d60267c694cbb0b5714f390ba0` |
+| `.github/scripts/update-release-index.mjs` | 新增 | 4707 | `c58f3af4e34677aa8841763384300f7f54ded9abf067e4ebb261a55380ee9e35` |
+| `.github/scripts/lib/release-facts.mjs` | 新增 | 2519 | `4cb37a4482adcbf2e69c532ff2e4c12c23b58e2aaa20f7c9b2b7e74b93baf58b` |
 | `release/release.json` | 新增 | 3 | `37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570` |
 
 构建工作流只改发布相关的部分。打标签自动建发布页的步骤被删掉，权限从写降为只读，推送触发加了索引目录的跳过规则。构建本身、缓存键、产物校验与附件名称都没有动，因为这条路径已经跑通，换掉它等于把已有的证据作废。
