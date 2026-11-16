@@ -1,7 +1,7 @@
 // Builds the release title and body for one tag.
 //
-// The title is <version>.<YYYYMMDD>, where the version comes from the tag and the date is the
-// publish date in UTC+8. The body is assembled from facts, not prose: the commits between the
+// The title is the product prefix followed by the tag, so the version appears once and nothing
+// else is invented. The body is assembled from facts, not prose: the commits between the
 // previous tag and this one, the packer's report for the ROM package, and the asset list
 // collected from the downloaded build. Publishing the same tag twice therefore produces the
 // same text, and a release can be audited from the repository alone.
@@ -15,11 +15,10 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
-import { readPackReport, readRomProperties } from './lib/release-facts.mjs';
+import { TAG_PATTERN, readPackReport, readRomProperties } from './lib/release-facts.mjs';
 
-const TAG_PATTERN = /^(v\d+\.\d+\.\d+)(?:-([0-9A-Za-z.-]+))?$/;
 const ROM_KEY_PATTERN = /^([A-Za-z0-9-]+)@(.+)$/;
-const RELEASE_UTC_OFFSET_MINUTES = 8 * 60;
+const RELEASE_TITLE_PREFIX = 'VerseBox A15 ';
 
 function fail (message) {
   console.error(message);
@@ -30,18 +29,9 @@ function git (...args) {
   return execFileSync('git', args, { encoding: 'utf8' }).trim();
 }
 
-function parseTag (tag) {
-  const match = TAG_PATTERN.exec(tag);
-  if (!match) fail(`tag ${tag} is not vX.Y.Z or vX.Y.Z-suffix; the release title is built from it`);
-  return { version: match[1], suffix: match[2] ?? '' };
-}
-
-// The date follows the maintainer's clock. A release cut at 02:00 local time must not be dated
-// to the previous UTC day, so the offset is applied here instead of trusting whichever time
-// zone the runner happens to use.
-function releaseDate (now) {
-  const local = new Date(now.getTime() + RELEASE_UTC_OFFSET_MINUTES * 60000).toISOString();
-  return local.slice(0, 10).split('-').join('');
+function requireVersion (tag) {
+  if (!TAG_PATTERN.test(tag)) fail(`tag ${tag} is not vX.Y.Z; the release title is built from it`);
+  return tag;
 }
 
 // A tag may sit on a commit that no earlier tag reaches, which is the normal state of the very
@@ -99,7 +89,7 @@ if (git('rev-parse', '--is-shallow-repository') === 'true') {
 }
 
 const tag = values.tag;
-const { version } = parseTag(tag);
+const version = requireVersion(tag);
 const repositoryUrl = `https://github.com/${values.repo}`;
 const rom = readRomProperties(values['rom-properties']);
 const report = readPackReport(values['pack-report']);
@@ -120,7 +110,7 @@ if (romKey[2] !== rom.defaultRomVersion) {
 
 const previous = previousTag(tag);
 const changes = commitsBetween(previous, tag, repositoryUrl);
-const title = `${version}.${releaseDate(new Date())}`;
+const title = `${RELEASE_TITLE_PREFIX}${version}`;
 const lines = [
   '## 本次发布',
   '',

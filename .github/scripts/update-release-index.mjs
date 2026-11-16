@@ -1,30 +1,30 @@
 // Records one published release in the index.
 //
-// The file is a JSON array with one entry per tag. The tag is the identity because one version
-// can be released on several dates: v1.0.0 cut today and v1.0.0 cut next month share the version
-// but are different releases with different files. Publishing a tag that is already recorded
-// replaces it in place, the newest entry always sits at the end, and only the last MAX_ENTRIES
-// releases are kept, so a retry of the same tag leaves one row and the file cannot grow without
-// bound.
+// The file is a JSON array with one entry per version, and the version is the tag name, so a
+// version can only be published as one entry. The newest entry sits at the end and only the last
+// MAX_ENTRIES versions are kept.
 //
-// An entry that does not match the schema stops the run. A reader looking up a hash by version
-// would otherwise stop de-duplicating without any error, and the next publish would append a
-// second row for a version that already had one.
+// Replacing instead of appending is what keeps the file trustworthy. A publish run can be
+// repeated after a failed step, and a tag can be deleted and recreated on a new commit; either
+// would leave two rows for one version with two different hashes, and a reader looking a version
+// up would have no way to say which row is current.
+//
+// An entry that does not match the schema stops the run, because a numeric version would make
+// the replacement stop matching without any error.
 //
 // Usage:
 //   node update-release-index.mjs --file release/release.json --version <version> \
-//     --tag <tag> --title <title> \
+//     --title <title> \
 //     --rom-properties rom/rom.properties.yaml \
 //     --pack-report <pack report> --commit <sha> \
 //     --run-url <url> --assets release-assets.json
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
-import { readPackReport, readRomProperties } from './lib/release-facts.mjs';
+import { TAG_PATTERN, readPackReport, readRomProperties } from './lib/release-facts.mjs';
 
 const MAX_ENTRIES = 100;
-const VERSION_PATTERN = /^v\d+\.\d+\.\d+$/;
-const TAG_PATTERN = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
+const VERSION_PATTERN = TAG_PATTERN;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const ROM_KEY_PATTERN = /^([A-Za-z0-9-]+)@(.+)$/;
 
@@ -37,7 +37,6 @@ const { values } = parseArgs({
   options: {
     file: { type: 'string' },
     version: { type: 'string' },
-    tag: { type: 'string' },
     title: { type: 'string' },
     'rom-properties': { type: 'string' },
     'pack-report': { type: 'string' },
@@ -48,16 +47,13 @@ const { values } = parseArgs({
   },
 });
 
-const REQUIRED = ['file', 'version', 'tag', 'title', 'rom-properties', 'pack-report', 'commit', 'assets'];
+const REQUIRED = ['file', 'version', 'title', 'rom-properties', 'pack-report', 'commit', 'assets'];
 for (const name of REQUIRED) {
   if (!values[name]) fail(`--${name} is required`);
 }
 
 const version = values.version;
 if (!VERSION_PATTERN.test(version)) fail(`--version ${version} is not vX.Y.Z`);
-
-const tag = values.tag;
-if (typeof tag !== 'string' || !TAG_PATTERN.test(tag)) fail(`--tag ${tag} is not vX.Y.Z or vX.Y.Z-suffix`);
 
 const maxEntries = values['max-entries'] ? Number(values['max-entries']) : MAX_ENTRIES;
 if (!Number.isInteger(maxEntries) || maxEntries < 1) fail('--max-entries must be a positive integer');
@@ -95,14 +91,10 @@ entries.forEach((item, index) => {
     || !VERSION_PATTERN.test(item.version)) {
     fail(`${values.file}: entry ${index} has no version in vX.Y.Z form; fix the file by hand`);
   }
-  if (typeof item.tag !== 'string' || !TAG_PATTERN.test(item.tag)) {
-    fail(`${values.file}: entry ${index} has no tag in vX.Y.Z or vX.Y.Z-suffix form; fix the file by hand`);
-  }
 });
 
 const entry = {
   version,
-  tag: values.tag,
   title: values.title,
   romVersion: romKey[2],
   romKey: report.romKey,
@@ -115,11 +107,11 @@ const entry = {
   assets,
 };
 
-const replaced = entries.filter(item => item.tag === tag).length;
+const replaced = entries.filter(item => item.version === version).length;
 const updated = [
-  ...entries.filter(item => item.tag !== tag),
+  ...entries.filter(item => item.version !== version),
   entry,
 ].slice(-maxEntries);
 
 writeFileSync(values.file, `${JSON.stringify(updated, null, 2)}\n`, 'utf8');
-console.log(`${values.file}: ${replaced} entry for ${tag} replaced, ${updated.length} entries kept`);
+console.log(`${values.file}: ${replaced} entry for ${version} replaced, ${updated.length} entries kept`);

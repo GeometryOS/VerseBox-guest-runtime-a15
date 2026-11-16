@@ -7,6 +7,10 @@
 
 import { readFileSync } from 'node:fs';
 
+// A tag is the version and nothing else. The date belongs to the release title, so a tag
+// carrying a date would put the same fact in two places and drift on a re-cut.
+export const TAG_PATTERN = /^v\d+\.\d+\.\d+$/;
+
 // rom.properties.yaml is a flat map of scalars. A nested or indented key means the schema
 // grew, and guessing at it here would silently change which version the artifacts carry.
 export function readRomProperties(filePath) {
