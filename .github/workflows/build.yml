@@ -7,9 +7,12 @@
 #
 # Artifacts for commits/PRs: a15-runtime-<ref>.tar.gz (prepared) + versebox-*.zip (ROM package) + SHA256SUMS.
 #
+# This workflow only builds. Publishing is a separate action (release-publish.yml), which takes the
+# artifacts of a tag's build and creates the release, so pushing a tag never publishes by itself.
+#
 # Triggers:
 #   * push any branch / PR -> Full build (incremental after cache)
-#   * push tag v*          -> Build and create GitHub Release
+#   * push tag v*          -> Build the payload that this tag will be published from
 #   * workflow_dispatch    -> Manual build (optionally rebuild desktop-gpu-host from source)
 name: Build A15 runtime
 
@@ -17,6 +20,9 @@ on:
   push:
     branches: ["**"]
     tags: ["v*"]
+    # release-publish.yml records each published version here; that commit changes no source.
+    paths-ignore:
+      - release/**
   pull_request:
   workflow_dispatch:
     inputs:
@@ -25,8 +31,10 @@ on:
         type: boolean
         default: false
 
+# Building needs no write access: the release and the commit to release/release.json are done
+# by release-publish.yml, which asks for contents: write on its own.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: a15-${{ github.ref }}
@@ -209,15 +217,3 @@ jobs:
             dist/pack-*.json
             SHA256SUMS
           if-no-files-found: error
-
-      - name: Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            a15-runtime-*.tar.gz
-            dist/versebox-*.zip
-            dist/*-min.zip
-            dist/apk-resident-libs-*.tar
-            dist/pack-*.json
-            SHA256SUMS
