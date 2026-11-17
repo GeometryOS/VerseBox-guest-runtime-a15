@@ -16,8 +16,8 @@
 | 路径 | 动作 | 字节 | sha256 |
 | --- | --- | --- | --- |
 | `.github/workflows/build.yml` | 修改 | 9624 | `65909cba866475e8653058333b79e3230e6b38af4e390df2d4c01d294bc01cc5` |
-| `.github/workflows/release-publish.yml` | 新增 | 10675 | `fb19f6098bb0bdc1592c40031bf796723b32fd92bf2681331a163dc3e0ec2f0a` |
-| `.github/scripts/collect-release-assets.mjs` | 新增 | 1800 | `f5b2b254e092b0ad83752305e7cfb4c08cb9cd560eb6e3ee036b09921273b597` |
+| `.github/workflows/release-publish.yml` | 新增 | 11188 | `fd3c10fb60310187fc9cb9df55aa6dd7e9ab78714a03fc766fcfce583584adb4` |
+| `.github/scripts/collect-release-assets.mjs` | 新增 | 2304 | `ac896d44a2f5c834ce06e2bebeaafb22e9148f875e58d08968eb72d30a0d4085` |
 | `.github/scripts/generate-release-notes.mjs` | 新增 | 6151 | `e392920feab621252077872721c0e54db69f64d60267c694cbb0b5714f390ba0` |
 | `.github/scripts/update-release-index.mjs` | 新增 | 4707 | `c58f3af4e34677aa8841763384300f7f54ded9abf067e4ebb261a55380ee9e35` |
 | `.github/scripts/lib/release-facts.mjs` | 新增 | 2519 | `4cb37a4482adcbf2e69c532ff2e4c12c23b58e2aaa20f7c9b2b7e74b93baf58b` |

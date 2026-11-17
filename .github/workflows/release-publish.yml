@@ -154,14 +154,26 @@ jobs:
           fi
           python3 rom/pack-rom.py --verify-only "${full[0]}"
 
+      # One glob per group, and no group overlaps another. dist/versebox-*.zip already covers
+      # the min placeholder, so naming it twice is how one file ends up listed twice and the
+      # upload then fights itself. The release step takes its file list from this same JSON,
+      # so what is published and what is indexed cannot drift apart.
       - name: Collect the assets
+        id: assets
         run: |
           set -euo pipefail
           shopt -s nullglob
           node .github/scripts/collect-release-assets.mjs --out release-assets.json \
-            a15-runtime-*.tar.gz dist/versebox-*.zip dist/*-min.zip \
+            a15-runtime-*.tar.gz dist/versebox-*.zip \
             dist/apk-resident-libs-*.tar dist/pack-*.json SHA256SUMS
           cat release-assets.json
+          node -e "const a=require('./release-assets.json'); console.log(a.map(x => x.name).join('\\n'))" > release-file-list.txt
+          {
+            echo 'files<<A15_FILES'
+            cat release-file-list.txt
+            echo 'A15_FILES'
+          } >> "$GITHUB_OUTPUT"
+          cat release-file-list.txt
 
       - name: Generate the release notes
         id: notes
@@ -218,13 +230,7 @@ jobs:
           tag_name: ${{ env.TAG }}
           name: ${{ steps.notes.outputs.title }}
           body_path: CHANGELOG.md
-          files: |
-            a15-runtime-*.tar.gz
-            dist/versebox-*.zip
-            dist/*-min.zip
-            dist/apk-resident-libs-*.tar
-            dist/pack-*.json
-            SHA256SUMS
+          files: ${{ steps.assets.outputs.files }}
           fail_on_unmatched_files: true
           draft: false
 
