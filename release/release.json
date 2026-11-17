@@ -1,1 +1,41 @@
-[]
+[
+  {
+    "version": "v1.0.1",
+    "title": "VerseBox A15 v1.0.1",
+    "romVersion": "1.0.1",
+    "romKey": "android15@1.0.1",
+    "payloadSha256": "b85dd66a43e82c72770d6c46357a14c4c5dd6436ce542bee136fd36dd50e2c35",
+    "payloadBytes": 1687638362,
+    "payloadFiles": 3573,
+    "commit": "24331caff329c59ffd987a333c078cfb75a35412",
+    "runUrl": "https://github.com/GeometryOS/VerseBox-guest-runtime-a15/actions/runs/43988698104",
+    "publishedAt": "2026-11-17T00:39:35.816Z",
+    "assets": [
+      {
+        "name": "a15-runtime-v1.0.1.tar.gz",
+        "bytes": 692811663,
+        "sha256": "703c19eee4cec320a993d561698de6d4d10d7f7509a87e2dd16a2e9cf0d08c3f"
+      },
+      {
+        "name": "dist/apk-resident-libs-android15.tar",
+        "bytes": 18391040,
+        "sha256": "21149bb7917c89355ed30713ef8d9f8017073f543ceaf23ba306ffbc1d035018"
+      },
+      {
+        "name": "dist/pack-android15-1.0.1.json",
+        "bytes": 723,
+        "sha256": "ddda40a29cdc51a78ffcbd5ea3f5018ba180b89b8725bca981b371983b63aa05"
+      },
+      {
+        "name": "dist/versebox-android15-1.0.1-min.zip",
+        "bytes": 703,
+        "sha256": "667f293f014473697e78f80b5925b13883bef00a29bf78269420e35f36d239f3"
+      },
+      {
+        "name": "dist/versebox-android15-1.0.1.zip",
+        "bytes": 693068315,
+        "sha256": "53ba10aa40576f82b297357fff891a3ce55606665f9fe4198c055206351a4867"
+      }
+    ]
+  }
+]
