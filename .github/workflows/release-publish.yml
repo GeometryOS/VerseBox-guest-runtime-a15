@@ -1,12 +1,12 @@
 # Publishes one release, from the artifacts of that tag's own build.
 #
-# A tag only starts a build (build.yml). This workflow is the separate publishing action: it
-# takes the artifacts GitHub already produced for that tag, runs the gates below, generates the
-# body from the repository, and attaches the files. Nothing is packed on a developer machine,
-# and pushing a tag never creates a release on its own.
+# Two ways in: a green Build A15 runtime run for a vX.Y.Z tag starts this workflow by itself, and
+# a manual dispatch can publish a tag that already has a green run. Both paths take the artifacts
+# GitHub produced, run the gates below, generate the body from the repository and attach the
+# files. Nothing is packed on a developer machine.
 #
 # Gates, in order:
-#   1. the tag matches vX.Y.Z or vX.Y.Z-suffix and exists;
+#   1. the tag matches vX.Y.Z and exists;
 #   2. Build A15 runtime succeeded for that exact tag, not merely for the same commit;
 #   3. every downloaded file matches SHA256SUMS, so the bytes are the bytes the build verified;
 #   4. the ROM package passes rom/pack-rom.py --verify-only, which re-reads its own manifest;
@@ -18,6 +18,11 @@
 name: Release Publish
 
 on:
+  # The chain needs no token and no dispatch call: when the tag build finishes green, GitHub
+  # starts this run. A failed or non-tag build stops at the job condition below.
+  workflow_run:
+    workflows: ["Build A15 runtime"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -41,11 +46,19 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    env:
+      # A tag build reports the tag as its branch, so both entry points end up with the same string.
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
     steps:
       - name: Checkout the tag with full history
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ env.TAG }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -56,7 +69,7 @@ jobs:
 
       - name: 'Gate 1: the tag exists and matches vX.Y.Z'
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
           printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -71,7 +84,7 @@ jobs:
         id: build
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
           sha=$(git rev-list -n1 "refs/tags/$TAG")
@@ -153,7 +166,7 @@ jobs:
       - name: Generate the release notes
         id: notes
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ env.TAG }}
           RUN_URL: ${{ steps.build.outputs.run_url }}
           COMMIT: ${{ steps.build.outputs.commit }}
         run: |
@@ -202,7 +215,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
+          tag_name: ${{ env.TAG }}
           name: ${{ steps.notes.outputs.title }}
           body_path: CHANGELOG.md
           files: |
@@ -222,7 +235,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
           gh auth setup-git

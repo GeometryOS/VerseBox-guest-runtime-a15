@@ -16,7 +16,7 @@
 | 路径 | 动作 | 字节 | sha256 |
 | --- | --- | --- | --- |
 | `.github/workflows/build.yml` | 修改 | 9624 | `65909cba866475e8653058333b79e3230e6b38af4e390df2d4c01d294bc01cc5` |
-| `.github/workflows/release-publish.yml` | 新增 | 10043 | `d8f30dd9ff7f544d8477830da1d3557156dfca7180958bbe0a3728b71c735beb` |
+| `.github/workflows/release-publish.yml` | 新增 | 10675 | `fb19f6098bb0bdc1592c40031bf796723b32fd92bf2681331a163dc3e0ec2f0a` |
 | `.github/scripts/collect-release-assets.mjs` | 新增 | 1800 | `f5b2b254e092b0ad83752305e7cfb4c08cb9cd560eb6e3ee036b09921273b597` |
 | `.github/scripts/generate-release-notes.mjs` | 新增 | 6151 | `e392920feab621252077872721c0e54db69f64d60267c694cbb0b5714f390ba0` |
 | `.github/scripts/update-release-index.mjs` | 新增 | 4707 | `c58f3af4e34677aa8841763384300f7f54ded9abf067e4ebb261a55380ee9e35` |
@@ -25,7 +25,7 @@
 
 构建工作流只改发布相关的部分。打标签自动建发布页的步骤被删掉，权限从写降为只读，推送触发加了索引目录的跳过规则。构建本身、缓存键、产物校验与附件名称都没有动，因为这条路径已经跑通，换掉它等于把已有的证据作废。
 
-发布工作流是新增的入口，四道闸门与生成、写回两组步骤按顺序排开。三个脚本各管一件事，收集附件哈希、生成标题与正文、写入版本索引，需要共同读取的事实在 `lib/release-facts.mjs` 里读一次，避免三处各读一份之后说法不一致。
+发布工作流是新增的入口，四道闸门与生成、写回两组步骤按顺序排开。它由标签构建的完成事件自动拉起，成功且是标签推送才继续，失败或分支构建停在入口条件上；同一条工作流也保留手动触发，供补发与重试。三个脚本各管一件事，收集附件哈希、生成标题与正文、写入版本索引，需要共同读取的事实在 `lib/release-facts.mjs` 里读一次，避免三处各读一份之后说法不一致。
 
 ## 与其它文档的关系
 
