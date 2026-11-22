@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rom-version-gate-${{.ref${{
+  group: rom-version-gate-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
