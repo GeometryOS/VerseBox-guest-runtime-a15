@@ -8003,3 +8003,13 @@ binder_context_ready=1
   `scripts/prepare-a15.py`（8.2 段生成 `apex-info-list.xml` + `apex_version()`）。
   没有动 Java、没有动桥接库、没有动 VINTF 清单内容。
 - 未验证的推断只能写在 `_audit/coding-log/`，不许写进本文的“当前状态”。
+
+
+## 版本隔离与 maxcv 闸门（2026-11-22，未在 CI 验证）
+
+- 产物目录改为 `dist/<id>@<version>/`：同版本产物同目录，不同版本不再互相覆盖。
+- 打包时自动生成 `pack-audit-intent.json`，含 `romKey`、`minAppVersionCode`、`packSeconds`、`files[]`（名称/字节数/SHA-256）；工作区不手写该文件。
+- `maxcv` 是 **app 侧**选包策略。ROM 只发布 `minAppVersionCode` 兼容下限，不写 `versionPointer`。
+- 新增 `.github/workflows/rom-version-gate.yml`：跑 `rom.test_version_gate` 与 `rom.test_apk_artifacts`，并校验 `rom.properties.yaml` 与 `dist/*/pack-audit-intent.json`。
+- 本地已跑：11 个单测通过（清单结构、maxcv 选择、固定版本下限、清单篡改拒绝）。
+- 尚未做：GitHub Actions 实跑、按新目录重建产物、真机验证。

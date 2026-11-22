@@ -1,9 +1,7 @@
 // Facts the release text and the release index both need, read from the workspace.
 //
-// Two sources: rom/rom.properties.yaml decides the artifact file name, and
-// dist/pack-<id>-<version>.json is the packer's own report for the package being published.
-// Reading both through one module keeps the notes and the index from disagreeing about a
-// version or a hash, which is what a downstream consumer matches a download against.
+// The generated pack-audit-intent.json is the release input manifest for one ROM version.
+// This reader validates the version pointer and the bytes shipped to downstream app builds.
 
 import { readFileSync } from 'node:fs';
 
@@ -40,15 +38,27 @@ export function readRomVersion(filePath) {
   return version;
 }
 
-const REPORT_FIELDS = ['romKey', 'payloadSha256', 'payloadBytes', 'payloadFiles', 'zipBytes', 'libMode'];
+const REPORT_FIELDS = ['romKey', 'versionPointer', 'minAppVersionCode', 'packSeconds', 'files'];
 
 export function readPackReport(filePath) {
   const report = JSON.parse(readFileSync(filePath, 'utf8'));
   for (const field of REPORT_FIELDS) {
     if (report[field] === undefined) throw new Error(`${filePath}: pack report has no ${field}`);
   }
-  if (!/^[0-9a-f]{64}$/.test(report.payloadSha256)) {
-    throw new Error(`${filePath}: payloadSha256 is not a sha256 hex string`);
+  if (!Number.isInteger(report.minAppVersionCode) || report.minAppVersionCode < 1) {
+    throw new Error(`${filePath}: minAppVersionCode must be a positive integer`);
+  }
+  if (report.versionPointer !== 'maxcv' && !/^\d+\.\d+\.\d+$/.test(report.versionPointer)) {
+    throw new Error(`${filePath}: versionPointer must be maxcv or MAJOR.MINOR.PATCH`);
+  }
+  if (!Array.isArray(report.files) || report.files.length < 2) {
+    throw new Error(`${filePath}: files must list ROM zip and placeholder zip`);
+  }
+  for (const item of report.files) {
+    if (typeof item.name !== 'string' || !item.name || !Number.isInteger(item.bytes) || item.bytes < 1
+      || !/^[0-9a-f]{64}$/.test(item.sha256)) {
+      throw new Error(`${filePath}: file entry must include name, positive bytes, and sha256`);
+    }
   }
   return report;
 }

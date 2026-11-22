@@ -14,6 +14,8 @@ name: Android 15
 androidVersion: "15"
 description: AOSP15 虚拟机 ROM
 defaultRomVersion: 1.0.1
+minAppVersionCode: 105
+# minAppVersionCode 是这一版要求的最低 app versionCode；maxcv 是 app 侧策略。
 
 # 客体 .so 的承载方式：
 #   apk  —— 客体 .so 仍由 APK 的 lib/arm64-v8a 提供，ROM 只带数据（旧行为）

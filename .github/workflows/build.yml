@@ -145,7 +145,7 @@ jobs:
           shopt -s nullglob
           full=()
           minimal=()
-          for zip in dist/versebox-*.zip; do
+          for zip in dist/*/versebox-*.zip; do
             case "$zip" in
               *-min.zip) minimal+=("$zip") ;;
               *) full+=("$zip") ;;
@@ -177,7 +177,7 @@ jobs:
           PY
           done
           # resident tar：必须存在，且内容与 rom/resident-native.txt 的条数一致。
-          tars=(dist/apk-resident-libs-*.tar)
+          tars=(dist/*/apk-resident-libs-*.tar)
           if [ ${#tars[@]} -eq 0 ]; then
             echo "missing apk-resident-libs-*.tar (APK 的 lib/ 没有来源，装出来的包开不了机)" >&2
             exit 1
@@ -199,7 +199,7 @@ jobs:
           # Put the ROM package and its packing report into the artifact: the report contains payloadSha256 / entry count,
           # so you don't need to rerun the packer to trace "how this package was created".
           shopt -s nullglob
-          for f in dist/versebox-*.zip dist/pack-*.json dist/apk-resident-libs-*.tar; do
+          for f in dist/*/versebox-*.zip dist/*/pack-audit-intent.json dist/*/apk-resident-libs-*.tar; do
             [ -f "$f" ] || continue
             sha256sum "$f" >> SHA256SUMS
           done
@@ -211,9 +211,9 @@ jobs:
           name: a15-runtime
           path: |
             a15-runtime-*.tar.gz
-            dist/versebox-*.zip
-            dist/*-min.zip
-            dist/apk-resident-libs-*.tar
-            dist/pack-*.json
+            dist/*/versebox-*.zip
+            dist/*/versebox-*-min.zip
+            dist/*/apk-resident-libs-*.tar
+            dist/*/pack-audit-intent.json
             SHA256SUMS
           if-no-files-found: error
