@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "== 审计清单结构 / maxcv 选择 =="
-          python3 -m unittest -v rom.test_version_gate
+          python3 -m unittest -v rom.test_apk_artifacts rom.test_version_gate
 
       - name: 校验 rom.properties.yaml 的兼容性声明
         run: |
