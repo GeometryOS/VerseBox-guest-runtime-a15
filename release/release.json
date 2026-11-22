@@ -4,37 +4,53 @@
     "title": "VerseBox A15 v1.0.1",
     "romVersion": "1.0.1",
     "romKey": "android15@1.0.1",
-    "payloadSha256": "b85dd66a43e82c72770d6c46357a14c4c5dd6436ce542bee136fd36dd50e2c35",
-    "payloadBytes": 1687638362,
-    "payloadFiles": 3573,
-    "commit": "24331caff329c59ffd987a333c078cfb75a35412",
-    "runUrl": "https://github.com/GeometryOS/VerseBox-guest-runtime-a15/actions/runs/43988698104",
-    "publishedAt": "2026-11-17T00:39:35.816Z",
+    "minAppVersionCode": 105,
+    "packSeconds": 64.3,
+    "files": [
+      {
+        "name": "versebox-android15-1.0.1.zip",
+        "bytes": 693068331,
+        "sha256": "fdd1655da13e7e52eab1092b20b459b84628e44e8dd3da543b6b4dfbe48055a7"
+      },
+      {
+        "name": "versebox-android15-1.0.1-min.zip",
+        "bytes": 719,
+        "sha256": "3c5f786381cfaead4ed8f7f87a8ba9b24ef15344bd8114678b7368a4c5ac1025"
+      },
+      {
+        "name": "apk-resident-libs-android15-1.0.1.tar",
+        "bytes": 18391040,
+        "sha256": "21149bb7917c89355ed30713ef8d9f8017073f543ceaf23ba306ffbc1d035018"
+      }
+    ],
+    "commit": "c57399d07b0619c064d86640f663b4aa08ee475c",
+    "runUrl": "https://github.com/GeometryOS/VerseBox-guest-runtime-a15/actions/runs/45043890434",
+    "publishedAt": "2026-11-22T16:32:20.774Z",
     "assets": [
       {
         "name": "a15-runtime-v1.0.1.tar.gz",
-        "bytes": 692811663,
-        "sha256": "703c19eee4cec320a993d561698de6d4d10d7f7509a87e2dd16a2e9cf0d08c3f"
+        "bytes": 692797536,
+        "sha256": "499ea91871213e3ce6a1f4c8056853f0dfe6adae909985f1f3e52ab817327f1e"
       },
       {
-        "name": "dist/apk-resident-libs-android15.tar",
+        "name": "dist/android15@1.0.1/apk-resident-libs-android15-1.0.1.tar",
         "bytes": 18391040,
         "sha256": "21149bb7917c89355ed30713ef8d9f8017073f543ceaf23ba306ffbc1d035018"
       },
       {
-        "name": "dist/pack-android15-1.0.1.json",
-        "bytes": 723,
-        "sha256": "ddda40a29cdc51a78ffcbd5ea3f5018ba180b89b8725bca981b371983b63aa05"
+        "name": "dist/android15@1.0.1/pack-audit-intent.json",
+        "bytes": 660,
+        "sha256": "8a35cf081a1fd10394a0912a8b304f947d9d5bf5a95fabcd971b697c6b980ddb"
       },
       {
-        "name": "dist/versebox-android15-1.0.1-min.zip",
-        "bytes": 703,
-        "sha256": "667f293f014473697e78f80b5925b13883bef00a29bf78269420e35f36d239f3"
+        "name": "dist/android15@1.0.1/versebox-android15-1.0.1-min.zip",
+        "bytes": 719,
+        "sha256": "3c5f786381cfaead4ed8f7f87a8ba9b24ef15344bd8114678b7368a4c5ac1025"
       },
       {
-        "name": "dist/versebox-android15-1.0.1.zip",
-        "bytes": 693068315,
-        "sha256": "53ba10aa40576f82b297357fff891a3ce55606665f9fe4198c055206351a4867"
+        "name": "dist/android15@1.0.1/versebox-android15-1.0.1.zip",
+        "bytes": 693068331,
+        "sha256": "fdd1655da13e7e52eab1092b20b459b84628e44e8dd3da543b6b4dfbe48055a7"
       }
     ]
   }
